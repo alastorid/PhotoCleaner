@@ -7,7 +7,11 @@
   --panel-border: rgba(0, 0, 0, 0.10);
   --text: #1d1d1f;
   --muted: #6e6e73;
-  --accent: #0a84ff;
+  /* The accent is also the Dock icon's ramp start (`tools/make-icon.swift`), and
+     it is used as a background behind white text on several controls, so it is
+     not free to be as light as the icon looks: this carries white at 4.56:1
+     where the blue it replaced managed 3.65:1. */
+  --accent: #c2551c;
   --danger: #ff3b30;
   --warning: #b25000;
   --tile: #ffffff;
@@ -40,7 +44,11 @@
     --panel-border: rgba(255, 255, 255, 0.12);
     --text: #f5f5f7;
     --muted: #98989d;
-    --accent: #0a84ff;
+    /* Lighter than the light-mode accent for the same reason Apple lightens its
+       own system colours in dark mode: it has to clear the dark panel, not the
+       light one. Held to the old blue's contrast on both the dark panel and
+       white text rather than trading one for the other. */
+    --accent: #e25a38;
     --danger: #ff453a;
     --warning: #ff9f0a;
     --tile: #2c2c2e;
@@ -95,7 +103,11 @@ button { font: inherit; cursor: pointer; }
   width: 16px;
   height: 16px;
   border-radius: 5px;
-  background: linear-gradient(160deg, var(--accent), #6f4bff);
+  /* The icon's body gradient, not `--accent`: the Dock icon is neutral grey
+     (see `tools/make-icon.swift` for why a neutral icon has to clear the desktop
+     by luminance rather than hue) while selection still needs a real colour.
+     This mark tracks the icon; `--accent` does not. */
+  background: linear-gradient(160deg, #9a9aa0, #54545a);
   box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.35);
 }
 
@@ -178,7 +190,7 @@ button { font: inherit; cursor: pointer; }
   display: block;
   height: 100%;
   width: 0%;
-  background: linear-gradient(90deg, var(--accent), #6f4bff);
+  background: linear-gradient(90deg, var(--accent), #7e2418);
   transition: width 0.25s ease;
 }
 .analysis-fill.indeterminate {
@@ -821,7 +833,10 @@ button { font: inherit; cursor: pointer; }
 }
 .group-image.failed { opacity: 0.3; }
 
-/* The overlay line, on the picture rather than under it. */
+/* The overlay line, on the picture rather than under it.
+   `pointer-events: none` so the caption does not swallow a click meant for the
+   frame behind it — with the heart now a control inside this row, the heart takes
+   its own `pointer-events: auto` back. */
 .group-meta {
   position: absolute;
   right: 5px; bottom: 5px;
@@ -838,7 +853,30 @@ button { font: inherit; cursor: pointer; }
   pointer-events: none;
 }
 .group-face { color: var(--accent); }
-.group-heart { color: #f0b429; }
+
+/* The heart, and the same control the grid tile has.
+   Unlike the tile's it is always visible: a strip is read by looking along it,
+   and a heart that appeared only under the pointer would be a different gesture
+   on every frame in the same row. The outline glyph is the offer; the solid one
+   is the fact. */
+.group-heart {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.group-heart.is-favorite { color: #f0b429; }
+.group-heart:hover { color: #f0b429; }
+.group-heart:active { transform: scale(0.9); }
 
 .allphotos-note, .allphotos-end {
   padding: 10px 24px;
@@ -923,13 +961,57 @@ button { font: inherit; cursor: pointer; }
 
 /* ---------- lightbox ---------- */
 
+/* The preview arrives and leaves rather than appearing, because the light on the
+   screen changes by most of its range in a single frame either way. Growing the
+   photograph while this dims gives the eye something continuous to follow; a bare
+   cut from a grid of thumbnails to one dark overlay reads as a flash, and a fast
+   Space toggle turns that flash into a flicker.
+
+   `display: none` cannot be transitioned — hence the two-step `hidden` plus
+   `.is-open` that `openLightbox`/`closeLightbox` walk between. Without the flush
+   (`offsetWidth`) between them the browser has only ever seen the destination, so
+   there is no change to animate from and the backdrop still jumps. */
 .lightbox {
   position: fixed; inset: 0; z-index: 60;
   background: color-mix(in srgb, #000 78%, transparent);
   backdrop-filter: blur(14px);
   display: flex; align-items: center; justify-content: center;
   padding: 32px;
+  opacity: 0;
+  transition: opacity 260ms ease;
 }
+.lightbox.is-open { opacity: 1; }
+/* Not up for grabs until it is on screen and done arriving: the same milliseconds
+   the photograph is travelling, the overlay does not exist as a click target yet. */
+.lightbox:not(.is-open) { pointer-events: none; }
+/* The real preview holds back until the travelling thumbnail has handed over, so a
+   cached 2048px JPEG cannot appear underneath a copy of itself still in flight. */
+.lightbox-entering #lightboxImage { opacity: 0; }
+#lightboxImage { transition: opacity 160ms ease; }
+
+/* The travelling photograph.
+
+   A separate element rather than the lightbox's own `<img>`, because the preview
+   is a 2048px JPEG that has not been requested yet: what can start moving the
+   instant the key is pressed is the thumbnail that is already decoded and on
+   screen. `position: fixed` with viewport coordinates rather than living inside
+   the stage, because the stage is a layout box and a transform on a child of a
+   box that can still be resizing is a transform whose meaning is still changing. */
+.preview-ghost {
+  position: fixed;
+  z-index: 61;
+  margin: 0;
+  object-fit: contain;
+  pointer-events: none;
+  transform-origin: 50% 50%;
+  will-change: transform, opacity;
+  transition: transform 300ms cubic-bezier(0.2, 0.72, 0.24, 1),
+              opacity 200ms ease-out,
+              filter 300ms ease-out;
+}
+/* Coming back it is the same travel read the other way round, which is a curve
+   that starts slowly and gathers rather than one that starts fast and coasts. */
+.preview-ghost-return { transition-timing-function: cubic-bezier(0.4, 0, 0.6, 1); }
 .lightbox-inner {
   position: relative;
   display: grid;
@@ -943,11 +1025,20 @@ button { font: inherit; cursor: pointer; }
   position: relative;
   display: flex; align-items: center; justify-content: center;
   min-height: 240px;
+  /* A fixed height rather than one fitted to the image.
+
+     The travel needs to know where the photograph is going before the photograph
+     arrives: the preview is still being fetched when the animation starts, and a
+     stage that grew to fit it would move its own final position out from under
+     the animation halfway through. Pinning the box makes the destination knowable
+     up front, and 78vh is the height the image already reached in every window
+     but the shortest. */
+  height: min(78vh, calc(100vh - 148px));
   background: rgba(0, 0, 0, 0.35);
   border-radius: var(--radius);
   overflow: hidden;
 }
-.lightbox-stage img { max-width: 100%; max-height: 78vh; display: block; }
+.lightbox-stage img { max-width: 100%; max-height: 100%; display: block; }
 .lightbox-fallback { color: #fff; opacity: 0.85; padding: 24px; text-align: center; }
 
 .lightbox-close, .lightbox-nav {
@@ -1096,6 +1187,9 @@ button { font: inherit; cursor: pointer; }
 
 @media (max-width: 900px) {
   .lightbox-inner { grid-template-columns: minmax(0, 1fr); }
+  /* Stacked, the stage and the metadata panel share the height between them, so
+     the stage gives up the room the panel needs. */
+  .lightbox-stage { height: max(200px, min(52vh, calc(100vh - 400px))); }
   .lightbox-meta { align-self: stretch; }
   .lightbox-close { top: -40px; }
 }

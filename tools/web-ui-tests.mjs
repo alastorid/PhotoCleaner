@@ -404,6 +404,71 @@ await check('shift-clicking a group cell selects the range between', async (app)
   assert(!cellAt(app, card, 5).classList.contains('selected'), 'the range ran past its end');
 });
 
+await check("a group cell's heart is the same control as a tile's", async (app) => {
+  // The heart used to be a `<span>` in a group strip that appeared only once a
+  // photo was *already* a favourite: it could report the flag but never set it,
+  // while the grid tile's heart set it from the photo. One promise, two different
+  // controls. This writes to the library, so it restores the flag afterwards.
+  const card = await openGroups(app);
+  const cell = cellAt(app, card, 1);
+  const heart = cell.querySelector('.group-heart');
+  assert(heart, 'the group cell has no heart');
+  assertEqual(heart.tagName, 'BUTTON', 'the group heart is not a control');
+
+  // Present whether or not the photo is a favourite: an outline heart is the
+  // offer. A node that only exists once the flag is set cannot offer anything.
+  assertEqual(heart.getAttribute('aria-pressed'), 'false',
+    'a photo that is not a favourite has no heart to press');
+
+  const id = cell.dataset.id;
+  const setFavorite = (favorite) => fetch(`${base}/api/favorites`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids: [id], favorite }),
+  });
+  try {
+    heart.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await app.settle(900);
+    const after = app.window.document.querySelector(
+      `#groupsList .group-cell[data-id="${app.window.CSS.escape(id)}"] .group-heart`);
+    assert(after, 'the heart vanished from the cell it was pressed on');
+    assertEqual(after.getAttribute('aria-pressed'), 'true',
+      'pressing the heart on a group cell did not make it a favourite');
+
+    // And pressing again takes it back, which is the toggle rather than a set.
+    after.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await app.settle(900);
+    assertEqual(after.getAttribute('aria-pressed'), 'false',
+      'pressing the heart a second time did not undo it');
+  } finally {
+    await setFavorite(false);
+    await app.settle(600);
+  }
+});
+
+await check("pressing a group cell's heart does not also select the cell", async (app) => {
+  // The cell is a click target in its own right, so a heart that did not stop
+  // propagation would select the photo as a side effect of favouriting it.
+  const card = await openGroups(app);
+  const cell = cellAt(app, card, 2);
+  const id = cell.dataset.id;
+  const setFavorite = (favorite) => fetch(`${base}/api/favorites`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids: [id], favorite }),
+  });
+  try {
+    cell.querySelector('.group-heart')
+      .dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await app.settle(400);
+    assert(!cell.classList.contains('selected'),
+      'the heart press selected the cell as well as favouriting it');
+  } finally {
+    await setFavorite(false);
+    await app.settle(600);
+  }
+});
+
 await check("Delete in a group cell's menu destroys that member and only that member", async (app) => {
   const sent = interceptDeletes(app);
   const card = await openGroups(app);

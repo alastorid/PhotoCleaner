@@ -1006,22 +1006,7 @@
     const heart = document.createElement('button');
     heart.type = 'button';
     heart.className = 'tile-heart';
-    heart.addEventListener('click', (event) => {
-      // The tile is itself a click target, so without this favouriting a photo
-      // would also select it — and the heart sits over the score, in the corner
-      // a click-to-select starts from.
-      event.preventDefault();
-      event.stopPropagation();
-      // Read the flag back rather than trusting the glyph on screen: the write is
-      // asynchronous, and the row may already have been patched by the time a
-      // second press arrives. A press that arrives mid-flight therefore asks for
-      // the state that is now on screen rather than the one that started it.
-      const current = rowById(row.id);
-      setFavoriteOnTargets([row.id], !(current ? current.favorite : row.favorite));
-    });
-    // Two presses of a button that changes the library are not a request to
-    // preview, so the tile's double-click never hears about them.
-    heart.addEventListener('dblclick', (event) => event.stopPropagation());
+    attachHeartToggle(heart, row.id);
     corner.appendChild(heart);
 
     const score = document.createElement('div');
@@ -1131,24 +1116,30 @@
     // it will do — and the words are `aria-label` rather than `title` so the
     // control says what it does even when a tooltip is not the thing being read.
     const heart = tile.querySelector('.tile-heart');
-    if (heart) {
-      const favourite = Boolean(row.favorite);
-      heart.textContent = favourite ? '♥' : '♡';
-      heart.classList.toggle('is-favorite', favourite);
-      heart.setAttribute('aria-pressed', favourite ? 'true' : 'false');
-      heart.setAttribute('aria-label', favourite ? 'Remove from Favourites' : 'Make Favourite');
-      // The heart is the only mark a favourite gets. There used to be a star chip
-      // and a lock chip in the right-hand gutter as well, saying the same thing
-      // twice: three glyphs for one flag. The heart carries the state, and the
-      // protection it implies is folded into the sentence it already had — the
-      // tile's accessible name says "protected from deletion" either way, so
-      // nothing about this photo was only ever knowable from the shape.
-      heart.title = favourite
-        ? (protectedNow
-          ? 'Favorite — protected from deletion. Click to remove.'
-          : 'Favorite in Photos — not protected from deletion while Protect Favorites is off. Click to remove.')
-        : 'Mark as a favorite in Photos. Favourites are excluded from deletion while Protect Favorites is on.';
-    }
+    if (heart) decorateHeart(heart, row);
+  }
+
+  /**
+   * Paints a heart from a row: the glyph, the announced state, and the tooltip.
+   *
+   * One place for both surfaces, so "the heart means the same thing everywhere" is
+   * a fact about the code rather than a coincidence. The heart is the only mark a
+   * favourite gets — there used to be a star chip and a lock chip in the tile's
+   * gutter as well, saying the same thing twice — so the protection the lock stood
+   * for is folded into this sentence, and nothing about a photo is only knowable
+   * from the shape of a glyph.
+   */
+  function decorateHeart(heart, row) {
+    const favourite = Boolean(row.favorite);
+    heart.textContent = favourite ? '♥' : '♡';
+    heart.classList.toggle('is-favorite', favourite);
+    heart.setAttribute('aria-pressed', favourite ? 'true' : 'false');
+    heart.setAttribute('aria-label', favourite ? 'Remove from Favourites' : 'Make Favourite');
+    heart.title = favourite
+      ? (favourite && favouritesProtected()
+        ? 'Favorite — protected from deletion. Click to remove.'
+        : 'Favorite in Photos — not protected from deletion while Protect Favorites is off. Click to remove.')
+      : 'Mark as a favorite in Photos. Favourites are excluded from deletion while Protect Favorites is on.';
   }
 
   /**
@@ -1198,6 +1189,33 @@
 
   function favouritesProtected() {
     return !state.serverSettings || state.serverSettings.protectFavorites !== false;
+  }
+
+  /**
+   * Makes a heart the toggle the grid tile's is, wherever it is drawn.
+   *
+   * One function for both surfaces, because "the heart sets the favourite" is a
+   * single promise and two implementations of it would drift: the group strip's
+   * used to be a `<span>` that only appeared once a photo was *already* a
+   * favourite and protection was on, so it could report the flag but never change
+   * it. Reading is fine; the tile could set it and the group could not.
+   *
+   * `rowById` is consulted rather than the row the button was built with: the
+   * write is asynchronous, so by the time a second press arrives the row may have
+   * been patched, and a press that lands mid-flight must ask for the state that is
+   * now on screen rather than the one that started it.
+   */
+  function attachHeartToggle(heart, id) {
+    heart.addEventListener('click', (event) => {
+      // The cell is itself a click target — it selects — so without this a press
+      // on the heart would select the photo as well as favouriting it.
+      event.preventDefault();
+      event.stopPropagation();
+      const current = rowById(id);
+      setFavoriteOnTargets([id], !(current ? current.favorite : false));
+    });
+    // A double press on the heart is two toggles, not a request to preview.
+    heart.addEventListener('dblclick', (event) => event.stopPropagation());
   }
 
   function refreshAllTiles() {
@@ -1513,14 +1531,30 @@
   }
 
   /**
-   * The row this client knows for an identifier, from either grid.
+   * The row this client knows for an identifier, from any surface that holds one.
    *
-   * The favourite flags live on the rows already in memory, and the grid is the
+   * The favourite flags live on the rows already in memory, and the grids are the
    * only place that knows about them, so this is how "is anything here already a
    * favourite" is answered without asking the server on every right-click.
+   *
+   * The group strips are searched too, because a heart in a strip is now a control
+   * and has to read the flag back the same way a tile's does. Without that a photo
+   * that is only in a group would answer "not a favourite" however many times it
+   * was pressed, and the heart would set the flag it already had.
    */
   function rowById(id) {
-    return state.items.find((row) => row.id === id) || state.all.rows.find((row) => row.id === id) || null;
+    return state.items.find((row) => row.id === id)
+      || state.all.rows.find((row) => row.id === id)
+      || groupRowById(id);
+  }
+
+  /** The group member row for an identifier, if a strip on screen holds it. */
+  function groupRowById(id) {
+    for (const group of state.groups.rows) {
+      const row = groupItems(group).find((item) => item.id === id);
+      if (row) return groupMemberRow(row);
+    }
+    return null;
   }
 
   function buildMenuItem(spec) {
@@ -1819,6 +1853,11 @@
     });
     patch(state.items);
     patch(state.all.rows);
+    // The group strips hold their own copies of the flag, so they are patched too.
+    // Without this a heart pressed inside a strip would write the change to Photos
+    // and leave the strip's own row — and therefore the glyph — reading the old
+    // state, so a second press would ask for the change it had just made.
+    for (const group of state.groups.rows) patch(groupItems(group));
     refreshTilesById(wanted);
     updateSelectionBar();
     return ids;
@@ -1874,21 +1913,12 @@
     cell.classList.toggle('selected', selected);
     cell.setAttribute('aria-pressed', selected ? 'true' : 'false');
     const heart = cell.querySelector('.group-heart');
-    // The heart, and the same one the tiles use: one glyph for one flag, so a
-    // favourite looks like a favourite in every view. It is a report rather than a
-    // control here — the strip is a ranking to read at a glance, not a place to
-    // edit — so it appears only when the flag means something, which is when
-    // protection is on and the favourite is therefore held back from deletion.
-    if (row.favorite && favouritesProtected() && !heart) {
-      const added = document.createElement('span');
-      added.className = 'group-heart';
-      added.textContent = '♥';
-      added.title = 'Favorite — protected from deletion';
-      const meta = cell.querySelector('.group-meta');
-      if (meta) meta.appendChild(added);
-    } else if ((!row.favorite || !favouritesProtected()) && heart) {
-      heart.remove();
-    }
+    // Repainted, never added or removed: the heart is a control now, so it is in
+    // the cell from the start and a photo that is not a favourite shows it as an
+    // outline rather than having no heart at all. An earlier version removed the
+    // node outright, which meant the group strip could not set the flag from the
+    // photo — the very thing the heart is there to do.
+    if (heart) decorateHeart(heart, row);
   }
 
   /* -------------------------------------------------------------- selection */
@@ -2681,6 +2711,330 @@
     closeAllPhotos();
   }
 
+  /* ------------------------------------------------- preview open/close travel */
+
+  /**
+   * The photograph travels between its tile and the preview instead of appearing.
+   *
+   * Photos does this, and the reason is not decoration. A grid of thumbnails to a
+   * single large image and back changes the light on the screen by most of its
+   * range in one frame, and the eye reads that as a flash — which a fast Space
+   * toggle turns into a flicker. Growing the photo while the backdrop dims gives
+   * the eye something continuous to follow, and closing plays the same motion
+   * backwards so the two ends match.
+   *
+   * What travels is a copy of the image already on screen, never the preview
+   * itself: the preview is a 2048px JPEG that has not been requested yet, and
+   * animating toward a bitmap that does not exist would mean animating the absence
+   * of one. So the thumbnail makes the trip, and the two cross-fade once the real
+   * bitmap has decoded underneath it.
+   */
+
+  /** Travel time. Mirrored by `.preview-ghost`'s transition in the stylesheet. */
+  const PREVIEW_TRAVEL_MS = 300;
+  /** The thumbnail handing over to the real preview: one cross-fade, this long. */
+  const PREVIEW_HANDOFF_MS = 120;
+  /**
+   * A bound on waiting for the preview bitmap. A photo whose preview cannot be
+   * read raises `error` rather than `load`, and the travelling thumbnail has to
+   * be taken away either way — the alternative is a ghost over a photo that is
+   * never coming.
+   */
+  const PREVIEW_DECODE_GRACE_MS = 2500;
+
+  const previewTravel = {
+    ghost: null,
+    timers: [],
+    source: null,
+    target: null,
+    aspect: 0,
+    travelled: false,
+    decoded: false,
+    settled: false,
+  };
+
+  const previewSoon = (fn, ms) => { previewTravel.timers.push(setTimeout(fn, ms)); };
+
+  function previewClearTimers() {
+    for (const timer of previewTravel.timers) clearTimeout(timer);
+    previewTravel.timers = [];
+  }
+
+  /**
+   * Takes the travelling photograph off the screen and stops everything waiting on
+   * it.
+   *
+   * Both halves of a travel go through here, so a preview closed while it was still
+   * arriving cannot leave a half-finished copy of itself floating over the grid
+   * with an overlay fading in behind it — and neither can start while another is
+   * still in flight.
+   */
+  function previewDropGhost() {
+    previewClearTimers();
+    if (previewTravel.ghost) previewTravel.ghost.remove();
+    previewTravel.ghost = null;
+    $('lightbox').classList.remove('lightbox-entering');
+  }
+
+  /** Forgets where the last travel was, so the next one starts from nothing. */
+  function previewForget() {
+    previewTravel.source = null;
+    previewTravel.target = null;
+    previewTravel.aspect = 0;
+  }
+
+  /**
+   * The photograph on screen for this id, wherever it is: the score grid, the All
+   * Photos window, or a group strip.
+   *
+   * Looked up from the id rather than handed down by the call sites, because five
+   * different gestures open a preview — click, double click, Enter, Space, the
+   * Inspect button — and every one of them would have to be trusted to pass the
+   * right element along.
+   *
+   * Every copy is asked, not just the first: the score grid and the All Photos
+   * window both hold their own tiles for a photo they have in common, and only one
+   * of the two is on screen, so the first match in the document is the wrong one
+   * half the time. A tile whose thumbnail failed, or one that lazy-loading has not
+   * filled in yet, has no pixels to fly; those fall back to a plain fade rather
+   * than a travel from an empty rectangle.
+   */
+  function previewSourceFor(id) {
+    if (!id) return null;
+    const copies = document.querySelectorAll(`[data-id="${CSS.escape(String(id))}"] img`);
+    for (const image of copies) {
+      if (!image.complete || !image.naturalWidth) continue;
+      if (!image.getBoundingClientRect().width) continue; // on screen nowhere
+      return image;
+    }
+    return null;
+  }
+
+  /**
+   * The photograph's shape, which is what has to be right for a travel to land
+   * square.
+   *
+   * The row knows the real dimensions; the thumbnail's own are the fallback for a
+   * group response, which carries a score and a date and no size at all. A photo
+   * that is neither is not given one — an assumed shape would zoom the picture into
+   * a rectangle it never had.
+   */
+  function previewAspect(row, source) {
+    const width = (row && row.width) || (source && source.naturalWidth);
+    const height = (row && row.height) || (source && source.naturalHeight);
+    return width && height ? width / height : 0;
+  }
+
+  /**
+   * Where the photograph will sit once it has decoded: the box a photo of this
+   * shape gets inside the stage, which is a fixed-size box in the stylesheet.
+   *
+   * Knowing this before the image arrives is the whole trick. The stage is pinned
+   * to a height in the stylesheet precisely so that this is answerable while the
+   * fetch is still in flight — and it is measured again on the way out, so a window
+   * resized while the preview was open does not send the photograph back to a
+   * rectangle that has since moved.
+   */
+  function previewTargetRect(aspect) {
+    const stage = $('lightboxStage').getBoundingClientRect();
+    if (!aspect || !stage.width || !stage.height) return null;
+    let width = stage.width;
+    let height = width / aspect;
+    if (height > stage.height) {
+      height = stage.height;
+      width = height * aspect;
+    }
+    return {
+      x: stage.left + (stage.width - width) / 2,
+      y: stage.top + (stage.height - height) / 2,
+      width,
+      height,
+    };
+  }
+
+  /**
+   * The rectangle the travel starts from — or ends at, when the preview is closing.
+   *
+   * A grid that moved while the preview was open (a page landed in a live queue,
+   * the All Photos window re-indexed) can leave the tile off screen entirely.
+   * Flying to an off-screen rectangle reads as the photo leaving the window
+   * altogether, so the travel ends at a small box in the middle instead: it still
+   * shrinks, it just has nowhere to land.
+   */
+  function previewTileRect(source) {
+    if (!source || !source.isConnected) return null;
+    const tile = source.getBoundingClientRect();
+    if (!tile.width || !tile.height) return null;
+    const offscreen = tile.bottom < 0 || tile.top > window.innerHeight
+      || tile.right < 0 || tile.left > window.innerWidth;
+    if (offscreen) {
+      const side = 96;
+      return { x: window.innerWidth / 2 - side / 2, y: window.innerHeight / 2 - side / 2, width: side, height: side };
+    }
+    return { x: tile.left, y: tile.top, width: tile.width, height: tile.height };
+  }
+
+  /**
+   * The transform that puts a photograph-sized box over its tile.
+   *
+   * One uniform scale about the centre, and the centre is the part that has to be
+   * right: the tile crops this same photo to `cover` a square and the preview fits
+   * all of it, so the two agree on the visible width and differ in how much of the
+   * frame is on screen. Matching width rather than area keeps the photograph the
+   * shape the user was just looking at, which is most of what makes the motion read
+   * as one photo moving rather than one photo becoming another.
+   */
+  function previewTransform(target, tile, aspect) {
+    const visible = tile.width >= tile.height * aspect ? tile.width : tile.height * aspect;
+    const scale = target.width ? visible / target.width : 1;
+    const dx = tile.x + tile.width / 2 - target.x - target.width / 2;
+    const dy = tile.y + tile.height / 2 - target.y - target.height / 2;
+    return `translate(${dx}px, ${dy}px) scale(${scale})`;
+  }
+
+  /** A copy of the photograph at its final size, to be transformed into place. */
+  function previewGhost(target, bitmap) {
+    const ghost = document.createElement('img');
+    ghost.className = 'preview-ghost';
+    // Purely a copy of something already on screen: announcing it would read the
+    // photo out twice, and it is gone within a third of a second either way.
+    ghost.setAttribute('aria-hidden', 'true');
+    ghost.alt = '';
+    ghost.src = bitmap;
+    ghost.style.left = `${target.x}px`;
+    ghost.style.top = `${target.y}px`;
+    ghost.style.width = `${target.width}px`;
+    ghost.style.height = `${target.height}px`;
+    return ghost;
+  }
+
+  /**
+   * Releases a ghost from its start pose.
+   *
+   * The start pose is held in inline styles and clearing them is what starts the
+   * transition, so the element has to be *read* in between (hence `offsetWidth`):
+   * without that flush the browser has only ever computed the destination, and a
+   * transition with no previous value to come from does not run.
+   */
+  function previewRelease(ghost) {
+    void ghost.offsetWidth;
+    ghost.style.opacity = '';
+    ghost.style.filter = '';
+    ghost.style.transform = '';
+  }
+
+  function prefersReducedMotion() {
+    return typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+
+  /**
+   * Starts the travel out of the tile and into the preview.
+   *
+   * Returns without doing anything when there is nothing to fly from, when there is
+   * no layout to measure, or when the user has asked for less motion. Every caller
+   * must work without it: a preview is a preview whether or not it animates.
+   */
+  function startPreviewTravel(row) {
+    previewDropGhost();
+    previewTravel.travelled = false;
+    previewTravel.decoded = false;
+    previewTravel.settled = false;
+    const source = previewSourceFor(row.id);
+    previewTravel.aspect = previewAspect(row, source);
+    const target = previewTargetRect(previewTravel.aspect);
+    previewTravel.source = source;
+    previewTravel.target = target;
+    if (!source || !target || prefersReducedMotion()) return;
+    const tile = previewTileRect(source);
+    if (!tile) return;
+    const ghost = previewGhost(target, source.currentSrc || source.src);
+    // Invisible until the release, so the thumbnail cannot arrive a frame late into
+    // a photograph that is already a third of the way across the screen.
+    ghost.style.opacity = '0';
+    // The bloom the user asked for: the thumbnail is 256px of a 2048px photograph,
+    // so it is lifted and briefly over-bright on the way out, which hides the
+    // resolution it is going to lose.
+    ghost.style.filter = 'brightness(1.28)';
+    ghost.style.transform = previewTransform(target, tile, previewTravel.aspect);
+    $('lightbox').classList.add('lightbox-entering');
+    document.body.appendChild(ghost);
+    previewTravel.ghost = ghost;
+    previewRelease(ghost);
+    previewSoon(() => { previewTravel.travelled = true; settlePreviewTravel(); }, PREVIEW_TRAVEL_MS);
+    previewWhenDecoded();
+  }
+
+  /** Resolves once the preview bitmap has decoded, or the grace period runs out. */
+  function previewWhenDecoded() {
+    const image = $('lightboxImage');
+    const ready = () => { previewTravel.decoded = true; settlePreviewTravel(); };
+    if (typeof image.decode === 'function') image.decode().then(ready, ready);
+    else {
+      image.addEventListener('load', ready, { once: true });
+      image.addEventListener('error', ready, { once: true });
+    }
+    previewSoon(ready, PREVIEW_DECODE_GRACE_MS);
+  }
+
+  /**
+   * The hand-over: the travelling thumbnail fades out as the real preview fades in.
+   *
+   * Both have to have happened first — the travel finished *and* the bitmap
+   * decoded. Cross-fading mid-flight would put the sharp photograph at full size
+   * with a blurred copy of itself still sliding down into the grid over it.
+   */
+  function settlePreviewTravel() {
+    if (previewTravel.settled || !previewTravel.travelled || !previewTravel.decoded) return;
+    previewTravel.settled = true;
+    previewClearTimers();
+    const ghost = previewTravel.ghost;
+    previewTravel.ghost = null;
+    $('lightbox').classList.remove('lightbox-entering');
+    if (!ghost) return;
+    // The transition is shortened rather than replaced: `transform` has already
+    // arrived, and only the fade is left to do.
+    ghost.style.transition = `opacity ${PREVIEW_HANDOFF_MS}ms linear`;
+    ghost.style.opacity = '0';
+    previewSoon(() => ghost.remove(), PREVIEW_HANDOFF_MS + 40);
+  }
+
+  /**
+   * The same travel backwards, from the preview down into the tile.
+   *
+   * Runs from the bitmap that is actually on screen rather than from the tile's
+   * thumbnail, because this is the direction where the difference is visible: a
+   * 256px copy shrinking away from a sharp photograph is a resolution drop the eye
+   * catches, and there is no reason to spend it.
+   *
+   * Returns whether the travel is running, which is the caller’s signal that the
+   * overlay must stay on screen until it lands.
+   */
+  function startPreviewReturn() {
+    const source = previewTravel.source;
+    // Measured again rather than remembered: the overlay is still on screen here,
+    // so this is the live stage, and the target the travel came from may no longer
+    // be where the stage is.
+    const target = previewTargetRect(previewTravel.aspect);
+    previewTravel.source = null;
+    previewTravel.target = null;
+    if (!source || !target || prefersReducedMotion()) return false;
+    const tile = previewTileRect(source);
+    if (!tile) return false;
+    const image = $('lightboxImage');
+    const ghost = previewGhost(target, image.naturalWidth
+      ? (image.currentSrc || image.src)
+      : (source.currentSrc || source.src));
+    document.body.appendChild(ghost);
+    previewTravel.ghost = ghost;
+    ghost.classList.add('preview-ghost-return');
+    void ghost.offsetWidth;
+    ghost.style.opacity = '0';
+    ghost.style.transform = previewTransform(target, tile, previewTravel.aspect);
+    previewSoon(() => ghost.remove(), PREVIEW_TRAVEL_MS + 40);
+    return true;
+  }
+
   /* ---------------------------------------------------------------- lightbox */
 
   /**
@@ -2707,8 +3061,17 @@
       label: label || '',
     };
     $('lightbox').hidden = false;
+    // Measured here so the backdrop has a computed `opacity: 0` to fade up from.
+    // Unhiding and opening in the same tick leaves the browser with no previous
+    // style to transition from, and the overlay would still arrive in one frame.
+    void $('lightbox').offsetWidth;
+    $('lightbox').classList.add('is-open');
     if (!wasOpen) $('lightboxClose').focus();
     renderLightbox();
+    // Arriving is the only half that travels *from* the grid. Moving between photos
+    // inside an open preview has no tile to fly from, and re-running the travel
+    // would make every arrow key look like the whole window had been rebuilt.
+    if (!wasOpen) startPreviewTravel(currentLightboxRow());
   }
 
   /**
@@ -2742,14 +3105,32 @@
     const index = state.lightbox.index;
     const wasAllPhotos = state.lightbox.allPhotos;
     state.lightbox = { open: false, queue: [], index: -1, live: false, allPhotos: false, groups: false, label: '' };
-    $('lightbox').hidden = true;
-    // Drop the decoded preview so a large JPEG is not held alive by a closed view.
-    $('lightboxImage').onerror = null;
-    $('lightboxImage').src = '';
-    restoreFocus();
+    // The state above is already closed, so the keyboard, the grid underneath and
+    // Escape all behave as though the preview is gone while it is still visibly on
+    // its way out. Only the pixels are still finishing — and the way back out takes
+    // over from anything still arriving, so the two halves of the round trip cannot
+    // both be holding the screen at once.
+    const returning = startPreviewReturn();
+    $('lightbox').classList.remove('is-open');
+    if (returning) previewSoon(() => hideLightbox(), PREVIEW_TRAVEL_MS);
+    else hideLightbox();
     // Closing in the All Photos window leaves the photo just inspected on
     // screen, which is where the user expects to carry on from.
     if (wasAllPhotos) scrollAllPhotosIntoView(index);
+  }
+
+  /**
+   * Takes the overlay off the screen and drops the decoded preview, so a large
+   * JPEG is not held alive by a closed view.
+   *
+   * On the way in this is the last statement of the travel, not the first: a
+   * `display: none` halfway through would cut the photograph off where it stood.
+   */
+  function hideLightbox() {
+    $('lightbox').hidden = true;
+    $('lightboxImage').onerror = null;
+    $('lightboxImage').src = '';
+    restoreFocus();
   }
 
   function currentLightboxRow() {
@@ -4374,7 +4755,7 @@
   }
 
   /**
-   * One group cell: rank, frame, face quality, star.
+   * One group cell: rank, frame, face quality, heart.
    *
    * Split out of `buildGroup` so the strip's own construction and the cells it
    * holds are one decision rather than two.
@@ -4440,19 +4821,25 @@
       face.title = 'Vision face capture quality for this photo — lighting, sharpness, blur and positioning';
       meta.appendChild(face);
     }
-    if (row.favorite && favouritesProtected()) {
-      const heart = document.createElement('span');
-      heart.className = 'group-heart';
-      heart.textContent = '♥';
-      heart.title = 'Favorite — protected from deletion';
-      meta.appendChild(heart);
-    }
+    // The heart, and the same one the tile uses: a control, not a report. The grid
+    // tile's heart sets the flag from the photo itself, and a heart that only
+    // reports on one surface and sets it on the other is the sort of difference a
+    // reader has to discover by trying. It is always present here — unlike the
+    // tile's, which stays invisible until the pointer arrives — because a strip is
+    // scanned rather than hovered, and a heart that appeared on hover would be a
+    // different gesture on every frame in the same row.
+    const heart = document.createElement('button');
+    heart.type = 'button';
+    heart.className = 'group-heart';
+    attachHeartToggle(heart, row.id);
+    decorateHeart(heart, row);
+    meta.appendChild(heart);
 
     cell.appendChild(rank);
     cell.appendChild(image);
-    // Only when it has something to say, so a frame with no face and no star is
-    // just the frame rather than a frame above an empty caption line.
-    if (meta.childElementCount) cell.appendChild(meta);
+    // The heart is always in the meta row now, so this is no longer a conditional
+    // line: the strip carries it whether or not Vision found a face.
+    cell.appendChild(meta);
     if (isOrigin) {
       // Ring *and* label, the way the All Photos anchor does it: the ring is
       // quick to spot while scrolling the strip, and the label says what the

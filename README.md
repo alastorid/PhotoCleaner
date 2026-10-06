@@ -276,6 +276,11 @@ Protection from deletion rides on the same glyph — while **Protect Favorites**
 a heart means the photo is excluded from bulk deletion — and the tooltip and the
 tile's accessible name both say so.
 
+The same heart is on a group member's thumbnail, and it does the same thing there.
+It used to be different: a mark you could read but not press, and only once the
+photo was already a favourite. "The heart sets the favourite" is one promise, and it
+holds everywhere a heart is drawn.
+
 ### While the library is being analysed
 
 Analysis progress lives in the title bar: the phase, a bar and a percentage, and
