@@ -1,0 +1,141 @@
+name: Release
+
+# Pushing a vN.N.N tag builds, tests, packages and publishes the drag-and-drop
+# DMG as a GitHub Release. Nothing else publishes anything: `main` is still only
+# covered by CI, so an ordinary push cannot ship a build.
+#
+# The version is the tag and nothing else. build.sh stamps it into the app's
+# Info.plist, the app reads it back for `--version`, the DMG carries it in its
+# filename and volume name, and make-dmg.sh refuses to package an app whose
+# stamped version does not match. There is no version constant to forget.
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+# Two tags pushed in quick succession must not race to publish: the second waits
+# for the first rather than cancelling it mid-upload and leaving a truncated
+# asset on the release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dmg:
+    name: Build and publish the DMG
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    env:
+      # Apple silicon only — the published filename says so.
+      PHOTOCLEANER_ARCH: arm64
+
+    steps:
+      # Full history: --generate-notes needs the commits since the last tag, and
+      # a shallow clone cannot see them.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Validate the tag and split it into the two forms used below: the release
+      # name ("v1.2.3") and the version the bundle is stamped with ("1.2.3").
+      # Done before anything expensive runs, and failed loudly rather than
+      # letting build.sh reject it ten minutes later.
+      - name: Check the tag
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "release: '$tag' is not a vN.N.N tag" >&2
+              exit 1
+          fi
+          version="${tag#v}"
+          echo "Releasing $tag (PhotoCleaner $version)"
+
+          # Read back by every later step. GitHub's tag pattern is a glob, not a
+          # regex, so this is where "v1.2.3" is genuinely checked.
+          printf 'RELEASE_TAG=%s\n' "$tag" >> "$GITHUB_ENV"
+          printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+
+      - name: Show the toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          swift --version
+
+      # The same three steps CI runs, in the same order: a tag is not a licence
+      # to ship something that does not pass.
+      - name: Build
+        run: ./build.sh
+        env:
+          PHOTOCLEANER_VERSION: ${{ env.VERSION }}
+
+      - name: Test
+        run: ./run-tests.sh
+
+      - name: Smoke test (static)
+        run: ./smoke-test.sh --no-server
+
+      # Mounts the finished image and checks the app, the Applications symlink,
+      # the bundle identifier and the signature inside it before this can pass.
+      - name: Package the DMG
+        run: ./make-dmg.sh --version "$VERSION" --no-build
+
+      # The image is verified above, but keep the artifact too: it is the only
+      # way to pull the exact bytes that were released and reproduce a user's
+      # problem with them.
+      - name: Upload the DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoCleaner-${{ github.ref_name }}-dmg
+          path: dist/PhotoCleaner-${{ github.ref_name }}-arm64.dmg
+          if-no-files-found: error
+
+      # `gh` is already on the runner, so this adds no third-party action to a
+      # project with no third-party runtime. --generate-notes writes the
+      # changelog from the commits since the previous tag.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dmg="dist/PhotoCleaner-${VERSION}-arm64.dmg"
+          [ -f "$dmg" ] || { echo "release: $dmg was not built" >&2; exit 1; }
+
+          notes=()
+          # The notes array is expanded through ${notes[@]+...}: macOS runners
+          # are bash 3.2, where "${notes[@]}" on an empty array is an unbound
+          # variable under set -u. That is the first release's job failing.
+          if previous="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null)"; then
+              notes+=(--notes-start-tag "$previous")
+          else
+              echo "==> No earlier tag; notes will cover the whole history"
+          fi
+
+          # A release can already exist if the tag was pushed again after a
+          # failure. Replace it rather than aborting the run. The tag itself is
+          # deliberately left alone: deleting what triggered this workflow is not
+          # this workflow's decision to make.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              echo "==> Release $RELEASE_TAG already exists; replacing it"
+              gh release delete "$RELEASE_TAG" --yes
+          fi
+
+          gh release create "$RELEASE_TAG" "$dmg" \
+              --title "PhotoCleaner $VERSION" \
+              --generate-notes \
+              "${notes[@]+"${notes[@]}"}"
+
+      - name: Confirm the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json tagName,name,assets \
+            --jq '.tagName + "  " + .name + "  " + ([.assets[].name] | join(", "))'
+          gh release download "$RELEASE_TAG" --pattern "*-arm64.dmg" --dir /tmp/verify --clobber
+          hdiutil verify "/tmp/verify/PhotoCleaner-${VERSION}-arm64.dmg"

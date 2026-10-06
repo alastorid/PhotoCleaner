@@ -1,0 +1,1197 @@
+/* PhotoCleaner — embedded stylesheet.
+   System fonts only, no external resources, follows the macOS appearance. */
+
+:root {
+  --bg: #f2f2f4;
+  --panel: #ffffff;
+  --panel-border: rgba(0, 0, 0, 0.10);
+  --text: #1d1d1f;
+  --muted: #6e6e73;
+  --accent: #0a84ff;
+  --danger: #ff3b30;
+  --warning: #b25000;
+  --tile: #ffffff;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 6px 16px rgba(0, 0, 0, 0.06);
+  --radius: 12px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  /* Sticky stacking offsets. Measured from the boxes they belong to (the app
+     header's padding + title line, and the All Photos bar below it) and used
+     only by the sticky day headings, so a pixel of drift is cosmetic. The header
+     is deliberately kept to one line — the analysis read-out sits *in* it — so
+     this number does not move when analysis starts or stops. */
+  --header-h: 52px;
+  --allphotos-bar-h: 46px;
+  /* Grid spacing, and the tile's edge treatment.
+   *
+   * The grid is a contact sheet: tiles are 1px apart with 1px around the whole
+   * grid, so nothing but the photographs is on screen. That is also what forces
+   * the tile's own decoration off — at a 1px seam a drop shadow from every tile
+   * overlaps its neighbours into a grey wash, and a 12px corner radius cuts a
+   * notch out of each seam. One variable each, so this is one edit to loosen. */
+  --tile-gap: 1px;
+  --grid-pad: 1px;
+  --tile-radius: 2px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --panel: #2c2c2e;
+    --panel-border: rgba(255, 255, 255, 0.12);
+    --text: #f5f5f7;
+    --muted: #98989d;
+    --accent: #0a84ff;
+    --danger: #ff453a;
+    --warning: #ff9f0a;
+    --tile: #2c2c2e;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 6px 16px rgba(0, 0, 0, 0.35);
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* Any author `display` declaration outranks the user-agent rule behind the
+   `hidden` attribute, so an overlay such as .lightbox would stay on screen
+   forever without this. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font: inherit; cursor: pointer; }
+
+/* ---------- header ---------- */
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 24px 12px;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.app-title { display: flex; align-items: center; gap: 10px; flex: none; }
+
+.app-title h1 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.app-mark {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  background: linear-gradient(160deg, var(--accent), #6f4bff);
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.35);
+}
+
+/* The library counts sit hard right, and the analysis read-out takes the slack in
+   between. The auto margin lives here rather than on a wrapper because the header
+   has only these two children: anything that later needs grouping around them has
+   to own its own element again, or the right-hand alignment goes with it. */
+.app-summary {
+  display: flex; align-items: baseline; gap: 6px;
+  margin-left: auto;
+  color: var(--muted); font-size: 12.5px; white-space: nowrap;
+}
+.summary-total { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.summary-sep { opacity: 0.5; }
+
+.connection-dot {
+  width: 7px; height: 7px; margin-left: 8px; border-radius: 50%;
+  background: #30d158; display: inline-block; align-self: center;
+}
+.connection-dot.offline { background: var(--muted); }
+
+/* ---------- analysis progress, in the title bar ---------- */
+
+/* Three fixed columns — the analysis read-out takes the slack, the tools sit
+   right — so a long library count cannot shove the progress off the bar, and the
+   phase label is dropped first when the window gets narrow, because a truncated
+   bar reads worse than no label at all. */
+.analysis {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+
+.analysis-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+}
+.analysis-toggle:hover { border-color: var(--panel-border); background: color-mix(in srgb, var(--text) 5%, transparent); }
+.analysis-toggle:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 0; }
+
+/* The phase label never shrinks. It is the one thing in the read-out that says
+   *which* run this is, and a truncated "ANALYZING LIB…" is worse than a shorter
+   bar: the bar is the thing allowed to give up space, because its value is
+   repeated as a percentage beside it. */
+.analysis-phase {
+  flex: none;
+  font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.analysis.is-failed .analysis-phase { color: var(--warning); }
+
+/* The bar itself is the whole click target's worth of state; it is 6px tall and
+   has no border-radius on the fill so it reads as one continuous rule. It is the
+   only part of the read-out allowed to shrink when the window is narrow. */
+.analysis-bar {
+  flex: 0 1 auto;
+  width: 168px;
+  max-width: 40vw;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--muted) 24%, transparent);
+}
+.analysis-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), #6f4bff);
+  transition: width 0.25s ease;
+}
+.analysis-fill.indeterminate {
+  width: 30% !important;
+  animation: slide 1.4s ease-in-out infinite;
+}
+@keyframes slide {
+  0% { margin-left: 0; }
+  50% { margin-left: 70%; }
+  100% { margin-left: 0; }
+}
+.analysis-percent { font: 600 12px/1 var(--mono); font-variant-numeric: tabular-nums; color: var(--text); }
+
+/* The detail is a popover anchored under the read-out rather than a second line of
+   the header, which is what keeps the header one line tall. `role="note"` so it is
+   announced when it opens, and `white-space: nowrap` because every figure in it is
+   tabular already and a wrapped one is harder to read than a wide popover. */
+.analysis-detail {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 34;
+  max-width: min(92vw, 520px);
+  padding: 7px 11px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  box-shadow: var(--shadow);
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+}
+.analysis.is-failed .analysis-detail { color: var(--warning); }
+
+.banner {
+  margin: 16px 24px 0;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warning) 16%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline;
+}
+.banner-hint { color: var(--muted); }
+
+/* ---------- control panel ---------- */
+
+.panel {
+  margin: 16px 24px 0;
+  padding: 18px 20px 14px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+/* One line for the label and everything the slider currently says, so the
+   slider sits directly under the numbers that describe it. */
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 10px;
+}
+
+.panel-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* The readout trails the label rather than sitting on its own row, which is
+   what saves the vertical space; it yields and wraps on a narrow window. */
+.panel-head .range-readout {
+  margin: 0;
+  margin-left: auto;
+}
+
+.range-row { display: flex; align-items: center; gap: 14px; }
+
+/* Reset rides at the end of the track, so the row's trailing edge is the
+   "put it back" action rather than another number to read. */
+.range-reset { flex: none; white-space: nowrap; }
+
+.range-edge {
+  font: 500 12px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  min-width: 56px;
+  text-align: center;
+}
+
+.dual-range { position: relative; flex: 1; height: 28px; }
+
+.range-track {
+  position: absolute;
+  top: 50%; left: 0; right: 0;
+  height: 4px;
+  transform: translateY(-50%);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--muted) 26%, transparent);
+}
+
+.range-fill {
+  position: absolute;
+  top: 0; bottom: 0;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.dual-range input[type="range"] {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  background: none;
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.dual-range input[type="range"]:focus-visible { outline: none; }
+
+.dual-range input[type="range"]::-webkit-slider-runnable-track {
+  height: 28px;
+  background: transparent;
+  border: none;
+}
+
+.dual-range input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: auto;
+  width: 18px; height: 18px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: #fff;
+  border: 0.5px solid rgba(0, 0, 0, 0.18);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+  transition: transform 0.08s ease;
+}
+
+.dual-range input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.08); }
+.dual-range input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 45%, transparent); }
+.dual-range.disabled { opacity: 0.45; }
+
+.range-readout {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.inequality { font-family: var(--mono); font-size: 12px; letter-spacing: 0.01em; }
+.range-readout .sep { color: var(--muted); opacity: 0.6; }
+.range-readout .muted { color: var(--muted); }
+.range-readout strong { font-variant-numeric: tabular-nums; }
+
+/* The one warning the range can still raise — a degenerate window while only a
+   single score has been analysed — trails the readout on the title line. */
+.numeric-hint:not(:empty) { color: var(--warning); font-size: 12px; }
+.numeric-hint:not(:empty)::before { content: "· "; color: var(--muted); opacity: 0.6; }
+
+.controls-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px;
+  padding-top: 12px;
+  border-top: 1px solid var(--panel-border);
+}
+.sort-group, .toggle-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* Sort is the last thing in the panel, and it is pushed to the far right so that
+   is where the eye finishes, on the same line when there is room for it. */
+.sort-group { margin-left: auto; }
+.control-label { color: var(--muted); font-size: 12px; }
+
+.chip {
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  background: color-mix(in srgb, var(--bg) 55%, var(--panel));
+  color: var(--text);
+  font-size: 12px;
+}
+.chip:hover { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+.chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.ghost {
+  padding: 4px 11px;
+  border-radius: 7px;
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+}
+.ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.ghost:disabled { opacity: 0.45; cursor: default; }
+
+.danger {
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: var(--danger);
+  color: #fff;
+  font-weight: 600;
+  font-size: 12.5px;
+}
+.danger:hover:not(:disabled) { filter: brightness(1.06); }
+.danger:disabled { opacity: 0.4; cursor: default; }
+.danger.small { padding: 4px 11px; font-size: 12px; }
+
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
+.check.is-disabled { color: var(--muted); }
+.check input { accent-color: var(--accent); }
+
+.select { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.select select {
+  font: 12px inherit;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 55%, var(--panel));
+  border: 1px solid var(--panel-border);
+  border-radius: 7px;
+  padding: 3px 6px;
+}
+
+/* ---------- grid ---------- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(186px, 1fr));
+  gap: var(--tile-gap);
+  padding: var(--grid-pad);
+}
+
+.tile {
+  position: relative;
+  border-radius: var(--tile-radius);
+  overflow: hidden;
+  background: var(--tile);
+  cursor: pointer;
+}
+/* No lift on hover: at a 1px gap a tile raised 2px would sit on top of its
+   neighbour with no shadow to explain the overlap. The photo brightening instead
+   cannot reach outside the tile, so the feedback stays local. */
+.tile:hover { filter: brightness(1.03); }
+.tile.selected { outline: 3px solid var(--accent); outline-offset: -1px; }
+/* Keyboard users need to see where they are: the selection ring only shows
+   for a tile that is already selected. */
+.tile:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.tile-media { position: relative; display: block; line-height: 0; }
+
+/* Every tile is a square and the photograph is cropped to fill it, the way a
+   contact sheet has always been read: 53,000 photos have to be scannable, and a
+   square is the only shape that makes a grid of them uniform. The score is what
+   the grid is *for*, so it stays. */
+.tile-image {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+}
+.tile-image.failed { display: none; }
+
+.tile-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1 / 1;
+  padding: 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 11.5px;
+  background: repeating-linear-gradient(45deg,
+    color-mix(in srgb, var(--muted) 9%, transparent) 0 10px,
+    transparent 10px 20px);
+}
+
+/* The bottom-left corner, as one row: the heart that marks and sets the
+   favourite, then the score. They share a corner because the heart is only there
+   while the pointer is on the photo, and a score that slid sideways when the
+   pointer arrived would put the one number the grid is for in motion. */
+.tile-corner {
+  position: absolute;
+  left: 8px; bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tile-score {
+  padding: 3px 8px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font: 600 13px/1.2 var(--mono);
+  font-variant-numeric: tabular-nums;
+  backdrop-filter: blur(6px);
+}
+
+/* The heart.
+ *
+ * A button, and the only mark a favourite gets on a tile: it is both how you see
+ * the flag and how you set it, without a right-click or a trip through the
+ * lightbox. It is
+ * invisible on a photo that is not a favourite until the pointer is over that
+ * photo — 53,000 hearts is a wall of glyphs, and the heart is an offer, not a
+ * fact — and it stays put for the rest of the time when the photo *is* a
+ * favourite, which is the state it exists to report.
+ *
+ * `opacity` rather than `display`, for two reasons. The transition has something
+ * to animate, and the box is still laid out while the heart is invisible, so the
+ * score beside it never moves. `pointer-events: none` while it is invisible so
+ * there is no invisible click target; `:focus-within` gives the pointer-events
+ * back the moment the keyboard lands on it, which is what makes it reachable
+ * without a mouse at all. */
+.tile-heart {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  backdrop-filter: blur(6px);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.tile:hover .tile-heart,
+.tile:focus-within .tile-heart,
+.tile-heart.is-favorite {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* White in both states. The shape already says which one this is — an outline
+   heart is an offer, a solid one is the fact Photos holds — so a second colour
+   would be a second thing to learn for the same information. */
+.tile-heart:hover { background: rgba(0, 0, 0, 0.78); }
+.tile-heart:active { transform: scale(0.9); }
+
+.tile-check {
+  position: absolute; top: 8px; right: 8px;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.35);
+  color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+  backdrop-filter: blur(4px);
+}
+.tile.selected .tile-check { background: var(--accent); border-color: var(--accent); }
+
+.tile-inspect,
+.tile-tool {
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: none;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 11px;
+  backdrop-filter: blur(4px);
+}
+
+/* Hover tools. There are two of them now (Inspect, All Photos), so they share a
+   container that fades in as one thing and lays out side by side; each button
+   keeps its own class so hover titles and future additions stay independent. */
+.tile-tools {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.tile:hover .tile-tools, .tile:focus-within .tile-tools { opacity: 1; }
+
+.load-more, .grid-status { text-align: center; padding: 6px 24px 40px; color: var(--muted); font-size: 12px; }
+
+.empty-state {
+  margin: 28px 24px 60px;
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px dashed var(--panel-border);
+  border-radius: var(--radius);
+}
+.empty-state h2 { margin: 0 0 8px; font-size: 15px; color: var(--text); }
+.empty-state p { margin: 4px 0; }
+
+/* ---------- all photos (chronological window around one photo) ---------- */
+
+/* A second sticky bar under the header, so Back and "Selected photo" stay
+   reachable in a window that can be tens of thousands of pixels tall. */
+.allphotos-bar {
+  position: sticky;
+  top: var(--header-h);
+  z-index: 26;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 24px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--panel-border);
+}
+.allphotos-titles { min-width: 0; }
+.allphotos-title { font-weight: 600; letter-spacing: -0.01em; }
+.allphotos-sub { color: var(--muted); font-size: 12px; }
+.allphotos-bar .ghost:last-child { margin-left: auto; }
+
+/* ------------------------------------------------------ similar groups */
+
+/* The bar deliberately mirrors .allphotos-bar, so the two secondary views read as
+   one family and the sticky offset is already correct. */
+.groups-bar {
+  position: sticky;
+  top: var(--header-h);
+  z-index: 26;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 24px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--panel-border);
+}
+.groups-titles { min-width: 0; flex: 1; }
+.groups-title { font-weight: 600; letter-spacing: -0.01em; }
+.groups-sub { color: var(--muted); font-size: 12px; }
+.groups-controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.groups { padding: 12px 24px 96px; }
+
+.groups-progress {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--panel);
+  border-radius: 0 8px 8px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.groups-empty {
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--muted);
+  max-width: 44rem;
+  margin: 0 auto;
+}
+/* The two ends of a continuously-scrolling list. Margins, not zero-height rules,
+   so `rootMargin` can start the fetch before the edge is reached. They carry no
+   text: the loading message is the single row below the list, so "loading" reads
+   the same at either end. */
+.groups-sentinel { height: 1px; }
+
+/* The one loading message. `is-pending` is the slow variant — a grouping pass is
+   minutes of work, so it reads as a steady state rather than a spinner that looks
+   stuck. */
+.groups-busy {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 18px 24px 34px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+.groups-busy.is-pending { color: var(--accent); }
+
+.groups-spinner {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  border: 2px solid color-mix(in srgb, var(--muted) 35%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: groupsSpin 0.8s linear infinite;
+}
+/* No spinner for a pass that takes minutes — a spinning wheel for that long reads
+   as a hang, not as work. */
+.groups-busy.is-pending .groups-spinner {
+  border-top-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  animation-duration: 2.4s;
+}
+@keyframes groupsSpin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  /* The border-colour sweep still reads as activity without anything rotating. */
+  .groups-spinner { animation: none; border-top-color: var(--accent); }
+}
+
+.group-card {
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  margin-bottom: 12px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--panel-border);
+}
+.group-title { font-weight: 600; font-size: 13px; }
+.group-when { color: var(--muted); font-weight: 400; }
+.group-badges { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+/* A horizontal strip, not a grid. A group is a short run of near-identical frames,
+   and the decision is between neighbours — so they stay adjacent rather than
+   wrapping onto several rows, and a long burst scrolls sideways.
+
+   Every bit of chrome is spent on the picture. The gap is zero, the cell has no
+   padding of its own, and the only separation between two frames is the 1px margin
+   on each image — so the frames read as one continuous contact sheet rather than a
+   shelf of separate cards, and the strip is as wide as the photos in it. */
+.group-strip {
+  display: flex;
+  gap: 0;
+  padding: 4px;
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
+}
+/* The cell is a positioning context and nothing else. The rank number and the
+   meta line are overlays on the photo rather than grid rows beside it — which is
+   what lets the image fill the cell completely, with no padding and no columns
+   spent on a caption that sits on top of the picture anyway. */
+.group-cell {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  scroll-snap-align: start;
+}
+.group-cell:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
+.group-cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* A selected cell. Clicking a cell selects it, so this has to be visible on the
+   cell itself: the selection bar's count is too far away to be the only feedback,
+   and a strip is read by looking along it rather than at the bar.
+   An inset outline, matching `.tile.selected`, so the two surfaces mark a selected
+   photo identically. */
+.group-cell.selected { outline: 3px solid var(--accent); outline-offset: -1px; }
+
+/* The member a group was opened for — the photo "Show Similar Photos" was pressed
+   on. The ring is the same accent the All Photos anchor uses, so "the one you came
+   from" looks the same wherever it appears.
+
+   It is emphatically not a selection, and it is not `.selected`: a cell can be both
+   at once, and the two states have to be told apart. The origin's label says which
+   one it is, and it is drawn with a box shadow rather than an outline so a selected
+   origin shows both rather than the later rule winning. */
+.group-cell.origin { box-shadow: inset 0 0 0 3px var(--accent); }
+
+.group-origin-label {
+  position: absolute;
+  right: 5px; top: 5px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  /* Never a click target: the label sits over the image the cell opens. */
+  pointer-events: none;
+}
+/* Staged for deletion, same mark as a grid tile. */
+
+/* Only the leading member is emphasised. Best Shot exists to surface the best few
+   captures, so numbering 1..N as a league table would overstate what the ranking
+   claims.
+
+   An overlay rather than a grid column: as a column it would have taken width from
+   every frame in the strip, which is the one thing the strip cannot afford. */
+.group-rank {
+  position: absolute;
+  left: 5px; top: 5px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: color-mix(in srgb, #000 52%, transparent);
+  color: #fff;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  pointer-events: none;
+}
+.group-cell:first-child .group-rank { background: var(--accent); font-weight: 700; }
+
+/* 128 px, and 1 px of margin all round. The margin is the whole spacing rule for
+   the strip — `.group-strip` has no gap — so neighbouring frames sit a hairline
+   apart, which is how a contact sheet reads and how you can see that two frames
+   really are the same shot rather than merely similar. It also stops the rounded
+   corners of adjacent images from reading as one blob. */
+/* 132 px, and 1 px of margin. The margin is the *entire* spacing rule for the
+   strip — `.group-strip` has no gap and the cell no padding — so two frames sit a
+   hairline apart and read as one sheet of film rather than as separate cards. It
+   also stops the rounded corners of neighbours blending into a single blob.
+
+   The size is set so a long burst is still a scroll rather than a page of tiles,
+   while each frame is big enough to actually judge against its neighbour — which is
+   the only reason they are shown side by side. */
+.group-image {
+  display: block;
+  width: 132px;
+  height: 132px;
+  margin: 1px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--panel-border);
+}
+.group-image.failed { opacity: 0.3; }
+
+/* The overlay line, on the picture rather than under it. */
+.group-meta {
+  position: absolute;
+  right: 5px; bottom: 5px;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, #000 52%, transparent);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.group-face { color: var(--accent); }
+.group-heart { color: #f0b429; }
+
+.allphotos-note, .allphotos-end {
+  padding: 10px 24px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+.allphotos-note.busy { color: var(--accent); }
+.allphotos-end {
+  padding: 24px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: color-mix(in srgb, var(--muted) 78%, var(--text));
+}
+
+/* One heading per calendar day, the way Photos labels All Photos. Sticky, so
+   the day you are looking at stays named while its neighbours scroll past. */
+.day-heading {
+  position: sticky;
+  top: calc(var(--header-h) + var(--allphotos-bar-h));
+  z-index: 20;
+  margin: 0;
+  padding: 8px 24px 6px;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  backdrop-filter: saturate(180%) blur(12px);
+}
+.day + .day { margin-top: 2px; }
+/* No rule for `.day .grid`: it takes the grid's 1px padding like every other grid,
+   and the separation under a day heading is the heading's own 6px of padding. */
+
+/* The photo the user came for. Distinguished by a ring and by a label that
+   names it, so its position is obvious even when it is off the top of a long
+   scroll — and so it is still findable with the label rather than by hue alone. */
+.tile.anchor { outline: 3px solid var(--accent); outline-offset: -1px; }
+
+.tile-anchor-label {
+  position: absolute;
+  right: 8px; bottom: 8px;
+  padding: 3px 8px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.4);
+}
+
+/* One pulse on arrival, then nothing: the anchor has to announce itself once,
+   not flicker for as long as the view is open. */
+.tile.anchor-pulse { animation: anchorPulse 1.5s ease-out 2; }
+@keyframes anchorPulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent); }
+  70% { box-shadow: 0 0 0 16px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+/* ---------- selection bar ---------- */
+
+.selection-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 25;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 24px;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  border-top: 1px solid var(--panel-border);
+}
+.selection-summary { font-weight: 600; font-variant-numeric: tabular-nums; }
+.selection-summary .emphasis { color: var(--accent); }
+.selection-hint { color: var(--muted); font-size: 12px; }
+.selection-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+/* ---------- lightbox ---------- */
+
+.lightbox {
+  position: fixed; inset: 0; z-index: 60;
+  background: color-mix(in srgb, #000 78%, transparent);
+  backdrop-filter: blur(14px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 32px;
+}
+.lightbox-inner {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 268px;
+  gap: 20px;
+  max-width: 1280px;
+  width: 100%;
+  max-height: 100%;
+}
+.lightbox-stage {
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 240px;
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.lightbox-stage img { max-width: 100%; max-height: 78vh; display: block; }
+.lightbox-fallback { color: #fff; opacity: 0.85; padding: 24px; text-align: center; }
+
+.lightbox-close, .lightbox-nav {
+  position: absolute;
+  border: none;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  border-radius: 50%;
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px;
+  backdrop-filter: blur(8px);
+}
+.lightbox-close { top: -42px; right: 0; }
+.lightbox-nav { top: 50%; transform: translateY(-50%); font-size: 24px; }
+.lightbox-nav.prev { left: 12px; }
+.lightbox-nav.next { right: 12px; }
+.lightbox-nav:hover, .lightbox-close:hover { background: rgba(255, 255, 255, 0.28); }
+
+.lightbox-meta {
+  color: #fff;
+  background: rgba(28, 28, 30, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius);
+  padding: 18px;
+  align-self: start;
+}
+.meta-score {
+  font: 600 30px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 14px;
+}
+.lightbox-meta dl { margin: 0 0 16px; display: grid; gap: 7px; }
+.lightbox-meta dl > div { display: flex; justify-content: space-between; gap: 12px; }
+.lightbox-meta dt { color: rgba(255, 255, 255, 0.6); font-size: 12px; }
+.lightbox-meta dd { margin: 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+.lightbox-actions { display: flex; flex-direction: column; gap: 8px; }
+.lightbox-actions .chip { background: rgba(255, 255, 255, 0.14); border-color: rgba(255, 255, 255, 0.18); color: #fff; }
+.lightbox-position { margin-top: 12px; color: rgba(255, 255, 255, 0.55); font-size: 11.5px; }
+
+/* ---------- tile context menu ---------- */
+
+/* The layer is the positioned element; the menu and its footnote sit inside it
+   so a single flip calculation covers both. `position: fixed` because the menu
+   follows the cursor, not the document flow. */
+.menu-layer {
+  position: fixed;
+  z-index: 70;
+  min-width: 232px;
+  max-width: 300px;
+  /* Never taller than the space it can flip into. */
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.context-menu {
+  padding: 4px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28), 0 1px 2px rgba(0, 0, 0, 0.12);
+  backdrop-filter: saturate(180%) blur(20px);
+}
+
+.context-menu:focus { outline: none; }
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  /* A menu item is a button to the browser and a `menuitem` to assistive tech;
+     both are set, because the default button styling is not wanted. */
+  width: 100%;
+  padding: 4px 9px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: default;
+}
+.menu-item:hover:not([aria-disabled="true"]) { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+/* The roving focus is drawn as the menu's own highlight rather than the browser
+   outline, so it does not get clipped by the menu's rounded corners. */
+.menu-item:focus-visible { background: var(--accent); color: #fff; outline: none; }
+.menu-item:focus-visible .menu-hint { color: rgba(255, 255, 255, 0.8); }
+/* Disabled items stay visible — a greyed-out action explains why it is not
+   available — but are skipped by the arrow keys and refused on activation. */
+.menu-item[aria-disabled="true"] { color: var(--muted); opacity: 0.55; }
+.menu-hint { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+
+.menu-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--panel-border);
+  border: none;
+}
+
+/* The footnote: which photos an action will actually affect. Rendered outside
+   `role="menu"` so it is not read as an item. */
+.context-menu-hint {
+  margin: 4px 4px 0;
+  padding: 5px 8px 6px;
+  border-top: 1px solid var(--panel-border);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* ---------- toast ---------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 84px;
+  transform: translateX(-50%);
+  z-index: 90;
+  max-width: min(680px, calc(100vw - 48px));
+  padding: 11px 18px;
+  border-radius: 10px;
+  background: rgba(28, 28, 30, 0.94);
+  color: #fff;
+  font-size: 12.5px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+.toast.error { background: color-mix(in srgb, var(--danger) 92%, #000); }
+.toast.warning { background: color-mix(in srgb, var(--warning) 88%, #000); }
+
+/* The title bar, narrow. The header stays one line whatever happens, so things are
+   dropped in reverse order of how much they say: first the library counts, then
+   the phase label, and only at the very bottom the progress bar itself — a running
+   analysis still has to be visible, and a percentage with no bar is still a fact. */
+@media (max-width: 1000px) {
+  .app-summary { display: none; }
+}
+@media (max-width: 720px) {
+  .analysis-phase { display: none; }
+}
+@media (max-width: 520px) {
+  .analysis-bar { width: 64px; max-width: 24vw; }
+}
+
+@media (max-width: 900px) {
+  .lightbox-inner { grid-template-columns: minmax(0, 1fr); }
+  .lightbox-meta { align-self: stretch; }
+  .lightbox-close { top: -40px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
+
+/* ------------------------------------------------------------------ albums */
+
+/* Album chips and tags.
+ *
+ * `.album-chip` is the filter row: every chip is a real button carrying
+ * `aria-pressed`, so the active album is *announced* as selected and not merely
+ * styled differently. `.album-tag` is the chip in the lightbox that filters to
+ * one album of the photo being looked at.
+ *
+ * Both share one ramp so an active chip reads as chosen at a glance — an accent
+ * border *and* a tinted fill, never colour alone. */
+.album-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--panel-border);
+}
+.album-row-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.album-index-state { font-size: 12px; color: var(--muted); }
+/* The count explains which albums it is *not* counting in its tooltip, so it is
+   marked as the hover target only while it has one — `[title]` is set by the same
+   pass that fills the count in, and an affordance shown over a count with nothing
+   behind it teaches the user to stop hovering. `cursor: help` rather than a border
+   or an icon: it is the platform's own signal for "there is an explanation here",
+   and it costs the row no height. */
+.album-index-state[title] { cursor: help; }
+.album-reindex { font-size: 12px; padding: 2px 8px; }
+.album-chips { display: flex; flex-wrap: wrap; gap: 6px; max-height: 132px; overflow-y: auto; }
+
+.album-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  max-width: 100%;
+}
+.album-chip:hover:not(:disabled) { border-color: var(--accent); }
+.album-chip.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  font-weight: 600;
+}
+.album-chip:disabled { opacity: 0.5; cursor: default; }
+.album-chip-count { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 11px; }
+.album-chip.active .album-chip-count { color: inherit; }
+.album-note { font-size: 12px; line-height: 1.45; color: var(--muted); }
+
+/* Album chips in the lightbox. They are *not* on the tile: a photo's album is a
+   property of the photo, not of the score grid, and the tile stays a photograph.
+   The tile's tooltip and accessible name still name the album, and the chip row in
+   the control panel is the filter. */
+.album-tag {
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.3;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.album-tag:hover { border-color: var(--accent); }
+.album-none { font-size: 12px; color: var(--muted); }
+.meta-albums dd { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* The protected-favourite count beside the Protect Favorites switch. */
+.protected-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+/* Same `[title]`-conditional affordance as the album count: it explains the
+   figure on hover, and only claims to while it has something to say. */
+.protected-count[title] { cursor: help; }
+.protected-count.is-off { color: var(--warning); }
+#lightboxFavoriteToggle.is-favorite {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  font-weight: 600;
+}

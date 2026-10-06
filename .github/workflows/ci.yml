@@ -1,0 +1,56 @@
+name: CI
+
+# PhotoCleaner has no package manager and no third-party runtime: build.sh and
+# run-tests.sh drive `swiftc` directly. So this workflow needs nothing installed
+# beyond a macOS runner with a Swift toolchain — no `swift build`, no `swift test`,
+# no dependency resolution step.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test (macOS)
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          swift --version
+
+      # Compiles with -warnings-as-errors, embeds the web UI, draws the icon and
+      # ad-hoc signs the bundle. A warning fails the job.
+      - name: Build
+        run: ./build.sh
+
+      # 210 assertions over the production sources, compiled unmodified. No Photos
+      # library, no network, no real cache.
+      - name: Test
+        run: ./run-tests.sh
+
+      # Structural audit of the built bundle: Info.plist keys, codesign, the embedded
+      # UI being byte-identical to web/, and that the app has written nothing outside
+      # Application Support and Logs. Cache and server checks skip themselves when
+      # there is no library, so this is safe on a runner.
+      - name: Smoke test (static)
+        run: ./smoke-test.sh --no-server
+
+      - name: Upload the built app
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoCleaner.app
+          path: dist/PhotoCleaner.app
+          if-no-files-found: error

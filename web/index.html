@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>PhotoCleaner</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="app-title">
+    <span class="app-mark" aria-hidden="true"></span>
+    <h1>PhotoCleaner</h1>
+  </div>
+
+  <!-- Analysis progress lives in the title bar, not in a panel of its own.
+       The header has to stay one line tall — the All Photos and Similar Groups bars
+       stack underneath it and the sticky day headings measure against it — so the
+       running commentary (rate, ETA, failures) is one click away instead of
+       permanently on screen. A stopped analysis opens it by itself, because that
+       text is the reason to look. -->
+  <div class="analysis" id="analysisStatus" hidden>
+    <button class="analysis-toggle" id="analysisToggle" type="button"
+            aria-expanded="false" aria-controls="analysisDetail"
+            title="Show analysis detail">
+      <span class="analysis-phase" id="phaseLabel" aria-live="polite">Analyzing library</span>
+      <span class="analysis-bar" id="progressBar" role="progressbar"
+            aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-labelledby="phaseLabel"><span class="analysis-fill" id="progressFill"></span></span>
+      <span class="analysis-percent" id="progressPercent">0%</span>
+    </button>
+    <div class="analysis-detail" id="analysisDetail" hidden></div>
+  </div>
+
+  <div class="app-summary" id="librarySummary">
+    <span class="summary-total" id="headerTotal">—</span>
+    <span class="summary-label">photos</span>
+    <span class="summary-sep">·</span>
+    <span class="summary-total" id="headerAnalyzed">—</span>
+    <span class="summary-label">analyzed</span>
+    <span class="connection-dot" id="connectionDot" title="Live updates connected"></span>
+  </div>
+</header>
+
+<div class="banner" id="authorizationBanner" hidden>
+  <strong>Photos access is required.</strong>
+  <span id="authorizationDetail"></span>
+  <span class="banner-hint">Open System Settings › Privacy &amp; Security › Photos, enable PhotoCleaner, then relaunch.</span>
+</div>
+
+<section class="panel" id="controlPanel">
+  <!-- Title and readout share one line: the label says what the control is, the
+       readouts say what it is currently doing, and the slider below acts on both.
+       Stacking them would spend two rows saying one thing. -->
+  <div class="panel-head">
+    <div class="panel-label">Aesthetics</div>
+    <div class="range-readout">
+      <span class="inequality"><span id="lowerReadout">—</span> ≤ SCORE ≤ <span id="upperReadout">—</span></span>
+      <span class="sep">·</span>
+      <span><strong id="matchCount">0</strong> matching photos</span>
+      <span class="sep">·</span>
+      <span class="muted"><span id="analyzedCount">0</span> analyzed / <span id="totalCount">0</span> total</span>
+      <span class="sep" id="problemSeparator" hidden>·</span>
+      <span class="muted" id="problemCounts"></span>
+      <span class="numeric-hint" id="boundsHint"></span>
+    </div>
+  </div>
+
+  <!-- The bounds can only be set by dragging — the two number fields that used to
+       sit under the slider are gone, because a hand-typed score is not how anyone
+       picks "keep the top 10%" and it invited values outside the data. Reset sits
+       at the end of the track, where the hand already is after a drag. -->
+  <div class="range-row">
+    <span class="range-edge" id="observedMinLabel">—</span>
+    <div class="dual-range" id="dualRange">
+      <div class="range-track"><div class="range-fill" id="rangeFill"></div></div>
+      <input type="range" id="lowerRange" min="0" max="1000" step="1" value="0" aria-label="Lowest score">
+      <input type="range" id="upperRange" min="0" max="1000" step="1" value="1000" aria-label="Highest score">
+    </div>
+    <span class="range-edge" id="observedMaxLabel">—</span>
+    <button class="ghost range-reset" id="resetBounds"
+            title="Follow the observed minimum and maximum again">Reset</button>
+  </div>
+
+  <!-- Albums come second, straight after the score range: both are *filters*, and
+       they are what narrows 53,000 photos down to something you would actually
+       look at. Sort comes last because it is the one control that changes no
+       membership — it only reorders what is already on screen, so it reads as the
+       final decision about how to walk the result. -->
+  <!-- Album membership in Photos is many-to-many and a photo can be in no
+       album at all, so the row always offers "All albums" and "No album" as
+       first-class buckets alongside the user's own albums. Photos' automatic
+       collections (Recents, Favorites, Panoramas, Screenshots) are computed by
+       Photos rather than being membership anyone adds to, so they are named in
+       #albumIndexState's tooltip — the count a reader hovers when an album they
+       can see in Photos is missing — rather than offered as filters; see the note
+       on the server's /api/albums. Clicking a chip filters the grid; clicking it
+       again clears. #albumNote is left for the one case that must not wait for a
+       hover: PhotoCleaner failing to read the albums at all. -->
+  <div class="album-row" id="albumRow">
+    <div class="album-row-head">
+      <span class="control-label">Album</span>
+      <span class="album-index-state" id="albumIndexState"></span>
+      <button class="ghost album-reindex" id="albumReindex"
+              title="Read your album membership again from Photos">Re-read albums</button>
+    </div>
+    <div class="album-chips" id="albumChips" role="group" aria-label="Filter by album"></div>
+    <div class="album-note" id="albumNote" hidden></div>
+  </div>
+
+  <div class="controls-row">
+    <div class="toggle-group">
+      <label class="check" id="protectFavoritesOption"><input type="checkbox" id="protectFavorites" checked> Protect Favorites</label>
+      <!-- The protected count, stated next to the switch that decides whether
+           favourites are protected at all. "Protected" means exactly one thing
+           here: excluded from bulk deletion, unless the deletion explicitly
+           overrides it. The switch's own tooltip carries the same sentence, since
+           the count is what a reader hovers the *switch* about — "is turning this
+           on going to protect anything?" — and `aria-describedby` points the
+           checkbox's description at the count, so it is not hover-only. The heart is
+           decorative: it names nothing the sentence does not already say, and it is the
+           one glyph the favourite flag wears anywhere in the app. -->
+      <span class="protected-count" id="protectedCountWrap">
+        <span aria-hidden="true">♥</span> <span id="protectedCount">—</span> protected from deletion
+      </span>
+      <label class="check is-disabled" title="PhotoCleaner version 1 analyzes still photos. Video support is planned.">
+        <input type="checkbox" checked disabled> Images only
+      </label>
+      <label class="check"><input type="checkbox" id="icloudDownloads"> Download from iCloud when required</label>
+      <button class="ghost" id="rescanButton" title="Re-read the Photos library and score anything new">Rescan library</button>
+      <button class="ghost" id="retryButton" title="Re-queue assets whose analysis failed">Retry failures</button>
+      <button class="ghost" id="groupsButton"
+              title="Browse photos that are alternate captures of the same shot">Similar Groups…</button>
+    </div>
+
+    <div class="sort-group">
+      <span class="control-label">Sort</span>
+      <button class="chip" data-sort="score_asc">Score ↑</button>
+      <button class="chip" data-sort="score_desc">Score ↓</button>
+      <button class="chip" data-sort="date_desc">Newest</button>
+      <button class="chip" data-sort="date_asc">Oldest</button>
+    </div>
+  </div>
+</section>
+
+<!-- Similar Groups: photos that are alternate captures of approximately the same
+     shot, each group ordered either by Apple's aesthetics score or by Best Shot
+     (PhotoCleaner's within-group ranking). Opened from the control panel; the score
+     grid below is hidden while it is open and restored on the way back. -->
+<!-- Similar Groups. The bar's own two lines are addressed by id because the view
+     has two modes: the whole list, and one group opened for a specific photo by
+     "Show Similar Photos". Same browser, same sort control, different heading —
+     and the heading is what tells the user which of the two they are looking at. -->
+<section class="groups-bar" id="groupsBar" hidden>
+  <button class="ghost" id="groupsBack" title="Back to the grid (Esc)">← Back</button>
+  <div class="groups-titles">
+    <div class="groups-title" id="groupsTitle">Similar Groups</div>
+    <div class="groups-sub" id="groupsSub">Photos that look like alternate captures of the same shot · sorted within each group</div>
+    <div class="groups-sub" id="groupsMeta">—</div>
+  </div>
+  <div class="groups-controls">
+    <div class="sort-group">
+      <span class="control-label">Within group</span>
+      <button class="chip" data-group-order="aesthetics">Aesthetics</button>
+      <button class="chip" data-group-order="best_shot">Best Shot</button>
+    </div>
+    <button class="ghost" id="groupsRebuild" title="Group the library again">Rebuild</button>
+  </div>
+</section>
+
+<section class="groups" id="groupsView" hidden aria-label="Similar groups">
+  <div class="groups-progress" id="groupsProgress" hidden></div>
+  <!-- Continuous scrolling, in both directions.
+       A "Load more" button could only ever go forwards, so the group you had just
+       examined was unreachable without reopening the view; and a single bottom
+       sentinel cannot go backwards either. Two sentinels bracketing the list fix
+       both: scrolling to either end pulls the next page in that direction.
+
+       They are margins rather than zero-height rules, so `rootMargin` can start
+       the fetch *before* the edge is reached and the strip never visibly stalls.
+       They carry no text of their own — the loading state is the row above the
+       list, which is one message for both ends. -->
+  <div class="groups-sentinel" id="groupsSentinelTop" aria-hidden="true"></div>
+  <div id="groupsList"></div>
+  <div class="groups-sentinel" id="groupsSentinelBottom" aria-hidden="true"></div>
+  <!-- The one loading message. Shown for a first load, a pull-in at either end,
+       and — the case that matters most — a grouping pass that has not finished
+       yet, which must never be allowed to read as "there are no groups". -->
+  <div class="groups-busy" id="groupsBusy" hidden>
+    <span class="groups-spinner" aria-hidden="true"></span>
+    <span id="groupsBusyText">Loading groups…</span>
+  </div>
+</section>
+
+<!-- "Show in All Photos": a reverse-chronological window around one photo,
+     grouped by day. Opened from a tile or from the lightbox; the score grid
+     above is hidden while it is open and restored — scroll position, selection
+     and all — on the way back. -->
+<section class="allphotos-bar" id="allPhotosBar" hidden>
+  <button class="ghost" id="allPhotosBack" title="Back to the grid (Esc)">← Back</button>
+  <div class="allphotos-titles">
+    <div class="allphotos-title">All Photos</div>
+    <div class="allphotos-sub">Newest first · ordered by date only — the aesthetics score plays no part</div>
+    <div class="allphotos-sub" id="allPhotosMeta"></div>
+  </div>
+  <button class="ghost" id="allPhotosToAnchor" title="Scroll back to the photo you came from">Selected photo</button>
+</section>
+
+<section class="allphotos" id="allPhotosView" hidden aria-label="All photos by date">
+  <div class="allphotos-end" id="allPhotosNewerEnd" hidden>Newest photo PhotoCleaner has scored</div>
+  <div class="sentinel" id="allPhotosNewerSentinel" aria-hidden="true"></div>
+  <div class="allphotos-note" id="allPhotosNewerNote" hidden></div>
+  <div id="allPhotosDays"></div>
+  <div class="allphotos-note" id="allPhotosOlderNote" hidden></div>
+  <div class="sentinel" id="allPhotosOlderSentinel" aria-hidden="true"></div>
+  <div class="allphotos-end" id="allPhotosOlderEnd" hidden>Oldest photo PhotoCleaner has scored</div>
+</section>
+
+<main class="grid" id="grid" aria-label="Matching photos"></main>
+
+<div class="empty-state" id="emptyState" role="status" hidden></div>
+
+<div class="sentinel" id="sentinel" aria-hidden="true"></div>
+<div class="load-more" id="loadMore" hidden><button class="ghost" id="loadMoreButton">Load more</button></div>
+
+<footer class="selection-bar" id="selectionBar">
+  <!-- One control, one step: this button destroys the selection now, labelled with
+       the count the server itself resolved so the number read is the number that
+       goes. It is the only control that calls /api/delete. Nothing is held back
+       between choosing and doing, so there is no list, no panel and no undo. -->
+  <div class="selection-summary" id="selectionSummary" aria-live="polite">Nothing selected</div>
+  <div class="selection-hint" id="selectionHint">Click to select · Shift-click for a range · ⌫ or Delete deletes the selection</div>
+  <div class="selection-actions">
+    <button class="ghost" id="selectAllMatching">Select all matching</button>
+    <button class="ghost" id="clearSelection" disabled>Clear selection</button>
+    <button class="danger" id="deleteButton" disabled
+            title="Delete the selection through Photos. This cannot be undone.">Delete</button>
+  </div>
+</footer>
+
+<!-- The tile context menu. One instance, reused: a right-click while one is open
+     re-anchors it rather than leaving two on screen. Items are built in JS so
+     they can be enabled, disabled and relabelled per photo; the container and
+     its footer live here so the ids are static. The menu is hidden until a tile
+     asks for it, and `openTileMenu` places the layer against the viewport. -->
+<div class="menu-layer" id="tileMenuLayer" hidden>
+  <div class="context-menu" id="tileMenu" role="menu" aria-label="Actions for this photo" tabindex="-1"></div>
+  <div class="context-menu-hint" id="tileMenuHint"></div>
+</div>
+
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lightbox-inner">
+    <button class="lightbox-close" id="lightboxClose" title="Close (Esc)">✕</button>
+    <div class="lightbox-stage" id="lightboxStage">
+      <button class="lightbox-nav prev" id="lightboxPrev" title="Previous (←)">‹</button>
+      <button class="lightbox-nav next" id="lightboxNext" title="Next (→)">›</button>
+      <img id="lightboxImage" alt="">
+      <div class="lightbox-fallback" id="lightboxFallback" hidden>Preview unavailable — the original is not on this Mac.</div>
+    </div>
+    <div class="lightbox-meta">
+      <div class="meta-score" id="lightboxScore">—</div>
+      <dl>
+        <div><dt>Date</dt><dd id="lightboxDate">—</dd></div>
+        <div><dt>Dimensions</dt><dd id="lightboxDimensions">—</dd></div>
+        <div><dt>Favorite</dt><dd id="lightboxFavorite">—</dd></div>
+        <!-- Album names, as clickable chips: clicking one filters the grid to that
+             album. Built by JS because the set comes from PhotoKit. A photo can be
+             in several albums, or none, and both are shown rather than hidden. -->
+        <div class="meta-albums"><dt>Albums</dt><dd id="lightboxAlbums">—</dd></div>
+      </dl>
+      <div class="lightbox-actions">
+        <button class="chip" id="lightboxAllPhotos">Show in All Photos</button>
+        <!-- The same action as the tile menu's "Show Similar Photos", offered here
+             as a chip for the same reason "Show in All Photos" is: right-click is
+             not reachable from a trackpad or a keyboard. One handler, one
+             implementation — see `showSimilarPhotos`. -->
+        <button class="chip" id="lightboxSimilarPhotos">Show Similar Photos</button>
+        <button class="chip" id="lightboxSelect">Select (Space)</button>
+        <!-- The favourite toggle, in the same heart the tiles use: one glyph for one
+             flag, everywhere. Favourite *means* "excluded from bulk deletion"
+             while Protect Favorites is on — that is the one protection this tool
+             has — so the button says so rather than offering a vague "protect". -->
+        <button class="chip" id="lightboxFavoriteToggle" aria-pressed="false">♥ Favourite</button>
+        <!-- Destroys the photo on screen. One photo, one press, and the same
+             function the bar's button and the tile menu's item call. -->
+        <button class="danger small" id="lightboxDelete">Delete</button>
+      </div>
+      <div class="lightbox-position" id="lightboxPosition"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<noscript>
+  <p style="padding:2rem;font:14px -apple-system,system-ui">PhotoCleaner needs JavaScript to display the library.</p>
+</noscript>
+
+<script src="/app.js"></script>
+</body>
+</html>

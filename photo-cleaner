@@ -1,0 +1,144 @@
+#!/bin/bash
+#
+# Launcher for PhotoCleaner.
+#
+#   ./photo-cleaner                  build if needed, start, show the window
+#   ./photo-cleaner --foreground     run in this terminal (Ctrl-C to stop)
+#   ./photo-cleaner --port 8766      listen on another loopback port
+#   ./photo-cleaner --browser        show the interface in the default browser
+#   ./photo-cleaner --no-browser     show no interface at all
+#   ./photo-cleaner --help | --version   handled by the binary itself
+#
+# PHOTOCLEANER_FOREGROUND=1 has the same effect as --foreground, for callers
+# that would rather set the environment than pass a flag.
+#
+# By default the app is started with `open`, which makes macOS attribute the
+# Photos permission prompt to PhotoCleaner itself rather than to your terminal.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP="$ROOT/dist/PhotoCleaner.app"
+BINARY="$APP/Contents/MacOS/PhotoCleaner"
+
+PORT=8765
+# An explicit --foreground still wins over the environment variable.
+FOREGROUND="${PHOTOCLEANER_FOREGROUND:-0}"
+# --help/--version print and exit: they never need a build or a staleness note.
+INFO_ONLY=0
+ARGS=()
+
+usage() {
+    cat >&2 <<'EOF'
+usage: photo-cleaner [--foreground] [--port <n>] [--browser] [--no-browser] [--help] [--version]
+
+  --foreground   run in this terminal (Ctrl-C to stop) instead of via `open`
+  --port <n>     loopback port to listen on (default 8765)
+  --browser      show the interface in the default browser, not in a window
+  --no-browser   show no interface at all; just run the server
+  --help, -h     print the binary's help and exit
+  --version, -v  print the version and exit
+
+PHOTOCLEANER_FOREGROUND=1 is equivalent to --foreground.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --foreground)
+            FOREGROUND=1
+            shift
+            ;;
+        --port)
+            if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+                echo "photo-cleaner: --port needs a port number" >&2
+                usage
+                exit 2
+            fi
+            case "$2" in
+                *[!0-9]*|"")
+                    echo "photo-cleaner: '$2' is not a port number" >&2
+                    exit 2
+                    ;;
+            esac
+            PORT="$2"
+            ARGS+=("--port" "$PORT")
+            shift 2
+            ;;
+        --help|-h|--version|-v)
+            # Handled entirely by the binary; run it in the foreground.
+            FOREGROUND=1
+            INFO_ONLY=1
+            ARGS+=("$1")
+            shift
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ "$INFO_ONLY" = "1" ]; then
+    exec "$BINARY" ${ARGS[@]+"${ARGS[@]}"}
+fi
+
+if [ ! -x "$BINARY" ] || [ ! -f "$APP/Contents/Info.plist" ]; then
+    echo "PhotoCleaner is not built yet — building now."
+    "$ROOT/build.sh"
+    echo
+fi
+
+# A rebuild is never implicit: `open`ing an old binary would silently serve the
+# previous version of the UI, so say so instead.
+if [ -n "$(find "$ROOT/web" "$ROOT/Sources" -type f -newer "$BINARY" -print -quit 2>/dev/null)" ]; then
+    echo "Note: web/ or Sources/ is newer than the built app — run ./build.sh to pick up your changes." >&2
+fi
+
+if [ "$FOREGROUND" = "1" ]; then
+    exec "$BINARY" ${ARGS[@]+"${ARGS[@]}"}
+fi
+
+if [ "${#ARGS[@]}" -gt 0 ]; then
+    open -n "$APP" --args "${ARGS[@]}"
+else
+    open -n "$APP"
+fi
+
+# Report only once PhotoCleaner itself is answering on that port. A bare TCP
+# connect would happily succeed against an unrelated listener — or an older
+# PhotoCleaner left over from before a rebuild.
+serving() {
+    if command -v curl >/dev/null 2>&1; then
+        # Captured rather than piped: `grep -q` exits early, and with
+        # `set -o pipefail` that SIGPIPE would make curl's failure look like a
+        # failed probe even on a successful match.
+        local body
+        body="$(curl -fsS -m 1 "http://127.0.0.1:$1/api/status" 2>/dev/null || true)"
+        case "$body" in
+            *'"version"'*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    # No curl: fall back to a plain TCP connect.
+    nc -z 127.0.0.1 "$1" 2>/dev/null
+}
+
+for _ in $(seq 1 60); do
+    if serving "$PORT"; then
+        echo
+        echo "  PhotoCleaner running at http://127.0.0.1:$PORT"
+        echo
+        exit 0
+    fi
+    sleep 0.25
+done
+
+cat >&2 <<EOF
+
+  PhotoCleaner did not start listening on port $PORT.
+  Check the log:  ~/Library/Logs/PhotoCleaner/PhotoCleaner.log
+  Or run in this terminal for live output:  ./photo-cleaner --foreground
+
+EOF
+exit 1
