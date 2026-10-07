@@ -263,7 +263,18 @@ final class VideoLibrary: @unchecked Sendable {
         // that already exists. `requestAVAsset` is what lets an iCloud-only clip
         // be played with downloads permitted at all.
         let export = try await export(asset: asset, identifier: identifier, allowNetwork: allowNetwork)
-        try install(export, at: destination)
+        // The export owns its temporary file — see `export`, which deliberately does
+        // not clean it up on the way out — so every exit from here has to dispose of
+        // it. `install` moves it on success, which consumes it; a throw between the
+        // two would otherwise leave a whole clip's worth of bytes in the cache
+        // directory under a name nothing will ever look up, counted against the
+        // eviction bound until the next pass happens to collect it.
+        do {
+            try install(export, at: destination)
+        } catch {
+            try? FileManager.default.removeItem(at: export)
+            throw error
+        }
         enforceBounds()
         return destination
     }
@@ -551,10 +562,37 @@ final class VideoLibrary: @unchecked Sendable {
         let temporary = AppPaths.videoCacheDirectory
             .appendingPathComponent("\(Self.digest(identifier)).\(UUID().uuidString)")
             .appendingPathExtension(Self.pathExtension(for: fileType))
-        defer { try? fm.removeItem(at: temporary) }
 
-        try await session.export(to: temporary, as: fileType)
-        guard fm.fileExists(atPath: temporary.path) else { throw PhotoLibraryError.imageUnavailable }
+        // ## The temporary file is the caller's to clean up, deliberately
+        //
+        // There is no `defer` removing it here, and that is load-bearing. A `defer`
+        // in this function would delete the export **before** the caller ever sees
+        // the URL: `defer` runs when the scope exits, which is after the return value
+        // is computed and before control actually reaches the caller. So the sequence
+        // would be "export → compute the URL → *delete the file* → return the URL of
+        // a file that no longer exists", and `install` would then fail with
+        // `NSCocoaErrorDomain Code=4`, "the former doesn't exist" — on **every**
+        // clip, with the bytes correctly written and then thrown away.
+        //
+        // So ownership passes to the caller: `exportedFile` installs the file (moving
+        // it, which consumes the temporary) and removes it on any failure, and
+        // nothing else can reach this path.
+        //
+        // Found by playing a real clip against a real library. Every test of this
+        // code passed first, because the tests never went through `export` — they
+        // covered the Range parser, the refusal gate and the cache-hit path, none of
+        // which export anything. A test that seeds a file on disk cannot see a bug
+        // that only exists while the file is being written.
+        do {
+            try await session.export(to: temporary, as: fileType)
+        } catch {
+            try? fm.removeItem(at: temporary)
+            throw error
+        }
+        guard fm.fileExists(atPath: temporary.path) else {
+            try? fm.removeItem(at: temporary)
+            throw PhotoLibraryError.imageUnavailable
+        }
         return temporary
     }
 

@@ -139,6 +139,65 @@ for pat in 'protectFavorites' 'protectedCount' 'Protect Favorites' 'protected fr
   fi
 done
 
+# The mirror of that check, for video. "Images only" was a *disabled* checkbox whose
+# tooltip said video support was planned — a claim about the product, made in the UI,
+# and now false. A disabled control that claims something is unimplemented is the same
+# class of defect as a live one that offers it: the user is told something the app can
+# no longer do, and no amount of testing the real feature catches the stale sentence.
+#
+# So the *absence* is asserted here, and the presence of a real control is asserted by
+# the jsdom suite. If the media control is ever removed, this passes and that fails —
+# which is the pairing that stops video support quietly becoming "not implemented
+# again" while the copy stays.
+for pat in 'Video support is planned' 'analyzes still photos'; do
+  if grep -qF -- "$pat" "$ROOT/web/index.html" "$ROOT/web/app.css" "$ROOT/web/app.js" 2>/dev/null; then
+    bad "web/ still claims video is unsupported: \"$pat\""
+    grep -nF -- "$pat" "$ROOT/web/index.html" "$ROOT/web/app.css" "$ROOT/web/app.js" | sed 's/^/        /'
+  else
+    ok "no \"$pat\" in the web client"
+  fi
+done
+
+# "Images only" is checked separately and more narrowly, because the word pair now
+# survives in an HTML comment that *explains* the control's replacement — which is
+# exactly the comment that should stay. What must not survive is the phrase in
+# something a reader sees, so only the rendered text is searched: `index.html` with
+# comments stripped, plus `app.js`, where a string would reach the DOM.
+strip_html_comments() {
+  # Removes `<!-- … -->`, including a multi-line one. `sed` rather than a real parser
+  # because this only has to be good enough not to hide a visible claim, and a
+  # malformed comment would have to be a bug worth failing on anyway.
+  perl -0pe 's/<!--.*?-->//gs' "$1"
+}
+if strip_html_comments "$ROOT/web/index.html" | grep -qF 'Images only'; then
+  bad "web/ still shows an \"Images only\" label to the reader"
+  strip_html_comments "$ROOT/web/index.html" | grep -nF 'Images only' | sed 's/^/        /'
+elif grep -qF 'Images only' "$ROOT/web/app.js" 2>/dev/null; then
+  bad "web/app.js still renders an \"Images only\" label"
+  grep -nF 'Images only' "$ROOT/web/app.js" | sed 's/^/        /'
+else
+  ok "no \"Images only\" label in anything the reader sees"
+fi
+
+# And the control itself has to be there: an absent media filter is how "videos are
+# scored but unreachable" would ship, which is a green suite and an empty feature.
+# All three choices are required, not one of them — checking only that *some*
+# `data-media` exists passed while the Videos chip had been stripped out, which is
+# exactly the failure the check is for.
+missing_media=""
+for choice in all images videos; do
+  grep -qF "data-media=\"$choice\"" "$ROOT/web/index.html" 2>/dev/null \
+    || missing_media="$missing_media $choice"
+done
+if [ -n "$missing_media" ] || ! grep -qF 'mediaChips' "$ROOT/web/index.html" 2>/dev/null; then
+  bad "the media filter is incomplete (missing:${missing_media:- the container}) — "
+  bad "  videos are scored but there may be no way to show them"
+elif ! grep -qF 'mediaChips' "$ROOT/web/app.js" 2>/dev/null; then
+  bad "the media filter is in the markup but the client never reads it"
+else
+  ok "the media filter offers All / Photos / Videos and the client reads it"
+fi
+
 # The guarantee still has to be *stated* somewhere, or removing the control would
 # just have deleted the information rather than relocated it. Checked against the
 # heart's own surfaces, which is where the user acts on a favourite.

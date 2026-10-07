@@ -841,6 +841,53 @@ within-group ordering? If neither, it does not belong.
   an edited clip simply misses and re-exports. This was left alone because it is a
   narrow case with a bounded cost — an extra export — against a change to the cache's
   key format.
+- **Clip playback is verified at the HTTP layer and in jsdom, but not by eye.** Against
+  the real library (54,614 assets, 1,953 clips) a scored clip serves
+  `200 video/quicktime` at 1.23 GB, `Range: bytes=0-99` → `206` with
+  `Content-Range: bytes 0-99/1234186379`, `bytes=5000-5099` → genuinely different bytes
+  (offset 0 is a valid MP4 `ftyp` box), and `bytes=99999999999-` → `416`.
+  `tools/web-ui-tests.mjs` runs 49 checks against that server, all green, including
+  the fourteen video ones: the media control, a clip rendering as a `<video>` with the
+  poster and no autoplay, and teardown on close and on paging. What is **not** proven
+  is what only pixels can answer: the lightbox hand-over timing (does
+  `loadedmetadata` arrive fast enough for the poster frame to read as the video, or is
+  there a visible gap), and whether `.tile-duration` collides with `.tile-check` or
+  `.tile-anchor-label` on a real grid — the duration is offset to `bottom: 30px` under
+  `.tile.anchor` precisely because those two marks exist.
+- **A clip is scored from up to three frames, and that is a judgement, not a
+  measurement.** `representativeTimes` samples 10%/50%/90% of the duration and the
+  median wins, so one black leader frame or blown highlight cannot set a clip's
+  score. Nobody has compared that against a human ranking of the same clips, and
+  nobody has checked whether three frames is the right number — a clip whose only
+  interesting content is between the samples scores on frames of something else.
+  **What it would take to measure**: score a set of clips at 1, 3 and 9 frames and
+  have a person rank them, then ask how often the ordering changes.
+- **A `PHAssetMediaType.unknown` fetch returns nothing, silently.** `.unknown` is the
+  *unknown* type, not "every type" — Photos holds no assets of it, so
+  `fetchAssets(with: .unknown, …)` answers 0 rows with no error, no exception and no
+  warning. It is the worst failure available to a library scan: an instant walk, an
+  empty cache, and a status of `up_to_date` — a green run and a blank grid. It is
+  what the first implementation of `fetchScannableAssets` did, and the whole library
+  was invisible for that reason. The media type is therefore narrowed by the *type
+  argument*, one fetch per type, merged into one ordered walk; see the comment on
+  `fetchScannableAssets` for the measured table. **What would reintroduce it**:
+  passing `.unknown`, or widening the predicate and calling the result "one query".
+- **`PHFetchOptions.predicate` is not SQL, and an unsupported one aborts the process.**
+  An unevaluable predicate raises `NSInvalidArgumentException` from inside Photos —
+  an Objective-C exception, so it cannot be caught in Swift and cannot be reported as
+  an error; the app simply dies. Verified on this SDK: `TRUEPREDICATE` raises
+  `Unsupported predicate in fetch options`. Only the `mediaType ==` forms used by
+  `scannableMediaPredicate` are known to be safe.
+- **The whole video path was green in CI and broken in the product.** The export step
+  deleted its own output: `defer { removeItem(at: temporary) }` in `VideoLibrary.export`
+  ran *after* the return value was computed and *before* the caller received the URL,
+  so every clip exported correctly and was then unlinked before `install` could move
+  it — a `500` with `NSCocoaErrorDomain Code=4` on every single clip. No test caught
+  it because every video test either covered the Range parser or seeded a finished
+  file on disk, and **no test of this code path ever exported anything**: the bug
+  exists only while the file is being written. The general lesson, now the reason the
+  suite includes `VideoRouteTests`: cover the seam where a file is *produced*, not
+  only the code that consumes one that already exists.
 - A scan is not a consistent snapshot: the library can mutate mid-enumeration. That is
   handled, but not prevented.
 - **Self-update cannot install everything.** `UpdateTarget.plan` refuses a bundle that
@@ -872,8 +919,15 @@ executable, because SwiftPM does not work here.
    the count contract, favourite protection, keyset pagination over tied values, the
    analysis state machine, HTTP parsing and single-response latching, timeline
    ordering, confirm tokens, albums, similar groups, schema migration, the Photos
-   authorization gate, self-update, the icon, and the window's launch-flag parsing,
-   shutdown relay and navigation policy. It needs no Photos library and no network.
+   authorization gate, self-update, the icon, the window's launch-flag parsing,
+   shutdown relay and navigation policy, and — since schema version 5 — the video
+   route end to end over a real socket: `Range` handling, `206`/`416`, `HEAD`
+   framing, keep-alive across a streamed body, the media filter and the
+   identifier-before-PhotoKit refusal gate. It needs no Photos library and no network.
+   **Serialise it against `build.sh`.** The script regenerates
+   `Web/GeneratedWebAssets.swift` in place and then compiles it, so a concurrent
+   build fails with "input file was modified during the build" — which reads like a
+   source problem and is not one.
 2. **`./build.sh`** — compiles with `-warnings-as-errors` and assembles the bundle.
 3. **`./smoke-test.sh`** — audits the real cache and, importantly, **what the app has
    written outside Application Support and Logs**. The windowed app is allowed exactly
@@ -885,12 +939,41 @@ executable, because SwiftPM does not work here.
    running server. Not wired into CI; see [WEB-UI-TESTS.md](WEB-UI-TESTS.md) for how
    to run it and the five things jsdom does not have. **A change to `web/` needs this
    suite too** — `run-tests.sh` compiles `web/` into the binary but asserts nothing
-   about how it behaves.
+   about how it behaves. Three things to know before trusting a run: it needs jsdom
+   (`JSDOM_PATH`) **and a server whose cache has rows in it**, because the harness
+   waits for a first tile and an empty library renders none — so it fails at boot on a
+   clean machine rather than skipping, which looks like a client bug and is not one.
+   It must be pointed at the build under test (see the handoff below). And a check
+   that depends on a *request* happening must poll for it rather than sleep: two of
+   the video cases flaked at a fixed `settle(700)` on a machine whose videos-filtered
+   page took longer to arrive, and passed once they waited for the condition instead.
 5. **Against the real library**, for anything structural that needs real PhotoKit or
    Vision behaviour.
 
+**The single-instance handoff will silently test the wrong binary.** A second launch
+on a taken port finds the instance that owns it, hands the address over and exits 0
+(`PhotoCleanerApp.handleStartFailure`) — under `--no-browser` it hands over and
+prints one line to stderr. So a stale server keeps serving, a route added since it
+started answers 404, and nothing reports an error: the request looks like a wrong
+answer rather than a wrong *server*. This is not hypothetical; it produced a confident
+but false "the live server does not echo `media`" reading before the process start
+time was checked. **Before trusting any live-server result, confirm the process is
+the build under test** — `ps -o lstart -p $(lsof -ti tcp:<port> -sTCP:LISTEN)`, or
+ask for a field only the new build emits (`library.videos`) rather than only for
+fields it has always had.
+
 Set `PHOTOCLEANER_SLOW_TESTS=1` to include the cases that wait on production
 timeouts.
+
+**Current state**, for whoever picks this up next. `./run-tests.sh --strict` reports
+**321 passed, 0 failed, 2 skipped** (the two are the production-timeout cases above);
+`./build.sh` is clean under `-warnings-as-errors`; `./smoke-test.sh` reports 56 passed;
+and `node tools/web-ui-tests.mjs` reports **49 passed, 0 failed** against a server on a
+populated library, fourteen of those being the video cases. Two things are
+consequently unproven and are recorded in §10 — the lightbox hand-over timing for a
+real clip, and whether `.tile-duration` collides with `.tile-check` or
+`.tile-anchor-label` on a real grid. Neither is a question the test suites can
+answer; both need a window.
 
 **A new test is only worth having once it has been seen to fail.** When changing
 `CacheStore` pagination, `resolveSelection`, or the deletion path, prove the case is

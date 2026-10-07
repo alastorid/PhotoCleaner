@@ -690,8 +690,11 @@ await check('shift-clicking a group cell selects the range between', async (app)
   last.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: true }));
   await app.settle(250);
 
+  // "assets": the noun follows the media filter, and the default is "all", which
+  // admits clips as well as photographs. Group *members* are always stills today,
+  // but the bar counts what the selection resolved to rather than what a group is.
   const summary = app.$('selectionSummary').textContent;
-  assert(/4 photos selected/.test(summary), `the range selected the wrong span: ${summary}`);
+  assert(/4 assets selected/.test(summary), `the range selected the wrong span: ${summary}`);
   for (const index of [1, 2, 3, 4]) {
     assert(cellAt(app, card, index).classList.contains('selected'),
       `rank ${index + 1} is in the range but is not marked`);
@@ -1132,7 +1135,11 @@ await check('the chips follow the server\'s echo, not the click that asked', asy
   };
 
   app.click('#mediaChips [data-media="videos"]');
-  await app.settle(700);
+  // Polled, not slept: the assertion is about the *request* having been made and
+  // answered, and a fixed interval that suffices on a warm machine is a flake on a
+  // cold one. `settled` also would not do — the client renders the grid before the
+  // rewritten echo arrives, so a tile on screen is not evidence the echo landed.
+  for (let attempt = 0; attempt < 40 && rewrote === 0; attempt += 1) await app.settle(100);
   assert(rewrote > 0, 'the videos-filtered page carrying the echo was never fetched');
   assertEqual(app.$('mediaChips').querySelector('[data-media="all"]').getAttribute('aria-pressed'), 'true',
     'the chips still show the click rather than the media the server applied');
@@ -1155,7 +1162,12 @@ await check('"Select all matching" pins the media dimension in the snapshot', as
     return real(input, init);
   };
   app.click('selectAllMatching');
-  await app.settle(700);
+  // Poll for the request rather than sleeping a fixed interval. How long the
+  // videos-filtered grid took to render depends on how many clips are scored and
+  // how long the server takes to answer, and a fixed sleep that is long enough on
+  // a fast machine is a flake on a slow one — the request simply had not been made
+  // yet, and the case failed for having been too early rather than for being wrong.
+  for (let attempt = 0; attempt < 40 && sent.length === 0; attempt += 1) await app.settle(100);
 
   assertEqual(sent.length, 1, `the selection was not resolved (${sent.length} requests)`);
   assertEqual(sent[0].mode, 'matching', 'the snapshot is not a filter');

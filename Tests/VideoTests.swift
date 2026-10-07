@@ -26,6 +26,27 @@ import SQLite3
 func registerVideoTests() {
     let suite = "video support"
 
+    // MARK: - the export cache's filename
+
+    Registry.shared.add(suite: suite, TestCase(name: "a cache filename survives an identifier with slashes, and is injective",
+        knownBug: nil) {
+        // A Photos `localIdentifier` contains `/` (`…/L0/001`), so using one verbatim
+        // as a path component escapes the cache directory and `install`'s move fails.
+        // The encoding has to be injective too: two identifiers sharing a filename
+        // would serve one person's clip for another's.
+        let awkward = "E6CE86CA-57E5-4C14-940C-DA8193961D55/L0/001"
+        let name = VideoLibrary.digest(awkward)
+        check(!name.contains("/"), "an identifier's slashes cannot reach the path: \(name)")
+        check(!name.contains("\\"), "nor its backslashes")
+        checkEqual(name, VideoLibrary.digest(awkward), "the same identifier is the same name")
+        check(name != VideoLibrary.digest(awkward + "x"), "one more character is a different name")
+        check(VideoLibrary.digest("a/b") != VideoLibrary.digest("ab"), "a slash is not silently dropped")
+        // A `:` would be trouble on some filesystems, and the hex alphabet cannot
+        // produce one — which is the property worth pinning.
+        check(name.allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) },
+              "the name is lowercase hex and nothing else: \(name)")
+    })
+
     // MARK: - representativeTimes
 
     Registry.shared.add(suite: suite, TestCase(name: "representativeTimes names one moment even for a zero-length or absurd duration",

@@ -156,19 +156,14 @@ final class PhotoLibrary: @unchecked Sendable {
         let batch = ScanRecordBatch(capacity: max(1, batchSize))
 
         let producer = Thread {
-            PhotoLibrary.fetchScannableAssets().enumerateObjects { asset, _, enumerationStop in
-                if stop.isRequested {
-                    enumerationStop.pointee = true
-                    return
-                }
+            PhotoLibrary.enumerateScannableAssets { asset in
+                if stop.isRequested { return false }
                 batch.append(PhotoLibrary.scanRecord(for: asset))
-                guard batch.isFull else { return }
+                guard batch.isFull else { return true }
                 // Parks here while the consumer is behind. `handOff` only
                 // returns false once the reader is gone for good, so this cannot
                 // drop a batch and then carry on.
-                if !handoff.handOff(batch.take()) {
-                    enumerationStop.pointee = true
-                }
+                return handoff.handOff(batch.take())
             }
             // The tail the walk finished without filling a batch over.
             if !batch.isEmpty { _ = handoff.handOff(batch.take()) }
@@ -211,18 +206,109 @@ final class PhotoLibrary: @unchecked Sendable {
         try Task.checkCancellation()
     }
 
-    /// The one fetch the walk iterates. Sorted newest first, which is the order
+    /// The fetches the walk iterates. Sorted newest first, which is the order
     /// `CacheStore.claimJobs` drains the queue in, so the queue and the scan
     /// agree on what "next" means.
     ///
     /// The predicate is the *definition* of what PhotoCleaner scores, and it is
     /// duplicated verbatim in `enumerateAlbumAssets` — the album walk and this one
     /// have to admit the same set or album membership becomes a different library.
-    private static func fetchScannableAssets() -> PHFetchResult<PHAsset> {
+    ///
+    /// ## Why there are two fetches and not one
+    ///
+    /// `fetchAssets(with:)` takes one `PHAssetMediaType`, and there is no case
+    /// meaning "image or video": the cases are `.image`, `.video`, `.audio` and
+    /// `.unknown`. The obvious way to get both in one query is `.unknown` plus a
+    /// predicate, and **that returns 0 rows on this SDK** — measured on the
+    /// development machine against a 52,661-image / 1,953-video library:
+    ///
+    /// | fetch | rows |
+    /// |---|---|
+    /// | `fetchAssets(with: .image, options: nil)` | 52,661 |
+    /// | `fetchAssets(with: .video, options: nil)` | 1,953 |
+    /// | `fetchAssets(with: .unknown, options: nil)` | **0** |
+    /// | `fetchAssets(with: .unknown, predicate: "mediaType == 1")` | **0** |
+    /// | `fetchAssets(with: .image, predicate: "mediaType == 1 OR mediaType == 2")` | 52,661 |
+    /// | `fetchAssets(with: .video, predicate: "mediaType == 1 OR mediaType == 2")` | 1,953 |
+    ///
+    /// `.unknown` is not "every type" at all — it is the *unknown* type, and Photos
+    /// holds no assets of it, so the query is answered correctly and emptily. It is
+    /// the worst possible failure for this function: no error, no exception, no
+    /// warning, a walk that completes instantly, and an empty library. A scan built
+    /// this way reports `up_to_date` having seen nothing — a green run and a blank
+    /// grid. This is not hypothetical: it is what the first implementation of this
+    /// function did, and it is why the table above is here.
+    ///
+    /// So the media type is narrowed by the **type argument**, one fetch per type,
+    /// and the two results are merged by the walk in a single date-ordered pass
+    /// (`enumerateScannableAssets`). `PHFetchResult` exposes no `union`/`merge` on
+    /// this SDK, so the merge is the walk's job; it is a *merge*, not two walks,
+    /// because the producer thread below drives one enumeration and emits one
+    /// ordered stream either way.
+    ///
+    /// What would reintroduce the bug: passing `.unknown`, or "simplifying" this to a
+    /// single `.unknown` fetch with the predicate widened. Both compile, both run,
+    /// and both report success.
+    private static func fetchScannableAssets() -> [PHFetchResult<PHAsset>] {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         options.predicate = PhotoLibrary.scannableMediaPredicate()
-        return PHAsset.fetchAssets(with: .unknown, options: options)
+        return [PHAsset.fetchAssets(with: .image, options: options),
+                PHAsset.fetchAssets(with: .video, options: options)]
+    }
+
+    /// Enumerates every scannable asset **once, newest first**, across the typed
+    /// fetches from `fetchScannableAssets`.
+    ///
+    /// A merge rather than a concatenation because the order is load-bearing:
+    /// `CacheStore.claimJobs` drains the queue `ORDER BY creation_date DESC`, so a
+    /// walk that delivered all 1,953 videos before any photo would make the analysis
+    /// pass score the entire clip collection first — on this library, before a
+    /// single photograph. The claim order and the walk order are supposed to agree
+    /// about what "next" means.
+    ///
+    /// Each side is fetched sorted `creationDate DESC`, so taking whichever side's
+    /// head has the later date is a two-way merge of two sorted runs and yields one
+    /// globally sorted stream. Ties are broken towards the first fetch in the array,
+    /// which is stable and deterministic — the same walk order on every pass, so a
+    /// rescan does not reshuffle batch boundaries.
+    ///
+    /// `enumerateObjects` per side rather than indexing: `result.count` is not
+    /// constant over a multi-second walk on a live library, so an index-based walk
+    /// can run off the end and raise an Objective-C exception. See `enumerateImages`.
+    private static func enumerateScannableAssets(_ body: (PHAsset) -> Bool) {
+        // One cursor per typed fetch, each over that fetch's own `creationDate DESC`
+        // order. A row pulled from a cursor is **held** in `pending` until it is
+        // emitted — pulling and dropping the losers would silently lose assets, which
+        // is the one thing a library walk must never do.
+        let cursors: [() -> PHAsset?] = fetchScannableAssets().map { result in
+            var index = 0
+            return {
+                guard index < result.count else { return nil }
+                let asset = result.object(at: index)
+                index += 1
+                return asset
+            }
+        }
+        var pending: [PHAsset] = []
+
+        while true {
+            // Refill: one row from any cursor that has an exhausted supply.
+            for index in cursors.indices where pending.count <= index {
+                guard let asset = cursors[index]() else { continue }
+                pending.append(asset)
+            }
+            guard !pending.isEmpty else { break }
+            // The newest pending row. Strictly greater, so a tie keeps the earlier
+            // side — stable across runs, which keeps batch boundaries reproducible.
+            var best = 0
+            for index in pending.indices
+            where (pending[index].creationDate ?? .distantPast) > (pending[best].creationDate ?? .distantPast) {
+                best = index
+            }
+            let asset = pending.remove(at: best)
+            if !body(asset) { return }
+        }
     }
 
     /// Images and videos, and nothing else.
@@ -232,13 +318,21 @@ final class PhotoLibrary: @unchecked Sendable {
     /// immutable once built, so a fresh instance per fetch costs one allocation
     /// and is the price of not disabling a concurrency check.
     ///
-    /// The media type handed to `fetchAssets` is `.unknown`, which is PhotoKit's
-    /// "every type", and the predicate is what narrows it. That reads
-    /// backwards — the type argument could do the narrowing — but the two
-    /// `PHAssetMediaType` cases are `.image` and `.video` and *no* case means
-    /// "either": there is no `.imageOrVideo`, so the fetch would need one call per
-    /// type and two walks to merge, which is the structure that lets the two halves
-    /// disagree. One fetch, one predicate.
+    /// The predicate is *redundant* with the type arguments in `fetchScannableAssets`
+    /// and is kept for a specific reason: `enumerateAlbumAssets` fetches from a
+    /// **collection**, where the media type cannot be narrowed by the type argument
+    /// the same way, so the predicate is what keeps the album walk and the library
+    /// walk admitting the same set. One definition, two call sites, and the
+    /// redundancy is the thing that makes them agree.
+    ///
+    /// ## It must stay a predicate PhotoKit can evaluate
+    ///
+    /// `PHFetchOptions.predicate` is not general-purpose SQL: an unsupported
+    /// predicate raises `NSInvalidArgumentException` from inside Photos, which is an
+    /// Objective-C exception and therefore **terminates the process** — it cannot be
+    /// caught in Swift and it is not an error this app can report. Verified on this
+    /// SDK: `TRUEPREDICATE` aborts with `Unsupported predicate in fetch options`.
+    /// The `mediaType ==` comparisons above are among the forms PhotoKit accepts.
     ///
     /// Excluding audio is deliberate: a Live Photo's paired video is reached
     /// through its *parent* image rather than as a video asset of its own, so the
