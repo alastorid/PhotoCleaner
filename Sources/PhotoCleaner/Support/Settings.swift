@@ -39,7 +39,15 @@ struct SettingsSnapshot: Sendable, Equatable, Codable {
     }
 
     /// Exclude favourites from bulk selection and deletion unless explicitly
-    /// overridden per request. On by default, and never changed implicitly.
+    /// overridden per request.
+    ///
+    /// Always `true`, and the property exists only so the value is *reported* — a
+    /// client can read that protection is on, but nothing can turn it off. It used
+    /// to be a switch in the control panel, which meant a `false` written by an
+    /// older build could outlive the control that wrote it: the user would have
+    /// favourites with no protection and no way to notice. Excluding favourites from
+    /// bulk deletion is the one behaviour here that must not be a preference, so
+    /// decoding refuses to honour a stored `false` and the server refuses to set one.
     var protectFavorites: Bool = true
 
     /// Bounded Vision concurrency. Measured on an M3: 4 concurrent analyses
@@ -117,8 +125,14 @@ struct SettingsSnapshot: Sendable, Equatable, Codable {
             ?? fallback.groupMinimumFaceArea
         groupMaximumSize = try container.decodeIfPresent(Int.self, forKey: .groupMaximumSize)
             ?? fallback.groupMaximumSize
-        protectFavorites = try container.decodeIfPresent(Bool.self, forKey: .protectFavorites)
-            ?? fallback.protectFavorites
+        // Deliberately not decoded. Every other field takes the file's value, but
+        // this one is a constant: a `settings.json` written by a build that had the
+        // switch is read with `protectFavorites: false`, and honouring it would leave
+        // that user's favourites deletable with no control left to undo it. The key
+        // stays in `CodingKeys`, so the value is still *written* — a file from this
+        // version round-trips — and an old file's stored `false` is simply ignored
+        // rather than being an error.
+        protectFavorites = fallback.protectFavorites
         analysisConcurrency = try container.decodeIfPresent(Int.self, forKey: .analysisConcurrency)
             ?? fallback.analysisConcurrency
         analysisPixelSize = try container.decodeIfPresent(Int.self, forKey: .analysisPixelSize)
@@ -157,7 +171,15 @@ final class Settings: Sendable {
         // the mutation must be applied in place. Mutating a copy and returning
         // it would leave the in-memory value stale while still persisting the
         // new one to disk.
-        let updated = state.withLock { current -> SettingsSnapshot in
+        //
+        // The write happens *inside* the lock rather than after it. Two updates
+        // racing from different tasks would otherwise be free to finish in the
+        // opposite order to the one they were applied in, and the earlier one
+        // would write last — leaving a file describing a state the process has
+        // already moved past, so that change would silently come back on the next
+        // launch. Settings writes are rare and the file is a few hundred bytes,
+        // so holding the lock across one costs nothing that matters.
+        state.withLock { current -> SettingsSnapshot in
             mutate(&current)
             current.analysisConcurrency = min(max(current.analysisConcurrency, 1), 16)
             current.analysisPixelSize = min(max(current.analysisPixelSize, 256), 4096)
@@ -170,10 +192,9 @@ final class Settings: Sendable {
             current.groupFaceWeight = groups.faceWeight
             current.groupMinimumFaceArea = groups.minimumFaceAreaFraction
             current.groupMaximumSize = groups.maximumGroupSize
+            persist(current)
             return current
         }
-        persist(updated)
-        return updated
     }
 
     private func persist(_ snapshot: SettingsSnapshot) {

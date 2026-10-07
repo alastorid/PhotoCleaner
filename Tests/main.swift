@@ -58,10 +58,13 @@ registerSettingsTests()
 registerThumbnailTests()
 registerSimilarGroupTests()
 registerHTTPServerTests()
+registerVideoRouteTests()
 registerPresentationTests()
 registerSchemaTests()
 registerAuthorizationTests()
 registerUpdateTests()
+registerIconTests()
+registerVideoTests()
 
 if listOnly {
     print("\(Registry.shared.count) cases registered")

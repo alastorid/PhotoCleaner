@@ -5,8 +5,9 @@
 #   ./smoke-test.sh              # check the build and a running instance
 #   ./smoke-test.sh --no-server  # build/bundle/static checks only
 #
-# bash + curl + sqlite3 + codesign/plutil/lsof (all system tools). No Python,
-# no Node, no npm, no network access, and nothing is written outside $TMPDIR.
+# bash + curl + sqlite3 + codesign/PlistBuddy/lsof/strings (all system tools).
+# No Python, no Node, no npm, no network access beyond loopback, and nothing is
+# written outside $TMPDIR.
 #
 # It NEVER deletes a photo, NEVER posts to /api/delete, NEVER touches
 # downloadFromICloud, and NEVER opens a network connection other than loopback.
@@ -14,6 +15,10 @@
 #
 # Exit status: 0 if every check passed, 1 otherwise.
 
+# `set -e` is deliberately absent: every check here is expected to be able to
+# fail without ending the run, because the whole point is to report all of them
+# and exit non-zero at the end. The other scripts are strict because they have
+# nothing to report.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -116,6 +121,35 @@ else
   ok "no analytics/telemetry identifier in the web client"
 fi
 
+head_ "Favourite protection is not offered as a control"
+# Excluding favourites from bulk deletion is unconditional, so there is nothing to
+# switch and nothing to count. Grepped rather than left to the jsdom suite: this is
+# the check that would notice a *returning* control, and the guarantee belongs to
+# the product rather than to one view — a switch reappearing here is a regression
+# even in a build where nobody happens to open the panel.
+#
+# The phrases are listed with the ids they came in with, so a control rebuilt under
+# a new name still trips this rather than sliding through on the wording alone.
+for pat in 'protectFavorites' 'protectedCount' 'Protect Favorites' 'protected from deletion while'; do
+  if grep -qF -- "$pat" "$ROOT/web/index.html" "$ROOT/web/app.css" "$ROOT/web/app.js" 2>/dev/null; then
+    bad "web/ still offers favourite protection as a setting: \"$pat\""
+    grep -nF -- "$pat" "$ROOT/web/index.html" "$ROOT/web/app.css" "$ROOT/web/app.js" | sed 's/^/        /'
+  else
+    ok "no \"$pat\" in the web client"
+  fi
+done
+
+# The guarantee still has to be *stated* somewhere, or removing the control would
+# just have deleted the information rather than relocated it. Checked against the
+# heart's own surfaces, which is where the user acts on a favourite.
+if grep -qF 'protected from deletion' "$ROOT/web/app.js" 2>/dev/null; then
+  ok "the client still tells the user a favourite is protected from deletion"
+else
+  bad "no \"protected from deletion\" anywhere in web/app.js — the guarantee is"
+  printf '        no longer stated to the user anywhere. It belongs on the heart,\n'
+  printf '        the tile accessible name and the lightbox favourite button.\n'
+fi
+
 head_ "Binary: no external resources"
 # Every URL the process can construct is either a loopback one or the release
 # feed.
@@ -172,7 +206,7 @@ else
     ok "pid $PID is listening on 127.0.0.1:$PORT"
 
     # The health check, in one line: this is what tells a healthy instance from
-    # a stale one. See README "Health check".
+    # a stale one. See README "Troubleshooting".
     if curl -fsS -m 3 "$BASE/api/status" | grep -q '"version"'; then
       ok "GET /api/status answers as PhotoCleaner (not some other listener)"
     else
@@ -334,7 +368,8 @@ fi
 head_ "Stored state"
 DB="$SUPPORT/cache.sqlite"
 
-for p in "$SUPPORT/cache.sqlite" "$SUPPORT/settings.json" "$LOGDIR/PhotoCleaner.log"; do
+for p in "$SUPPORT/cache.sqlite" "$SUPPORT/settings.json" "$SUPPORT/video-cache" \
+         "$LOGDIR/PhotoCleaner.log"; do
   [ -e "$p" ] && ok "$(printf '%s' "$p" | sed "s|$HOME|~|")" \
               || skip "$(printf '%s' "$p" | sed "s|$HOME|~|")" "not present"
 done

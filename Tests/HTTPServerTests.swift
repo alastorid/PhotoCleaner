@@ -310,6 +310,12 @@ func registerHTTPServerTests() {
     })
 
     Registry.shared.add(suite: suite, TestCase(name: "an unparseable Content-Length is refused", knownBug: nil) {
+        // `Int("banana") ?? 0` used to make this a zero-length body, so the
+        // request was dispatched and happened to be refused downstream as
+        // "malformed selection" — a 400 that came from the JSON decoder rather
+        // than from the framing. Anything a client actually sent after that
+        // header stayed in the buffer and was parsed as the *next* request, which
+        // is request smuggling with a friendlier error message.
         try await withServer { server in
             try await server.write("""
             POST /api/selection/preview HTTP/1.1\r
@@ -319,9 +325,159 @@ func registerHTTPServerTests() {
 
             """)
             let response = checkNotNil(try await server.readResponse(), "the response")
-            checkEqual(response?.status, 400, "a Content-Length that is not a number must not be read as zero")
-            check(response?.bodyString.contains("malformed selection") == true,
-                  "the request is dispatched and refused as malformed, not framed: \(response?.bodyString ?? "")")
+            checkEqual(response?.status, 400, "a Content-Length that is not a number is a framing error")
+            check(response?.bodyString.contains("malformed Content-Length") == true,
+                  "and says so, rather than dispatching a body-less request: \(response?.bodyString ?? "")")
+            checkNil(try await server.readOptionalResponse(), "with nothing after it")
+        }
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "request framing is refused, never guessed at", knownBug: nil) {
+        // Every one of these leaves the body in the buffer under the old parser,
+        // so the bytes that followed were read as a second request on the same
+        // connection — the desync hazard the framing checks exist to close.
+        try await withServer { server in
+            let cases: [(name: String, bytes: String, expect: String)] = [
+                ("a chunked body", """
+                POST /api/selection/preview HTTP/1.1\r
+                Host: x\r
+                Transfer-Encoding: chunked\r
+                \r
+                0\r
+
+                GET /favicon.ico HTTP/1.1\r
+                Host: x\r
+                Connection: close\r
+                \r
+
+                """, "transfer coding"),
+                ("two Content-Length headers", """
+                POST /api/selection/preview HTTP/1.1\r
+                Host: x\r
+                Content-Length: 2\r
+                Content-Length: 21\r
+                \r
+                {}GET /favicon.ico HTTP/1.1\r
+                Host: x\r
+                \r
+
+                """, "Content-Length"),
+                ("a whitespace-before-colon field name", """
+                GET /api/photos HTTP/1.1\r
+                Host: x\r
+                Content-Length : 0\r
+                \r
+
+                """, "header field name"),
+            ]
+            for test in cases {
+                try await server.reconnect()
+                try await server.write(test.bytes)
+                let responses = try await server.readAllResponses()
+                checkEqual(responses.count, 1,
+                           "\(test.name): exactly one response, got \(responses.map(\.status))")
+                guard let response = responses.first else { continue }
+                checkEqual(response.status, 400, "\(test.name): refused with 400")
+                check(response.bodyString.contains(test.expect),
+                      "\(test.name): names the problem: \(response.bodyString)")
+                checkEqual(response.header("connection"), "close", "\(test.name): and closes")
+            }
+        }
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "a HEAD gets the GET headers and no body", knownBug: nil) {
+        // Routed as a method of its own, `HEAD /` answered 404 — telling a client
+        // the interface does not exist — and a `HEAD` on any other route would
+        // have produced a `404` *with* a body. Worse, once routed, the body has to
+        // be suppressed: a `HEAD` client reads no body and would treat those bytes
+        // as the start of the next response.
+        try await withServer { server in
+            try await server.write("""
+            HEAD /api/photos?limit=1 HTTP/1.1\r
+            Host: 127.0.0.1:\(server.port)\r
+            \r
+
+            """)
+            let head = checkNotNil(try await server.readHeader(), "the HEAD response")
+            checkEqual(head?.status, 200, "HEAD resolves the same route as GET")
+            let declared = head?.header("content-length").flatMap { Int($0) }
+            check(declared != nil && declared! > 0,
+                  "and reports the Content-Length GET would have sent, got \(head?.header("content-length") ?? "none")")
+
+            // The decisive part: the connection must still be in sync, which is
+            // only observable by sending a real request and reading a real body.
+            try await server.write("""
+            GET /api/photos?limit=1 HTTP/1.1\r
+            Host: 127.0.0.1:\(server.port)\r
+            Connection: close\r
+            \r
+
+            """)
+            let response = checkNotNil(try await server.readResponse(), "the following GET")
+            checkEqual(response?.status, 200, "the connection is still in sync after a HEAD")
+            let json = response.flatMap { try? JSONSerialization.jsonObject(with: $0.body) as? [String: Any] }
+            checkEqual((json?["items"] as? [Any])?.count, 1, "and its body is the response, not a tail of the HEAD's")
+            checkNil(try await server.readOptionalResponse(), "with nothing after it")
+        }
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "204 carries no Content-Length", knownBug: nil) {
+        // `/favicon.ico` answers 204. RFC 9110 §8.6: a status that cannot carry a
+        // body must not announce a length either, because the header is a claim
+        // about framing that the response does not have.
+        try await withServer { server in
+            try await server.write("""
+            GET /favicon.ico HTTP/1.1\r
+            Host: 127.0.0.1:\(server.port)\r
+            Connection: close\r
+            \r
+
+            """)
+            let response = checkNotNil(try await server.readResponse(), "the response")
+            checkEqual(response?.status, 204, "status")
+            checkEqual(response?.header("content-length"), nil, "and no Content-Length on a 204")
+        }
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "Connection is read as a list of tokens", knownBug: nil) {
+        // `Connection: keep-alive, close` is what several HTTP/1.1 clients send to
+        // mean "this was my last request". Compared as one string it was neither
+        // "close" nor "keep-alive", so the connection stayed open past the client's
+        // own last request and the test below had to wait out the idle deadline.
+        try await withServer { server in
+            try await server.write("""
+            GET /api/status HTTP/1.1\r
+            Host: 127.0.0.1:\(server.port)\r
+            Connection: keep-alive, close\r
+            \r
+
+            """)
+            let response = checkNotNil(try await server.readResponse(), "the response")
+            checkEqual(response?.status, 200, "status")
+            checkEqual(response?.header("connection"), "close",
+                       "a close token anywhere in the list closes the connection")
+            checkNil(try await server.readOptionalResponse(), "which is then gone")
+        }
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "a half-closed client still gets its response", knownBug: nil) {
+        // `shutdown(SHUT_WR)` after the request is legal and is what a client that
+        // is done talking but still wants the answer does. The receive loop treated
+        // any `isComplete` as "close now", which cancelled the handler mid-flight
+        // and dropped the response entirely.
+        try await withServer { server in
+            try await server.write("""
+            GET /api/status HTTP/1.1\r
+            Host: 127.0.0.1:\(server.port)\r
+            \r
+
+            """)
+            try await server.shutdownWrite()
+            let response = checkNotNil(try await server.readResponse(afterSeconds: 10), "the response")
+            checkEqual(response?.status, 200, "the answer still arrives after a half-close")
+            check(response?.bodyString.contains("\"phase\"") == true,
+                  "and it is the whole response: \(response?.bodyString.prefix(60).debugDescription ?? "")")
+            checkNil(try await server.readOptionalResponse(), "then the connection closes")
         }
     })
 
@@ -594,6 +750,12 @@ final class TestServer: @unchecked Sendable {
         try await off { try self.client.reconnect(self.port) }
     }
 
+    /// Half-closes the write side: "I have no more requests, but I am still
+    /// reading." A full `close()` cannot express that.
+    func shutdownWrite() async throws {
+        try await off { try self.client.shutdownWrite() }
+    }
+
     func canConnect(port: UInt16, address: String = "127.0.0.1") async throws -> Bool {
         try await off { self.client.canConnect(port: port, address: address) }
     }
@@ -770,6 +932,13 @@ final class BlockingSocket: @unchecked Sendable {
             throw CacheError.open("could not connect to 127.0.0.1:\(port)")
         }
         return fd
+    }
+
+    func shutdownWrite() throws {
+        guard fd >= 0 else { throw CacheError.open("the client socket is closed") }
+        guard Darwin.shutdown(fd, SHUT_WR) == 0 else {
+            throw CacheError.open("could not half-close the client socket")
+        }
     }
 
     func write(_ data: Data) throws {

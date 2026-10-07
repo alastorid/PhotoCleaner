@@ -7,11 +7,16 @@
   --panel-border: rgba(0, 0, 0, 0.10);
   --text: #1d1d1f;
   --muted: #6e6e73;
-  /* The accent is also the Dock icon's ramp start (`tools/make-icon.swift`), and
-     it is used as a background behind white text on several controls, so it is
-     not free to be as light as the icon looks: this carries white at 4.56:1
-     where the blue it replaced managed 3.65:1. */
+  /* Selection colour, NOT the icon: the Dock icon is neutral grey
+     (`tools/make-icon.swift`) and `.app-mark` tracks the icon, because a grey
+     accent makes a selected tile look unselected. It carries white text on
+     several controls, so it cannot be as light as a swatch looks either —
+     4.56:1 against white here. */
   --accent: #c2551c;
+  /* The accent's own dark end, for gradients that read as depth in the accent
+     (the analysis bar). Nothing here carries text, so it is a tone rather than a
+     contrast budget — unlike `--accent` itself. */
+  --accent-deep: #7e2418;
   --danger: #ff3b30;
   --warning: #b25000;
   --tile: #ffffff;
@@ -44,11 +49,15 @@
     --panel-border: rgba(255, 255, 255, 0.12);
     --text: #f5f5f7;
     --muted: #98989d;
-    /* Lighter than the light-mode accent for the same reason Apple lightens its
-       own system colours in dark mode: it has to clear the dark panel, not the
-       light one. Held to the old blue's contrast on both the dark panel and
-       white text rather than trading one for the other. */
+    /* Lighter than the light-mode accent for the reason Apple lightens its own
+       system colours in dark mode: it has to clear the dark panel rather than
+       the light one. That puts the two requirements — white text on it, and
+       visibility against the panel — in tension, and this is the compromise that
+       holds both rather than trading one for the other. */
     --accent: #e25a38;
+    /* Follows `--accent` upwards for the same reason it does: a dark-mode
+       gradient that ends near-black reads as a hole rather than as depth. */
+    --accent-deep: #a83a1e;
     --danger: #ff453a;
     --warning: #ff9f0a;
     --tile: #2c2c2e;
@@ -103,10 +112,10 @@ button { font: inherit; cursor: pointer; }
   width: 16px;
   height: 16px;
   border-radius: 5px;
-  /* The icon's body gradient, not `--accent`: the Dock icon is neutral grey
-     (see `tools/make-icon.swift` for why a neutral icon has to clear the desktop
-     by luminance rather than hue) while selection still needs a real colour.
-     This mark tracks the icon; `--accent` does not. */
+  /* The icon's body gradient, so the header mark and the Dock icon are the same
+     object. Deliberately not `--accent`, which stays a hue for selection; see
+     `tools/make-icon.swift` for why the body has to clear the desktop by
+     luminance rather than hue. */
   background: linear-gradient(160deg, #9a9aa0, #54545a);
   box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.35);
 }
@@ -122,6 +131,12 @@ button { font: inherit; cursor: pointer; }
 }
 .summary-total { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .summary-sep { opacity: 0.5; }
+
+/* The clip count is one more "N clips" in a row that is already a row, so it has to
+   be a group the flex layout keeps together — otherwise hiding it (a library with no
+   videos) would leave its leading separator stranded between two numbers. */
+.summary-clips { display: inline-flex; align-items: baseline; gap: 6px; }
+.summary-clips[hidden] { display: none; }
 
 .connection-dot {
   width: 7px; height: 7px; margin-left: 8px; border-radius: 50%;
@@ -190,7 +205,7 @@ button { font: inherit; cursor: pointer; }
   display: block;
   height: 100%;
   width: 0%;
-  background: linear-gradient(90deg, var(--accent), #7e2418);
+  background: linear-gradient(90deg, var(--accent), var(--accent-deep));
   transition: width 0.25s ease;
 }
 .analysis-fill.indeterminate {
@@ -364,7 +379,9 @@ button { font: inherit; cursor: pointer; }
   padding-top: 12px;
   border-top: 1px solid var(--panel-border);
 }
-.sort-group, .toggle-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.sort-group, .toggle-group, .media-group {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+}
 /* Sort is the last thing in the panel, and it is pushed to the far right so that
    is where the eye finishes, on the same line when there is room for it. */
 .sort-group { margin-left: auto; }
@@ -410,8 +427,16 @@ button { font: inherit; cursor: pointer; }
 .danger:disabled { opacity: 0.4; cursor: default; }
 .danger.small { padding: 4px 11px; font-size: 12px; }
 
+/* The media filter. One rule, and it is about *position* rather than appearance:
+   the chips are `.chip`, so the pressed state, the hover and the focus ring are
+   the sort chips' — a second ramp here would be a second thing to learn for the
+   same "this one is in force" signal. All this does is keep the group beside Sort
+   rather than inside the album row, because `margin-left: auto` on `.sort-group`
+   pushes only the last child to the far edge and Media has to stay attached to it
+   as the row's final pair of decisions. */
+.media-group { gap: 6px; }
+
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
-.check.is-disabled { color: var(--muted); }
 .check input { accent-color: var(--accent); }
 
 .select { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
@@ -500,6 +525,66 @@ button { font: inherit; cursor: pointer; }
   backdrop-filter: blur(6px);
 }
 
+/* A clip's length, in the corner opposite the score.
+ *
+ * Bottom-right because the score is bottom-left and a grid of mixed media has to
+ * keep its one number in the same corner on every tile: a length that moved to
+ * whatever corner was free would make the eye re-find the score on half the grid.
+ *
+ * Styled as the score badge's twin — same plate, same radius, same blur — so a
+ * tile carrying both reads as two labels rather than as one label and one
+ * ornament. `pointer-events: none` is not decoration: the tile is the click
+ * target, and a badge that swallowed the click would look exactly like a grid
+ * where clips refuse to select. */
+.tile-duration {
+  position: absolute;
+  right: 8px; bottom: 8px;
+  padding: 3px 7px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font: 600 11.5px/1.2 var(--mono);
+  font-variant-numeric: tabular-nums;
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+/* The All Photos anchor label already owns the bottom-right corner, and exactly
+   one tile in the window carries it. Rather than move the length — which would
+   put the score's opposite corner somewhere different on that one tile and
+   nowhere else — the two stack, with the accent pill staying on the corner it was
+   designed for because it is the mark that has to be spotted while scrolling. */
+.tile.anchor .tile-duration { bottom: 30px; }
+
+/* The play glyph.
+ *
+ * Centred rather than tucked into the fourth free corner because that is the one
+ * place every platform has taught a reader to look for "this is a video", and at
+ * 186 px a poster frame is indistinguishable from a photograph of the same
+ * moment — which is precisely the confusion that makes someone delete a clip
+ * believing they had a still in front of them.
+ *
+ * `padding-left` is optical centring, not alignment: U+25B6 carries right side
+ * bearing, so a geometrically centred triangle sits visibly left of the circle's
+ * centre. `pointer-events: none` for the reason the length badge has it. */
+.tile-play {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding-left: 2px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
 /* The heart.
  *
  * A button, and the only mark a favourite gets on a tile: it is both how you see
@@ -586,7 +671,7 @@ button { font: inherit; cursor: pointer; }
 }
 .tile:hover .tile-tools, .tile:focus-within .tile-tools { opacity: 1; }
 
-.load-more, .grid-status { text-align: center; padding: 6px 24px 40px; color: var(--muted); font-size: 12px; }
+.load-more { text-align: center; padding: 6px 24px 40px; color: var(--muted); font-size: 12px; }
 
 .empty-state {
   margin: 28px 24px 60px;
@@ -660,10 +745,11 @@ button { font: inherit; cursor: pointer; }
   max-width: 44rem;
   margin: 0 auto;
 }
-/* The two ends of a continuously-scrolling list. Margins, not zero-height rules,
-   so `rootMargin` can start the fetch before the edge is reached. They carry no
-   text: the loading message is the single row below the list, so "loading" reads
-   the same at either end. */
+/* The two ends of a continuously-scrolling list. A hairline rather than nothing,
+   so the observer has a box to measure; it is the observer's `rootMargin`, not
+   this, that starts the fetch before the edge is reached. They carry no text: the
+   loading message is the single row below the list, so "loading" reads the same at
+   either end. */
 .groups-sentinel { height: 1px; }
 
 /* The one loading message. `is-pending` is the slow variant — a grouping pass is
@@ -722,6 +808,25 @@ button { font: inherit; cursor: pointer; }
 .group-title { font-weight: 600; font-size: 13px; }
 .group-when { color: var(--muted); font-weight: 400; }
 .group-badges { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+/* The badges on a group card. The order is the load-bearing one — it is the
+   answer to "why is this frame in this place?" — so it is the only badge with a
+   fill; the rest are counts, and a warning is the only one allowed colour. */
+.badge {
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--panel-border);
+  background: color-mix(in srgb, var(--muted) 10%, transparent);
+  color: var(--text);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge.muted-badge { background: none; color: var(--muted); }
+.badge.warn-badge {
+  border-color: color-mix(in srgb, var(--warning) 35%, transparent);
+  color: var(--warning);
+}
 
 /* A horizontal strip, not a grid. A group is a short run of near-identical frames,
    and the decision is between neighbours — so they stay adjacent rather than
@@ -985,9 +1090,15 @@ button { font: inherit; cursor: pointer; }
    the photograph is travelling, the overlay does not exist as a click target yet. */
 .lightbox:not(.is-open) { pointer-events: none; }
 /* The real preview holds back until the travelling thumbnail has handed over, so a
-   cached 2048px JPEG cannot appear underneath a copy of itself still in flight. */
-.lightbox-entering #lightboxImage { opacity: 0; }
-#lightboxImage { transition: opacity 160ms ease; }
+   cached 2048px JPEG cannot appear underneath a copy of itself still in flight.
+   A clip gets the same treatment and for the same reason: its poster frame is the
+   same frame the travelling copy is showing, so an un-held-back `<video>` would put
+   two copies of one frame on screen at once. `previewWhenDecoded` waits for
+   `loadedmetadata` rather than a bitmap, which is bounded by `preload="metadata"`
+   and needs none of the clip's bytes. */
+.lightbox-entering #lightboxImage,
+.lightbox-entering #lightboxVideo { opacity: 0; }
+#lightboxImage, #lightboxVideo { transition: opacity 160ms ease; }
 
 /* The travelling photograph.
 
@@ -1038,7 +1149,19 @@ button { font: inherit; cursor: pointer; }
   border-radius: var(--radius);
   overflow: hidden;
 }
-.lightbox-stage img { max-width: 100%; max-height: 100%; display: block; }
+/* Both the still and the clip are sized the same way, and it matters that they
+   are: the stage has a pinned height (§8), so whichever element is on it has to
+   fit *inside* that box itself. `object-fit: contain` on the clip rather than the
+   `cover` the tile uses — a still in the lightbox shows the whole photograph, and
+   a clip that cropped to a letterbox would put bars in front of a video that is
+   letterboxed anyway. */
+.lightbox-stage img,
+.lightbox-stage video { max-width: 100%; max-height: 100%; display: block; }
+/* A clip is not an image, so it does not transition into place the way
+   `#lightboxImage` does: the travelling thumbnail *is* the poster frame at the
+   tile's size, and cross-fading it out would hand the screen to a second,
+   lower-quality copy of the very frame that was just on it. The element is
+   instead hidden until the travelling copy lands — see `renderLightbox`. */
 .lightbox-fallback { color: #fff; opacity: 0.85; padding: 24px; text-align: center; }
 
 .lightbox-close, .lightbox-nav {
@@ -1278,12 +1401,6 @@ button { font: inherit; cursor: pointer; }
 .album-none { font-size: 12px; color: var(--muted); }
 .meta-albums dd { display: flex; flex-wrap: wrap; gap: 4px; }
 
-/* The protected-favourite count beside the Protect Favorites switch. */
-.protected-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
-/* Same `[title]`-conditional affordance as the album count: it explains the
-   figure on hover, and only claims to while it has something to say. */
-.protected-count[title] { cursor: help; }
-.protected-count.is-off { color: var(--warning); }
 #lightboxFavoriteToggle.is-favorite {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 14%, var(--panel));

@@ -100,6 +100,12 @@ final class PhotoLibrary: @unchecked Sendable {
 
     /// Walks the whole library, handing metadata to `consume` in batches.
     ///
+    /// Images **and** videos. The walk and the scoring queue have to agree about
+    /// what an asset is: a video that was walked but never scored drops out of
+    /// the grid, and one that was scored but never walked has its row deleted by
+    /// `finishScan`. Either way an asset silently appears and disappears between
+    /// runs.
+    ///
     /// The walk streams, and protecting that is what this implementation is
     /// about. `enumerateObjects` is a synchronous callback API with no async
     /// hand-off, so the batch boundary has to live somewhere between it and the
@@ -150,7 +156,7 @@ final class PhotoLibrary: @unchecked Sendable {
         let batch = ScanRecordBatch(capacity: max(1, batchSize))
 
         let producer = Thread {
-            PhotoLibrary.fetchImages().enumerateObjects { asset, _, enumerationStop in
+            PhotoLibrary.fetchScannableAssets().enumerateObjects { asset, _, enumerationStop in
                 if stop.isRequested {
                     enumerationStop.pointee = true
                     return
@@ -208,10 +214,42 @@ final class PhotoLibrary: @unchecked Sendable {
     /// The one fetch the walk iterates. Sorted newest first, which is the order
     /// `CacheStore.claimJobs` drains the queue in, so the queue and the scan
     /// agree on what "next" means.
-    private static func fetchImages() -> PHFetchResult<PHAsset> {
+    ///
+    /// The predicate is the *definition* of what PhotoCleaner scores, and it is
+    /// duplicated verbatim in `enumerateAlbumAssets` — the album walk and this one
+    /// have to admit the same set or album membership becomes a different library.
+    private static func fetchScannableAssets() -> PHFetchResult<PHAsset> {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        return PHAsset.fetchAssets(with: .image, options: options)
+        options.predicate = PhotoLibrary.scannableMediaPredicate()
+        return PHAsset.fetchAssets(with: .unknown, options: options)
+    }
+
+    /// Images and videos, and nothing else.
+    ///
+    /// A function rather than a stored constant because `NSPredicate` is not
+    /// `Sendable` and Swift 6 will not let one be a global — and a predicate is
+    /// immutable once built, so a fresh instance per fetch costs one allocation
+    /// and is the price of not disabling a concurrency check.
+    ///
+    /// The media type handed to `fetchAssets` is `.unknown`, which is PhotoKit's
+    /// "every type", and the predicate is what narrows it. That reads
+    /// backwards — the type argument could do the narrowing — but the two
+    /// `PHAssetMediaType` cases are `.image` and `.video` and *no* case means
+    /// "either": there is no `.imageOrVideo`, so the fetch would need one call per
+    /// type and two walks to merge, which is the structure that lets the two halves
+    /// disagree. One fetch, one predicate.
+    ///
+    /// Excluding audio is deliberate: a Live Photo's paired video is reached
+    /// through its *parent* image rather than as a video asset of its own, so the
+    /// `.audio` case is where "whatever Photos has" would stop being an image or a
+    /// clip. This is the single definition of what PhotoCleaner scores, and the
+    /// album walk builds its predicate here rather than spelling the same two
+    /// `rawValue`s out again.
+    static func scannableMediaPredicate() -> NSPredicate {
+        NSPredicate(
+            format: "mediaType == %d OR mediaType == %d",
+            PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
     }
 
     private static func scanRecord(for asset: PHAsset) -> ScanRecord {
@@ -224,7 +262,13 @@ final class PhotoLibrary: @unchecked Sendable {
             height: asset.pixelHeight,
             favorite: asset.isFavorite,
             mediaSubtype: Int(asset.mediaSubtypes.rawValue),
-            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot)
+            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
+            // `PHAsset.duration` is `0` for a still, and a stored `0` would claim a
+            // zero-length video exists — the browser would draw an `m:ss` badge
+            // reading `0:00` on a photograph. `nil` is the only honest answer for
+            // something that is not a video, and it also happens to be what every
+            // pre-version-5 row already holds.
+            duration: asset.mediaType == .video ? asset.duration : nil
         )
     }
 
@@ -242,6 +286,82 @@ final class PhotoLibrary: @unchecked Sendable {
     }
 
     // MARK: - Images
+
+    /// The decoded frames Vision scores for one asset: exactly one for a still,
+    /// one to three for a video.
+    ///
+    /// This is the single entry point the scoring worker uses, and it exists
+    /// because a clip is not one image: a still *is* one picture, and a clip is a
+    /// sequence of them, so "load the image and score it" has no single answer for
+    /// a video. Sampling three moments spread across the clip and taking the median
+    /// of their scores (`VisionAnalyzer.analyzeFrames`) survives the one frame that
+    /// is black — a leader, a lens cap, a blown window — without letting it set the
+    /// score for the whole clip. `VideoLibrary.representativeTimes` is where the
+    /// moments are chosen, and why those fractions.
+    ///
+    /// **Never empty.** An empty array has no honest meaning downstream: `analyze`
+    /// would be asked to score nothing and would produce a median of nothing, and
+    /// the alternative — recording a score for an asset nothing was read from — is
+    /// the one outcome this tool must never manufacture. So the still case is a
+    /// one-element array by construction, and the video case degrades rather than
+    /// returning nothing: see the loop below.
+    ///
+    /// The failures are the *same* `PhotoLibraryError` cases `image(identifier:)`
+    /// throws, and that is the point. `AnalysisEngine.recordOutcome` routes on them
+    /// exhaustively — `.assetNotFound` deletes the row, `.imageNotLocal` parks the
+    /// asset as `unavailable` without counting a failure, `.imageRequestFailed`
+    /// counts one. A new "video failed" case would have had to be taught about the
+    /// analysis path, and the tempting mapping — a clip that cannot be decoded being
+    /// reported as a *scoring* failure — is exactly how a run that was interrupted
+    /// would come to be counted as thousands of broken assets.
+    ///
+    /// Frames come back in ascending time order, so a caller that wants to know
+    /// which moment it is holding does not have to sort.
+    func framesForAnalysis(identifier: String,
+                           maxPixelSize: Int,
+                           allowNetwork: Bool) async throws -> [CGImage] {
+        guard let asset = asset(identifier: identifier) else { throw PhotoLibraryError.assetNotFound }
+        guard asset.mediaType == .video else {
+            return [try await image(asset: asset, maxPixelSize: maxPixelSize, allowNetwork: allowNetwork)]
+        }
+
+        // The `PHAsset` is already in hand, so its `duration` is read straight off
+        // it rather than through `VideoLibrary.duration(identifier:)`, which would
+        // fetch the same asset a second time to answer the same question.
+        let videos = VideoLibrary.shared
+        var frames: [CGImage] = []
+        frames.reserveCapacity(3)
+        var lastError: Error = PhotoLibraryError.imageUnavailable
+        for seconds in VideoLibrary.representativeTimes(duration: asset.duration) {
+            do {
+                frames.append(try await videos.frame(identifier: identifier,
+                                                    at: seconds,
+                                                    maxPixelSize: maxPixelSize,
+                                                    allowNetwork: allowNetwork))
+            } catch is CancellationError {
+                // The run was interrupted, not the clip. Rethrown rather than
+                // swallowed, so the worker's `Task.isCancelled` check hands the
+                // claim back instead of scoring a one-frame clip as though that
+                // were the whole of it.
+                throw CancellationError()
+            } catch {
+                // One bad moment must not cost the whole clip its score. Dropping
+                // the frame turns three samples into two, and two into one — which
+                // `analyzeFrames` still scores, and still reports as a
+                // single-frame subject.
+                Log.warn("frame at \(seconds)s of \(identifier) was not readable: \(error)")
+                lastError = error
+            }
+        }
+        // Every moment failed. Rethrowing rather than returning an empty array is
+        // what keeps the routing above intact — a cloud-only clip still answers
+        // `imageNotLocal` and is parked as unavailable instead of marked broken.
+        // "The last one" is an arbitrary choice only among failures that are all
+        // the same failure, because whichever one first fails for a given
+        // `allowNetwork` will fail for the rest of them too.
+        guard !frames.isEmpty else { throw lastError }
+        return frames
+    }
 
     /// Requests a downscaled representation and returns it as a `CGImage`.
     ///
@@ -372,16 +492,22 @@ final class PhotoLibrary: @unchecked Sendable {
     // MARK: - Deletion
 
     struct DeletionOutcome: Sendable {
-        var requested: Int = 0
         var deleted: Int = 0
         var missing: Int = 0
         /// Assets that exist in Photos but were left alone because they are
         /// favourites and protection is on. Read live from PhotoKit, so a photo
         /// favourited since the last scan is still protected.
         var skippedFavorites: Int = 0
-        /// Assets that exist but are not still images. Version 1 only ever scans
-        /// `.image`, so this is zero unless the cache and the library have
-        /// diverged — in which case deleting them is not what anyone asked for.
+        /// Assets that exist but are neither a photo nor a video — an audio asset,
+        /// or a media type Photos adds later.
+        ///
+        /// The wire field name is unchanged and deliberately so: it is a published
+        /// field, and "non-image" still describes what it counts. Before video
+        /// support this was zero unless the cache and the library had diverged,
+        /// because only `.image` was ever scanned; now it is the residue once
+        /// videos became scannable, browsable assets in their own right. Deleting
+        /// something the user cannot even see in the grid is not what anyone asked
+        /// for, so it is still skipped rather than swept up.
         var skippedNonImages: Int = 0
         var deletedIdentifiers: [String] = []
         var failedMessages: [String] = []
@@ -400,13 +526,25 @@ final class PhotoLibrary: @unchecked Sendable {
     /// the authority on what is favourited right now, and a photo that became a
     /// favourite a minute ago must not be destroyed because the cache has not
     /// caught up.
+    ///
+    /// ## What video support changed here, and what it did not
+    ///
+    /// It changed *which* assets are eligible: a video is deleted, because a user
+    /// who selects a clip in the grid and presses Delete has asked for it to be
+    /// deleted, and Photos puts it in Recently Deleted like anything else. The
+    /// `protectFavorites` branch did not move, and its position in the chain did
+    /// not either — it is still evaluated *before* the media-type test, so a
+    /// favourited asset is counted as `skippedFavorites` and never reaches the
+    /// deletable list, whatever it happens to be. Nothing about admitting videos
+    /// may weaken protection; that is the whole reason the check is re-read live
+    /// here rather than trusted from the cache, and it is why "may this be
+    /// deleted" is answered by *refusing* rather than by permitting a known list.
     func delete(identifiers: [String], protectFavorites: Bool, chunkSize: Int = 500) async -> DeletionOutcome {
         var outcome = DeletionOutcome()
         // Duplicates must never be double counted: `fetchAssets` collapses them,
         // which would leave `deleted` and `deletedIdentifiers` disagreeing.
         var seen = Set<String>()
         let unique = identifiers.filter { seen.insert($0).inserted }
-        outcome.requested = unique.count
 
         let authorization = Self.currentAuthorization()
         guard Self.hasReadAccess(authorization) else {
@@ -423,9 +561,15 @@ final class PhotoLibrary: @unchecked Sendable {
 
             var deletable: [PHAsset] = []
             for asset in fetched {
+                // Favourite protection first, and it stays first. A favourited
+                // video is protected on exactly the same terms as a favourited
+                // photograph, and widening what can be deleted must not widen what
+                // can be deleted *while protected*: this is the live check, and it
+                // fails closed — anything it cannot affirmatively clear is left
+                // alone.
                 if protectFavorites, asset.isFavorite {
                     outcome.skippedFavorites += 1
-                } else if asset.mediaType != .image {
+                } else if asset.mediaType != .image, asset.mediaType != .video {
                     outcome.skippedNonImages += 1
                 } else {
                     deletable.append(asset)
@@ -451,14 +595,15 @@ final class PhotoLibrary: @unchecked Sendable {
 
     /// Outcome of setting or clearing the favourite flag.
     struct FavoriteOutcome: Sendable {
-        /// Distinct identifiers the caller asked about.
-        var requested = 0
         /// Assets PhotoKit is now reporting as favourites matching the requested
         /// state. Read back from PhotoKit *after* the change, never assumed from
         /// the request: this is what the caller writes into the cache, so the two
         /// cannot come to disagree about who is protected.
         var confirmed: [String: Bool] = [:]
-        /// Assets that exist but are no longer still images.
+        /// Assets that exist but are neither a photo nor a video. Same meaning as
+        /// `DeletionOutcome.skippedNonImages`: everything the grid can show, and
+        /// everything `delete` can remove, so a user who favourites a video is
+        /// protecting it by the same gesture as a photo.
         var skippedNonImages = 0
         /// Identifiers no longer in the library at all.
         var missing: Int = 0
@@ -498,7 +643,6 @@ final class PhotoLibrary: @unchecked Sendable {
         var outcome = FavoriteOutcome()
         var seen = Set<String>()
         let unique = identifiers.filter { seen.insert($0).inserted }
-        outcome.requested = unique.count
 
         let authorization = Self.currentAuthorization()
         guard Self.hasReadAccess(authorization) else {
@@ -515,7 +659,16 @@ final class PhotoLibrary: @unchecked Sendable {
 
             var targets: [PHAsset] = []
             for asset in fetched {
-                if asset.mediaType == .image { targets.append(asset) } else { outcome.skippedNonImages += 1 }
+                // Photographs and videos; anything else is counted and left alone.
+                // The set here has to match the set `delete` will remove — a user
+                // who could favourite an asset but not delete it, or vice versa,
+                // would be looking at two different notions of what this tool
+                // manages.
+                if asset.mediaType == .image || asset.mediaType == .video {
+                    targets.append(asset)
+                } else {
+                    outcome.skippedNonImages += 1
+                }
             }
             guard !targets.isEmpty else { continue }
 
@@ -573,16 +726,26 @@ final class PhotoLibrary: @unchecked Sendable {
         /// `PHAssetCollection` does not expose its own collection type, so this is
         /// the *requested* type rather than a read-back. That is honest here only
         /// because `userAlbums` enumerates `PHAssetCollectionType.album` and
-        /// nothing else — the value is stored so a future code path that does mix
-        /// types cannot silently file a smart album among the user ones.
+        /// nothing else — the guard against filing a smart album among the user ones
+        /// is that one fetch, not this value, which is stored for the record and read
+        /// back by nothing.
         let collectionType: Int
-        /// Photos' own count for the collection. Used only to order the indexing
-        /// work smallest-first; never shown to the user, because it counts the
-        /// whole library including assets this instance has not scanned.
-        let estimatedCount: Int
     }
 
     /// The **user** albums in the library, smallest first.
+    ///
+    /// ## Why smallest first
+    ///
+    /// Album membership is the most expensive thing PhotoCleaner reads, so the
+    /// order decides what becomes filterable first: the cheapest albums become
+    /// usable almost immediately instead of waiting behind a 12,000-photo one.
+    ///
+    /// The order comes from PhotoKit's own `estimatedAssetCount`, which is a
+    /// deliberate approximation rather than an exact cost: Photos counts the whole
+    /// library including assets this instance has never scanned, while the write is
+    /// only over assets it has. It is still the right ordering for the same reason
+    /// it is an approximation — the albums that cost least to read are the ones
+    /// most likely to be both small and useful.
     ///
     /// ## Why smart albums are excluded, deliberately
     ///
@@ -615,8 +778,7 @@ final class PhotoLibrary: @unchecked Sendable {
                 title: collection.localizedTitle ?? "",
                 // The requested type, since `PHAssetCollection` does not report
                 // its own — see `AlbumRecord.collectionType`.
-                collectionType: PHAssetCollectionType.album.rawValue,
-                estimatedCount: max(0, collection.estimatedAssetCount)))
+                collectionType: PHAssetCollectionType.album.rawValue))
         }
         return records
     }
@@ -651,9 +813,17 @@ final class PhotoLibrary: @unchecked Sendable {
 
         let producer = Thread {
             let options = PHFetchOptions()
-            // Only stills: version 1 never scans video, and a membership row for
-            // an asset with no cache row would be pruned by the next `replaceAlbumMembership`.
-            options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+            // The same predicate the whole-library walk uses, and it has to stay
+            // the same: `asset_albums` holds a membership row per (asset, album)
+            // pair, and `CacheStore.replaceAlbumMembership` prunes every row whose
+            // asset has no cache row. A narrower walk here would write membership
+            // for assets the scan never visited — so the *next* album index would
+            // delete them again, and an album would flicker between indexes
+            // depending on which ran last. A membership row may only ever name an
+            // asset the scan also covers, which is why this calls
+            // `scannableMediaPredicate()` rather than writing the same clause out
+            // a second time.
+            options.predicate = PhotoLibrary.scannableMediaPredicate()
             PHAsset.fetchAssets(in: collection, options: options).enumerateObjects { asset, _, stopEnumerating in
                 if stop.isRequested {
                     stopEnumerating.pointee = true
@@ -1023,12 +1193,6 @@ private final class WalkHandoff<Element: Sendable>: @unchecked Sendable {
     }
 }
 
-/// Metadata for one batch of the library walk, held by reference.
-///
-/// The producer's callback is a synchronous closure, so the partial batch has to
-/// live in something with a stable address rather than in a local `var`. It is
-/// only ever touched on the producer thread, and nothing it points at escapes
-/// that thread except the arrays handed to the consumer, which are `Sendable`.
 /// Metadata for one batch of the album walk, held by reference.
 ///
 /// The same reason as `ScanRecordBatch`, with plain identifiers instead of
@@ -1057,6 +1221,12 @@ private final class IdentifierBatch: @unchecked Sendable {
     }
 }
 
+/// Metadata for one batch of the library walk, held by reference.
+///
+/// The producer's callback is a synchronous closure, so the partial batch has to
+/// live in something with a stable address rather than in a local `var`. It is
+/// only ever touched on the producer thread, and nothing it points at escapes
+/// that thread except the arrays handed to the consumer, which are `Sendable`.
 private final class ScanRecordBatch: @unchecked Sendable {
     private let capacity: Int
     private var records: [ScanRecord]
@@ -1085,9 +1255,22 @@ private final class ScanRecordBatch: @unchecked Sendable {
 
 /// Single-shot guard shared between the image request handler and the
 /// task-cancellation handler.
+/// Single-shot guard shared between the image request handler and the
+/// task-cancellation handler.
+///
+/// Two independent one-shot conditions, and both matter:
+///
+///   * **resume** — PhotoKit can call the handler more than once, and a second
+///     `resume` of a checked continuation traps.
+///   * **cancel** — the cancellation handler can run *before* the request has an
+///     identifier to cancel, because `withTaskCancellationHandler` fires `onCancel`
+///     immediately when the task is already cancelled. Without remembering the
+///     cancellation, a request registered afterwards is never cancelled: it runs to
+///     completion and hands back an image for a task that was told to stop.
 private final class ResumeBox: @unchecked Sendable {
     private let lock = NSLock()
     private var resumed = false
+    private var cancelled = false
     private var requestID: PHImageRequestID?
     private var manager: PHImageManager?
 
@@ -1101,7 +1284,7 @@ private final class ResumeBox: @unchecked Sendable {
 
     func set(requestID: PHImageRequestID, manager: PHImageManager) {
         lock.lock()
-        let alreadyCancelled = resumed
+        let alreadyCancelled = cancelled
         self.requestID = requestID
         self.manager = manager
         lock.unlock()
@@ -1110,6 +1293,7 @@ private final class ResumeBox: @unchecked Sendable {
 
     func cancel() {
         lock.lock()
+        cancelled = true
         let id = requestID
         let manager = manager
         lock.unlock()

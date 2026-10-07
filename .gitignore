@@ -1,7 +1,22 @@
+# Build output. dist/ holds the .app bundle and the DMGs; the embedded web-assets
+# source is generated from web/ by tools/embed-web.swift and must never be
+# committed, or it goes stale against the files it was generated from.
 .build/
 dist/
+Sources/PhotoCleaner/Web/GeneratedWebAssets.swift
+
+# macOS
 .DS_Store
 *.xcuserstate
+
+# SwiftPM. There is no Package.swift and there is not going to be one — see the
+# README — but these are what a stray `swift build` leaves behind, and they should
+# not turn up in a diff.
 .swiftpm/
 Package.resolved
-Sources/PhotoCleaner/Web/GeneratedWebAssets.swift
+
+# node_modules/ is npm's working directory, never committed: package.json declares
+# jsdom for the web-UI harness and npm fetches it at install time. `npm install`
+# recreates it. package.json and package-lock.json *are* committed — the manifest
+# and the resolution record, with no code from either in the tree.
+node_modules/

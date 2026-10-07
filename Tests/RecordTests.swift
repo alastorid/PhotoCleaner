@@ -201,14 +201,6 @@ func registerRecordTests() {
         check(!HTTPStatus.text(599).isEmpty, "and HTTP/1.1 requires a phrase to be present")
     })
 
-    Registry.shared.add(suite: suite, TestCase(name: "htmlEscaped covers the three characters that matter",
-        knownBug: nil) {
-        checkEqual("<script>".htmlEscaped, "&lt;script&gt;", "")
-        checkEqual("a&b".htmlEscaped, "a&amp;b", "")
-        checkEqual("\"'".htmlEscaped, "\"'", "quotes need no escaping outside an attribute")
-        checkEqual("plain".htmlEscaped, "plain", "")
-    })
-
     // MARK: the wire contract
 
     Registry.shared.add(suite: suite, TestCase(name: "optional fields are omitted, never sent as null", knownBug: nil) {
@@ -221,24 +213,27 @@ func registerRecordTests() {
         let dated = await fixture.router.reply(Req.get("/api/photo/dated"))
         checkEqual(dated.status, 200, "status")
         let row = dated.json["photo"] as? [String: Any] ?? [:]
-        checkEqual(row.keys.sorted(), ["date", "favorite", "height", "id", "score", "width"],
+        checkEqual(row.keys.sorted(), ["date", "favorite", "height", "id", "mediaType", "score", "width"],
                    "every field is present for a fully-populated row")
         checkEqual(row["date"] as? Double, 1000, "the date")
+        // `mediaType` is the one field that is never optional, and that is the point:
+        // a client reading its absence as "image" would render a video as a still.
+        checkEqual(row["mediaType"] as? Int, 1, "the media type is always stated, not inferred")
+        check(!row.keys.contains("duration"), "and a still carries no duration key at all")
 
         let undated = await fixture.router.reply(Req.get("/api/photo/undated"))
         let undatedRow = undated.json["photo"] as? [String: Any] ?? [:]
         check(!undatedRow.keys.contains("date"), "a nil date is omitted, not null: \(undatedRow.keys.sorted())")
         check(!undatedRow.values.contains { $0 is NSNull }, "and nothing in the object is an explicit null")
 
-        // `utility` used to be the optional field this case existed for. Nothing is
-        // optional now except the date, which the `undated` row above already covers,
-        // so what is left to assert is that the one non-optional field that cannot be
-        // known is still sent as a number rather than a null: `PhotoRow.score` is
-        // non-optional, so an unanalysed row reads back as `score: 0`, which the
-        // score-bounded filter excludes anyway because the stored column is NULL.
+        // Nothing else in a row is optional, so what is left to assert is that the
+        // one field that cannot be known is still sent as a number rather than a
+        // null: `PhotoRow.score` is non-optional, so an unanalysed row reads back as
+        // `score: 0`, which the score-bounded filter excludes anyway because the
+        // stored column is NULL.
         let unscored = await fixture.router.reply(Req.get("/api/photo/unscored"))
         let unscoredRow = unscored.json["photo"] as? [String: Any] ?? [:]
-        checkEqual(unscoredRow.keys.sorted(), ["date", "favorite", "height", "id", "score", "width"],
+        checkEqual(unscoredRow.keys.sorted(), ["date", "favorite", "height", "id", "mediaType", "score", "width"],
                    "an unanalysed row has the same shape as a scored one")
         check(!unscoredRow.values.contains { $0 is NSNull }, "and still sends no explicit nulls")
         checkEqual(unscoredRow["score"] as? Double, 0, "score is a number, not absent")

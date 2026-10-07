@@ -53,11 +53,17 @@ enum MainMenu {
         check.target = target
         updateItem = check
 
+        // No initial state here. The checkmark is not this file's to guess: it
+        // belongs to `Settings.checkForUpdates`, and `MainMenu.updateItem(for:)`
+        // writes the one value the updater will actually act on. Guessing `on`
+        // would put a tick next to a user who had deliberately turned the check
+        // off, and it would survive until the first updater status arrived —
+        // which is not instant, because the Photos permission prompt can sit in
+        // front of it.
         let automatic = menu.addItem(withTitle: "Check for Updates Automatically",
                                      action: #selector(AppDelegate.toggleAutomaticUpdateChecks(_:)),
                                      keyEquivalent: "")
         automatic.target = target
-        automatic.state = .on
         automaticItem = automatic
 
         menu.addItem(.separator())
@@ -104,6 +110,12 @@ enum MainMenu {
     /// answer mentally. It never becomes an error message: what happened to the
     /// last attempt belongs in the window and the log, not in a menu that is
     /// re-read every time it opens.
+    ///
+    /// `.checking` deliberately reads as "Check for Updates…" rather than
+    /// "Checking…": the menu is left enabled while the updater works, because the
+    /// title bar arc in the same state swaps its own pointer for an arrow, and two
+    /// affordances that answer differently send someone hunting for whichever one
+    /// still works.
     static func updateItem(for status: Updater.Status) {
         automaticItem?.state = status.automaticChecks ? .on : .off
         guard let item = updateItem else { return }

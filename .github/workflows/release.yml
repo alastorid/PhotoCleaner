@@ -88,11 +88,16 @@ jobs:
       # The image is verified above, but keep the artifact too: it is the only
       # way to pull the exact bytes that were released and reproduce a user's
       # problem with them.
+      #
+      # env.VERSION, not github.ref_name: the ref is the tag (`v1.2.3`) and
+      # make-dmg.sh names the file after the version it stamped into the bundle
+      # (`1.2.3`), so ref_name here would point at a path that does not exist and
+      # fail the step.
       - name: Upload the DMG
         uses: actions/upload-artifact@v4
         with:
-          name: PhotoCleaner-${{ github.ref_name }}-dmg
-          path: dist/PhotoCleaner-${{ github.ref_name }}-arm64.dmg
+          name: PhotoCleaner-${{ env.VERSION }}-dmg
+          path: dist/PhotoCleaner-${{ env.VERSION }}-arm64.dmg
           if-no-files-found: error
 
       # `gh` is already on the runner, so this adds no third-party action to a

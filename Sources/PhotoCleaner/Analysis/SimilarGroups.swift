@@ -126,8 +126,6 @@ struct SimilarGroup: Sendable, Equatable {
     /// identity across rebuilds and can be cited in a URL.
     let id: String
     let members: [String]
-
-    var isEmpty: Bool { members.isEmpty }
 }
 
 /// Builds Similar Groups from cached FeaturePrints.

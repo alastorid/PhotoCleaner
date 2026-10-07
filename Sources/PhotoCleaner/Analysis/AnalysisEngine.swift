@@ -8,8 +8,21 @@ import Photos
 /// to the remaining queue. Nothing is estimated or fabricated.
 struct StatusSnapshot: Sendable, Codable {
     struct LibrarySection: Sendable, Codable {
+        /// Every asset this instance has scanned — photos *and* videos. It means
+        /// what it always meant, and it now includes videos because a video is a
+        /// scanned, scored asset like any other; nothing here was renamed to make
+        /// room for the media split.
         var total = 0
         var favorites = 0
+        /// How many of `total` are videos.
+        ///
+        /// Reported rather than left for the client to infer by subtraction, because
+        /// subtraction cannot distinguish "no videos" from "this build does not scan
+        /// videos yet" — a fresh cache, before the first scan of a library that does
+        /// contain clips, reports the same zero either way, and the media control in
+        /// the UI needs to know which of those it is looking at before it offers a
+        /// filter that would return nothing.
+        var videos = 0
     }
 
     struct AnalysisSection: Sendable, Codable {
@@ -35,14 +48,19 @@ struct StatusSnapshot: Sendable, Codable {
 
     struct SettingsSection: Sendable, Codable {
         var downloadFromICloud = false
+        /// Reported as always `true` so a client can state the guarantee rather than
+        /// infer it from the absence of a control. Not settable.
         var protectFavorites = true
         var concurrency = 4
         var analysisPixelSize = 1024
         /// The Similar Group knobs, echoed so the UI renders the values the server
-        /// actually applied rather than what it last sent.
+        /// actually applied rather than what it last sent. All five: a partial echo
+        /// is a lie of omission, because a client cannot tell "unchanged" from
+        /// "not reported" for a key that is simply absent.
         var groupWindowSeconds = SimilarGroupSettings.default.windowSeconds
         var groupMaxDistance = SimilarGroupSettings.default.maxDistance
         var groupFaceWeight = SimilarGroupSettings.default.faceWeight
+        var groupMinimumFaceArea = SimilarGroupSettings.default.minimumFaceAreaFraction
         var groupMaximumSize = SimilarGroupSettings.default.maximumGroupSize
     }
 
@@ -201,6 +219,15 @@ actor AnalysisEngine {
             if removed > 0 {
                 Log.info("removed \(removed) cache entries for assets no longer in Photos")
             }
+            // The foreign key normally takes a deleted asset's group membership with
+            // it. This is the pass that can leave one behind — a rebuild reading
+            // members while this walk deletes underneath it — and it is the only
+            // moment in a run where the asset set has just changed, so it is where
+            // the sweep belongs.
+            let orphans = try await cache.pruneOrphanGroupMembers()
+            if orphans > 0 {
+                Log.info("pruned \(orphans) group memberships for assets no longer in the cache")
+            }
             scannedSoFar = nil
         } catch is CancellationError {
             // A rescan or a quit interrupted the walk. That is not an error and
@@ -309,15 +336,27 @@ actor AnalysisEngine {
             }
             let snapshot = settings.snapshot()
             do {
-                let image = try await library.image(
+                // One frame for a still, one to three for a video. The single call
+                // is what keeps the *failure routing* below unchanged: `framesForAnalysis`
+                // throws the same `PhotoLibraryError` cases `image(identifier:)` did, so
+                // `recordOutcome` still tells "deleted elsewhere" from "not on this Mac"
+                // from "could not be decoded" without knowing which kind of asset this
+                // was. Splitting the two here would have meant a second, video-only
+                // failure path — and a video that fails would then have had to be
+                // guessed at, which is exactly the "one bad clip aborts the pass"
+                // failure this shape exists to avoid.
+                let frames = try await library.framesForAnalysis(
                     identifier: job.identifier,
                     maxPixelSize: snapshot.analysisPixelSize,
                     allowNetwork: snapshot.downloadFromICloud
                 )
-                // Aesthetics and the FeaturePrint come from the same decoded image: measured at
-                // 7.2 ms together against 5.0 ms for aesthetics alone, because the
-                // two requests are independent models over pixels already in memory.
-                let (result, featurePrint) = try await analyzer.analyzeWithFeaturePrint(image)
+                // `analyzeFrames` takes the median of the per-frame scores and yields a
+                // FeaturePrint only for a single-frame subject, so a video scores
+                // without ever entering the Similar Group machinery. Both facts live in
+                // that one call rather than in this worker, because the "no vector for a
+                // video" rule is a property of what a video *is* and belongs beside the
+                // median, not beside the queue.
+                let (result, featurePrint) = try await analyzer.analyzeFrames(frames)
                 try await cache.record(score: result.score, for: job.identifier)
                 // A missing FeaturePrint is not a failure — the score is the primary
                 // observation, and an asset without one simply cannot join a group.
@@ -467,7 +506,7 @@ actor AnalysisEngine {
 
         var status = StatusSnapshot()
         status.authorization = authorization
-        status.library = .init(total: stats.total, favorites: stats.favorites)
+        status.library = .init(total: stats.total, favorites: stats.favorites, videos: stats.videos)
         status.settings = .init(downloadFromICloud: preferences.downloadFromICloud,
                                 protectFavorites: preferences.protectFavorites,
                                 concurrency: preferences.analysisConcurrency,
@@ -475,6 +514,7 @@ actor AnalysisEngine {
                                 groupWindowSeconds: preferences.groupWindowSeconds,
                                 groupMaxDistance: preferences.groupMaxDistance,
                                 groupFaceWeight: preferences.groupFaceWeight,
+                                groupMinimumFaceArea: preferences.groupMinimumFaceArea,
                                 groupMaximumSize: preferences.groupMaximumSize)
         status.score = .init(min: stats.minScore, max: stats.maxScore, analyzed: stats.analyzed)
         status.cachePath = AppPaths.cacheDatabase.path
@@ -507,6 +547,4 @@ actor AnalysisEngine {
         guard elapsed >= 1 else { return 0 }
         return Double(last.processed - first.processed) / elapsed
     }
-
-    func lastErrorDescription() -> String? { lastError }
 }

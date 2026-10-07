@@ -36,14 +36,16 @@ jobs:
       - name: Build
         run: ./build.sh
 
-      # 210 assertions over the production sources, compiled unmodified. No Photos
-      # library, no network, no real cache.
+      # The regression suite, over the production sources compiled unmodified. No Photos
+      # library, no network, no real cache. `./run-tests.sh --list` prints how many
+      # cases are registered; the run itself reports the counts.
       - name: Test
         run: ./run-tests.sh
 
-      # Structural audit of the built bundle: Info.plist keys, codesign, the embedded
-      # UI being byte-identical to web/, and that the app has written nothing outside
-      # Application Support and Logs. Cache and server checks skip themselves when
+      # Structural audit of the built bundle: Info.plist keys, codesign, the release
+      # feed being the only URL the binary can reach, the launcher flags, and that
+      # the app has written nothing outside Application Support and Logs. The server
+      # checks are skipped by --no-server and the cache checks skip themselves when
       # there is no library, so this is safe on a runner.
       - name: Smoke test (static)
         run: ./smoke-test.sh --no-server

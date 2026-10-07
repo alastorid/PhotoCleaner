@@ -6,8 +6,6 @@ import Foundation
 /// own Application Support directory. Nothing is ever written next to, or
 /// inside, `Photos Library.photoslibrary`.
 enum AppPaths {
-    static let bundleIdentifier = "com.alastorid.photocleaner"
-
     /// The running app's version, read from the `CFBundleShortVersionString` that
     /// build.sh stamped into Info.plist.
     ///
@@ -79,14 +77,29 @@ enum AppPaths {
         supportDirectory.appendingPathComponent("update", isDirectory: true)
     }
 
-    /// Where a release's DMG is downloaded to.
-    static func downloadedUpdate(version: String, architecture: String) -> URL {
-        updateDirectory.appendingPathComponent("PhotoCleaner-\(version)-\(architecture).dmg")
-    }
-
     /// `~/Library/Application Support/PhotoCleaner/cache.sqlite`
     static var cacheDatabase: URL {
         supportDirectory.appendingPathComponent("cache.sqlite")
+    }
+
+    /// `~/Library/Application Support/PhotoCleaner/video-cache`
+    ///
+    /// Where `VideoLibrary` parks passthrough exports of clips the user has
+    /// opened, so a clip is fetched from iCloud at most once per eviction cycle
+    /// instead of once per play.
+    ///
+    /// Application Support rather than `~/Library/Caches`, and that is the whole
+    /// argument: macOS offers to empty `Caches` when a disk runs low, and a user
+    /// who accepts would silently lose every cached export — harmless — but the
+    /// *same* directory being where the tool keeps the things it is supposed to
+    /// keep is a worse habit than a stale file. It is also what keeps
+    /// "PhotoCleaner writes nothing outside Application Support and Logs" true,
+    /// which `smoke-test.sh` audits and the README promises. Nothing here is a
+    /// derived value the user would miss: every file in it is reproducible from
+    /// Photos by re-exporting, which is why `VideoLibrary` bounds it rather than
+    /// treating it as storage.
+    static var videoCacheDirectory: URL {
+        supportDirectory.appendingPathComponent("video-cache", isDirectory: true)
     }
 
     /// `~/Library/Logs/PhotoCleaner/PhotoCleaner.log`
@@ -94,15 +107,6 @@ enum AppPaths {
         let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library")
         return base.appendingPathComponent("Logs/PhotoCleaner/PhotoCleaner.log")
-    }
-
-    /// The running executable, resolving the bundle layout when launched from a `.app`.
-    static var executableDirectory: URL {
-        let arg0 = CommandLine.arguments.first ?? ""
-        if arg0.contains("/") {
-            return URL(fileURLWithPath: arg0).resolvingSymlinksInPath().deletingLastPathComponent()
-        }
-        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
 
     static func createDirectoryIfNeeded(_ url: URL) throws {

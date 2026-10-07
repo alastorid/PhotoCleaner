@@ -33,6 +33,11 @@ struct CacheStats: Sendable {
     var unavailable = 0
     var pending = 0
     var favorites = 0
+    /// Scanned assets whose media type is video. `total` and `favorites` are
+    /// unchanged and now mean "all scanned assets", videos included — this is the
+    /// extra number that lets a caller say *which* of them are videos rather than
+    /// inferring it by subtraction.
+    var videos = 0
     var minScore: Float?
     var maxScore: Float?
 }
@@ -130,15 +135,22 @@ actor CacheStore {
     /// Version 2: the album tables. Deliberately additive — see `migrate`.
     /// Version 3: `similar_groups`, `similar_group_members` and
     /// `featureprint_queue`.
+    /// Version 4: the three group settings version 3 did not record, so a stored
+    /// group can say which *rules* produced it and not only which threshold.
+    /// Version 5: `assets.duration_seconds`, so a scored video can say how long it
+    /// is without PhotoKit being asked again.
     ///
     /// Covered by `SchemaTests`, which rewinds a database to an older version and
     /// upgrades it — the one guarantee here that cannot be checked on a fresh file,
     /// because a fresh file is already at the current version.
-    static let schemaVersion = 3
+    static let schemaVersion = 5
 
     /// Creates or upgrades the schema. Idempotent, and safe to run against a
-    /// database an older build wrote: every step is `IF NOT EXISTS`, nothing is
-    /// dropped or rewritten, and no existing table's shape changes.
+    /// database an older build wrote: every step is `IF NOT EXISTS` or is guarded
+    /// by a column check, nothing is dropped or rewritten, and no existing column
+    /// changes meaning — the two steps that touch an existing table (version 4's
+    /// group settings and version 5's `duration_seconds`) only *add* columns, which
+    /// is why the rows an older build wrote survive both.
     ///
     /// **Version 2 (albums).** The existing `assets` table has exactly one row per
     /// asset and albums are many-to-many, so they cannot be columns on it: a
@@ -215,9 +227,19 @@ actor CacheStore {
         CREATE TABLE IF NOT EXISTS albums (
             album_identifier TEXT PRIMARY KEY,
             title            TEXT NOT NULL DEFAULT '',
+            -- Recorded, never filtered on. `PhotoLibrary.userAlbums` is the only
+            -- writer and it enumerates `PHAssetCollectionType.album` and nothing
+            -- else, so the type is a record of what was asked for rather than a
+            -- filter; see `AlbumRecord.collectionType`.
             collection_type  INTEGER NOT NULL DEFAULT 1,
             -- Populated (membership rows written) at least once, and when.
             indexed_at       REAL,
+            -- Version 2 wrote this as the album's membership size. Nothing has read
+            -- it since, because the count that is served is deliberately *not* this
+            -- one: `albums()` recounts over scored assets, so the number on the chip
+            -- is the number of tiles the filter will actually yield. The column stays
+            -- because a cache on disk is not ours to reshape, and it is no longer
+            -- written — one `COUNT(*)` per album per pass for nobody.
             estimated_count  INTEGER NOT NULL DEFAULT 0
         );
         """)
@@ -296,7 +318,60 @@ actor CacheStore {
         );
         """)
 
+        // ---- version 4: the rest of the settings a pass was built under --------
+        // Additive like everything above, and the only step that has to *alter* an
+        // existing table, because a version 3 cache already has `similar_groups` and
+        // the columns belong to it rather than to a new table.
+        //
+        // Version 3 stored the capture window and the FeaturePrint threshold — the
+        // two knobs that decide *which photos are grouped* — and read them back into
+        // `GroupSummary`, where nothing consumed them. The knobs a pass also used
+        // had nowhere to go, so "were these groups built with different rules?"
+        // could not be answered for them: after a restart the answer was always
+        // "no", because the comparison lived in the engine's memory. Recording the
+        // remaining three makes the stored row a complete statement of the rules it
+        // was built under. See `newestGroupPass`.
+        try addColumnIfMissing("similar_groups", name: "face_weight", type: "REAL")
+        try addColumnIfMissing("similar_groups", name: "minimum_face_area", type: "REAL")
+        try addColumnIfMissing("similar_groups", name: "maximum_group_size", type: "INTEGER")
+
+        // ---- version 5: clip duration ------------------------------------------
+        // The only column video support adds, and it is additive like every step
+        // above: an existing cache upgrades in place with every score intact.
+        //
+        // `NULL`, not `0`, for every row written before this version, and that is
+        // the honest value rather than a placeholder: those rows are either stills
+        // — which have no duration — or videos this build has not re-scanned yet,
+        // and both of those are "unknown", not "zero seconds long". A client that
+        // renders a duration badge must therefore omit it, exactly as it omits any
+        // other absent field, rather than printing `0:00` for a nine-minute clip.
+        // `0` would be a claim about the asset, and this codebase never writes a
+        // claim it cannot source.
+        try addColumnIfMissing("assets", name: "duration_seconds", type: "REAL")
+
         try execute("PRAGMA user_version = \(Self.schemaVersion);")
+    }
+
+    /// Adds one column to an existing table, if it is not already there.
+    ///
+    /// SQLite has no `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, so a step that has
+    /// to alter a table has to *read* its shape first. That is what keeps this
+    /// idempotent, which in turn is what lets `migrate()` keep running
+    /// unconditionally on every launch: a column added on the first upgrade is found
+    /// on the second and skipped.
+    ///
+    /// `table` and `name` are literals at both call sites, never anything a caller
+    /// supplies — there is no parameter for a value that has to reach SQL as text.
+    private func addColumnIfMissing(_ table: String, name: String, type: String) throws {
+        let existing = try withStatement("PRAGMA table_info(\(table));") { statement -> Set<String> in
+            var columns: Set<String> = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                columns.insert(text(statement, 1))
+            }
+            return columns
+        }
+        guard !existing.contains(name) else { return }
+        try execute("ALTER TABLE \(table) ADD COLUMN \(name) \(type);")
     }
 
     /// Reads `PRAGMA user_version`. Used by the migration tests and by
@@ -385,28 +460,60 @@ actor CacheStore {
     /// A row is claimed by being *deleted*, and completed by writing the vector. A
     /// crash therefore loses the claim and the asset is retried, rather than
     /// leaving a placeholder that would silently never be filled.
+    ///
+    /// The version guard is what makes `asset_signals.analyzer_version` mean
+    /// something. A vector written by an earlier build is re-queued for the same
+    /// reason a score is: `analyzerVersion` is the promise that "the meaning of a
+    /// stored observation changes when this number changes", and a cache that
+    /// checked only for the row's *existence* would keep comparing FeaturePrints
+    /// computed under rules the current build no longer applies — with no symptom
+    /// other than subtly wrong groups. Rows written by the current build carry its
+    /// version, so this costs nothing until the version is actually bumped.
+    ///
+    /// **Videos are excluded, and that is a decision rather than a gap.** A
+    /// FeaturePrint is Apple's answer to "are these the same shot?". For a video
+    /// it would be one arbitrary frame of a clip that may pan off the very thing a
+    /// still shows, so the distance would be answering a question nobody asked, and
+    /// the `maxDistance` threshold and the capture window were both calibrated on
+    /// stills against bursts and retakes. Admitting clip frames would silently
+    /// change what a distance *means* for every group already stored. Excluding
+    /// them here is the belt; `VisionAnalyzer.analyzeFrames` returning no vector for
+    /// a multi-frame subject is the braces, and a video therefore has no path into
+    /// `similar_group_members` at all.
     private func refreshFeaturePrintQueue() throws {
         try withStatement("""
         INSERT OR IGNORE INTO featureprint_queue (asset_identifier)
         SELECT a.asset_identifier
         FROM assets a
         WHERE a.aesthetics_score IS NOT NULL
+          AND a.media_type = 1
           AND NOT EXISTS (
             SELECT 1 FROM asset_signals s
             WHERE s.asset_identifier = a.asset_identifier AND s.signal = ?
+              AND s.analyzer_version = ?
           );
         """) { statement in
             bind(statement, 1, Signal.featurePrint.rawValue)
+            sqlite3_bind_int(statement, 2, Int32(Self.analyzerVersion))
             try run(statement)
         }
     }
 
     func upsert(batch: [ScanRecord], marker: Int64) throws {
+        // `duration_seconds` is written on conflict unconditionally, exactly like
+        // `media_type` and `favorite`: they are facts Photos reported about the
+        // asset right now, so the newest scan always wins. It is *not* given one of
+        // the guarded `CASE` arms below, which exist for a different reason —
+        // those preserve a score that is still valid, and duration is not a score.
+        // A video scanned for the first time lands on the existing `ELSE 'pending'`
+        // arm and is queued; a video already `done` keeps its score untouched,
+        // exactly as a photo does, and a still keeps a NULL duration.
         let sql = """
         INSERT INTO assets (
             asset_identifier, media_type, creation_date, modification_date, width, height,
-            favorite, media_subtype, is_screenshot, analysis_state, scan_marker, analyzer_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            favorite, media_subtype, is_screenshot, duration_seconds,
+            analysis_state, scan_marker, analyzer_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         ON CONFLICT(asset_identifier) DO UPDATE SET
             media_type        = excluded.media_type,
             creation_date     = excluded.creation_date,
@@ -416,6 +523,7 @@ actor CacheStore {
             favorite          = excluded.favorite,
             media_subtype     = excluded.media_subtype,
             is_screenshot     = excluded.is_screenshot,
+            duration_seconds  = excluded.duration_seconds,
             scan_marker       = excluded.scan_marker,
             analysis_state    = CASE
                 WHEN assets.analysis_state = 'done'
@@ -457,8 +565,12 @@ actor CacheStore {
                     sqlite3_bind_int(statement, 7, record.favorite ? 1 : 0)
                     sqlite3_bind_int(statement, 8, Int32(truncatingIfNeeded: record.mediaSubtype))
                     sqlite3_bind_int(statement, 9, record.isScreenshot ? 1 : 0)
-                    sqlite3_bind_int64(statement, 10, marker)
-                    sqlite3_bind_int(statement, 11, Int32(Self.analyzerVersion))
+                    // NULL for a still, never `0`: `PHAsset.duration` is 0 for an
+                    // image, and storing that would be a stored lie about a clip
+                    // that does not exist. `bind(_:_: Double?)` binds NULL itself.
+                    bind(statement, 10, record.duration)
+                    sqlite3_bind_int64(statement, 11, marker)
+                    sqlite3_bind_int(statement, 12, Int32(Self.analyzerVersion))
                     try run(statement)
                 }
             }
@@ -482,6 +594,13 @@ actor CacheStore {
 
     // MARK: - Analysis queue
 
+    /// Takes up to `limit` unscored assets, newest first.
+    ///
+    /// `media_type IN (1, 2)` — images *and* videos. The predicate is spelled as a
+    /// two-value `IN` rather than `!= 1` on purpose: the closed set is what the
+    /// scoring pass wants, and `!= 1` would quietly start scoring an asset whose
+    /// media type is `audio` or `unknown` if Photos ever reported one, which is not
+    /// something this pass knows how to produce frames for.
     func claimJobs(limit: Int) throws -> [AssetJob] {
         var jobs: [AssetJob] = []
         // The selection and the state change are one transaction. They were
@@ -492,7 +611,7 @@ actor CacheStore {
         do {
             try withStatement("""
             SELECT asset_identifier FROM assets
-            WHERE analysis_state = 'pending' AND media_type = 1
+            WHERE analysis_state = 'pending' AND media_type IN (1, 2)
             ORDER BY creation_date DESC, asset_identifier ASC
             LIMIT ?;
             """) { statement in
@@ -649,9 +768,9 @@ actor CacheStore {
     /// ever reads back — and so `featurePrints()` can be sure of what it is
     /// selecting.
     enum Signal: String, Sendable {
-        /// Apple's FeaturePrint, LZFSE-compressed JSON. See `recordFeaturePrint`.
+        /// Apple's FeaturePrint, zlib-compressed JSON. See `recordFeaturePrint`.
         case featurePrint = "featureprint"
-        /// Per-face capture quality, LZFSE-compressed JSON.
+        /// Per-face capture quality, zlib-compressed JSON.
         case faceCaptureQuality = "face_capture_quality"
     }
 
@@ -661,19 +780,32 @@ actor CacheStore {
     ///
     /// A FeaturePrint is 768 floats: 3,072 B raw, 4,351 B as JSON. Measured on
     /// this library, JSON at 4.3 KB × 53k assets is 231 MB of cache — against a
-    /// cache that is otherwise 15 MB — so it is LZFSE'd, which brings it to
-    /// ~2.7 KB each, about 144 MB.
+    /// cache that is otherwise 15 MB — so it is zlib'd, which brings it to
+    /// ~2.5 KB each, about 149 MB.
     ///
     /// JSON is used rather than the raw bytes because **there is no public way to
     /// rebuild a `FeaturePrintObservation` from its raw payload**: the only
     /// initialiser takes another observation, and the `Codable` conformance is the
     /// only route in. That round trip was verified bit-exact — worst distance
-    /// error `0.0` across 400 pairs — so nothing is lost by taking it.
-    /// Takes up to `limit` assets awaiting a FeaturePrint backfill, newest first.
+    /// error `0.0` across 400 pairs — so nothing is lost by taking it. The same
+    /// applies to a face result; both encodings live in `SignalCompression`.
+    func recordFeaturePrint(_ payload: Data, for identifier: String) throws {
+        try recordSignal(.featurePrint, payload: payload, for: identifier)
+    }
+
+    /// Takes up to `limit` assets awaiting a FeaturePrint backfill.
     ///
     /// A separate queue from `claimJobs` because these assets are already `done`:
     /// their aesthetics score is good and must not be disturbed, so they cannot go
     /// through the state machine that clears scores on requeue.
+    ///
+    /// Claims come out in the order the queue was filled — insertion order, which is
+    /// the order `refreshFeaturePrintQueue` scanned the asset table in, and so the
+    /// order of the walk that discovered them. Deliberately not "newest first":
+    /// arranging that would need a join against `assets`, and the queue is a set of
+    /// outstanding work rather than a ranking. The one property it does need is that
+    /// a claim is *removed* when it is taken, so two runs can never both spend
+    /// effort on one asset.
     func claimFeaturePrints(limit: Int) throws -> [String] {
         var identifiers: [String] = []
         try execute("BEGIN IMMEDIATE;")
@@ -733,10 +865,6 @@ actor CacheStore {
             guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
             return Int(sqlite3_column_int64(statement, 0))
         }
-    }
-
-    func recordFeaturePrint(_ payload: Data, for identifier: String) throws {
-        try recordSignal(.featurePrint, payload: payload, for: identifier)
     }
 
     /// Stores one face-capture result for an asset.
@@ -864,8 +992,9 @@ actor CacheStore {
             try withStatement("""
             INSERT INTO similar_groups (
                 group_id, member_count, face_member_count, earliest_date,
-                window_seconds, max_distance, ranked_at, built_at
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?);
+                window_seconds, max_distance, face_weight, minimum_face_area,
+                maximum_group_size, ranked_at, built_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?);
             """) { statement in
                 let now = Date().timeIntervalSince1970
                 for group in groups {
@@ -881,7 +1010,13 @@ actor CacheStore {
                     }
                     sqlite3_bind_double(statement, 5, config.windowSeconds)
                     sqlite3_bind_double(statement, 6, Double(config.maxDistance))
-                    sqlite3_bind_double(statement, 7, now)
+                    // The rest of the settings, so a stored row is a complete
+                    // statement of the rules it was built under — see
+                    // `newestGroupPass`, which is what reads them back.
+                    sqlite3_bind_double(statement, 7, Double(config.faceWeight))
+                    sqlite3_bind_double(statement, 8, Double(config.minimumFaceAreaFraction))
+                    sqlite3_bind_int(statement, 9, Int32(config.maximumGroupSize))
+                    sqlite3_bind_double(statement, 10, now)
                     try run(statement)
                 }
             }
@@ -922,15 +1057,54 @@ actor CacheStore {
         let memberCount: Int
         let faceMemberCount: Int
         let earliestDate: Double?
-        /// The settings this group was built under, so a stale group can be named
-        /// as stale rather than quietly served.
-        let windowSeconds: Double
-        let maxDistance: Float
-        /// `nil` while the group is still being face-analysed.
+        /// `nil` until every member has been through face capture analysis. The
+        /// browser reports that as `incomplete`, so a portrait group whose ranking
+        /// may still move is not presented as settled.
         let rankedAt: Double?
     }
 
-    /// A page of groups, largest first, optionally restricted to one album.
+    /// The pass the stored groups came from: when it ran, and the settings it ran
+    /// under. `nil` when no group is stored, or when the stored rows predate the
+    /// columns that record the settings (schema version 4) — "not recorded" is not
+    /// "recorded as current", and the caller must be able to tell the difference.
+    ///
+    /// One row is enough: `replaceGroups` writes every group in a single
+    /// transaction from one `SimilarGroupSettings`, so they all carry the same
+    /// values. The newest row is read, so a pass that found nothing does not
+    /// masquerade as a library that has never been grouped.
+    ///
+    /// This is what makes "built with different rules" survive a restart. The
+    /// engine's own record of what it built is process state; a settings change
+    /// followed by a quit would otherwise leave groups built under rules the user
+    /// has moved on from being reported — and served — as current.
+    func newestGroupPass() throws -> (builtAt: Date, settings: SimilarGroupSettings)? {
+        try withStatement("""
+        SELECT built_at, window_seconds, max_distance, face_weight,
+               minimum_face_area, maximum_group_size
+        FROM similar_groups
+        ORDER BY built_at DESC LIMIT 1;
+        """) { statement in
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            let window = sqlite3_column_double(statement, 1)
+            let distance = Float(sqlite3_column_double(statement, 2))
+            guard sqlite3_column_type(statement, 3) != SQLITE_NULL,
+                  sqlite3_column_type(statement, 4) != SQLITE_NULL,
+                  sqlite3_column_type(statement, 5) != SQLITE_NULL else { return nil }
+            return (
+                Date(timeIntervalSince1970: sqlite3_column_double(statement, 0)),
+                SimilarGroupSettings(
+                    windowSeconds: window,
+                    maxDistance: distance,
+                    faceWeight: Float(sqlite3_column_double(statement, 3)),
+                    minimumFaceAreaFraction: Float(sqlite3_column_double(statement, 4)),
+                    maximumGroupSize: Int(sqlite3_column_int(statement, 5))
+                ).validated()
+            )
+        }
+    }
+
+    /// A page of groups, largest first, optionally restricted to one album and one
+    /// media type.
     ///
     /// The album dimension filters on a group's **members**, and a group qualifies
     /// as soon as *one* member is in the album rather than only when all of them
@@ -940,19 +1114,38 @@ actor CacheStore {
     /// comparing. The predicate is an `EXISTS` over the members primary key, so
     /// the cost is one index probe per group, not per photo.
     ///
-    /// The order is the group's own size, unchanged by the filter: `member_count` is
-    /// a property of the group, and re-ranking the list by "how many photos of this
-    /// group happen to be in this album" would make one album's list a different
-    /// sort from another's for no reason the user asked for.
-    func groupSummaries(limit: Int, offset: Int, album: AlbumSelection = .all) throws -> (total: Int, groups: [GroupSummary]) {
-        let clause = album.membershipClause(asset: "m.asset_identifier", albumParameter: "?1")
+    /// The media dimension filters the same way, on the same "one member is enough"
+    /// rule, and for the same reason — but note what it actually means in practice:
+    /// **videos are never group members** (§ the FeaturePrint exclusion in
+    /// `refreshFeaturePrintQueue`), so `media = .videos` yields an empty list and
+    /// `media = .images` yields the unfiltered list. That is the truthful answer, and
+    /// it is produced by the filter rather than short-circuited in the router, so the
+    /// day a video *can* join a group this route needs no change.
+    ///
+    /// The order is the group's own size, unchanged by either filter:
+    /// `member_count` is a property of the group, and re-ranking the list by "how
+    /// many photos of this group happen to be in this album" would make one album's
+    /// list a different sort from another's for no reason the user asked for.
+    func groupSummaries(limit: Int, offset: Int, album: AlbumSelection = .all,
+                        media: MediaSelection = .all) throws -> (total: Int, groups: [GroupSummary]) {
+        let clause = Self.groupMemberClause(album: album, media: media,
+                                            asset: "m.asset_identifier", albumParameter: "?1")
         let filtered = !clause.isEmpty
         // Named `qualifier` rather than `where`: the latter is a keyword, and the
         // multiline literal it would be interpolated into reads as a clause
         // declaration rather than a value.
+        //
+        // `assets` is joined into the `EXISTS` rather than left out. `MediaSelection`'s
+        // predicate is the bare literal `media_type = 1` (it has to be unqualified
+        // and unparameterised — see `PhotoFilter.whereSQLClause`), and
+        // `similar_group_members` has no such column, so without this join SQLite
+        // would fail to prepare the statement and the *album* filter would break
+        // along with the media one. The join is on the members primary key, so it
+        // costs the same one index probe the correlated subquery already paid.
         let qualifier = filtered
             ? """
             WHERE EXISTS (SELECT 1 FROM similar_group_members m \
+            JOIN assets ma ON ma.asset_identifier = m.asset_identifier \
             WHERE m.group_id = g.group_id AND \(clause))
             """
             : ""
@@ -975,8 +1168,7 @@ actor CacheStore {
             total = Int(sqlite3_column_int64(statement, 0))
         }
         try withStatement("""
-        SELECT g.group_id, g.member_count, g.face_member_count, g.earliest_date,
-               g.window_seconds, g.max_distance, g.ranked_at
+        SELECT g.group_id, g.member_count, g.face_member_count, g.earliest_date, g.ranked_at
         FROM similar_groups g
         \(qualifier)
         ORDER BY g.member_count DESC, g.group_id ASC
@@ -992,10 +1184,8 @@ actor CacheStore {
                     faceMemberCount: Int(sqlite3_column_int(statement, 2)),
                     earliestDate: sqlite3_column_type(statement, 3) == SQLITE_NULL
                         ? nil : sqlite3_column_double(statement, 3),
-                    windowSeconds: sqlite3_column_double(statement, 4),
-                    maxDistance: Float(sqlite3_column_double(statement, 5)),
-                    rankedAt: sqlite3_column_type(statement, 6) == SQLITE_NULL
-                        ? nil : sqlite3_column_double(statement, 6)))
+                    rankedAt: sqlite3_column_type(statement, 4) == SQLITE_NULL
+                        ? nil : sqlite3_column_double(statement, 4)))
             }
         }
         return (total, summaries)
@@ -1008,12 +1198,18 @@ actor CacheStore {
     /// of the *group* rather than of whatever page was fetched: a `LIMIT` applied
     /// before the count would turn "12 photos" into "the first 12 photos". The read
     /// is an index probe per member on the members primary key.
-    func groupMembers(groupID: String, album: AlbumSelection = .all) throws -> [String] {
-        let clause = album.membershipClause(asset: "m.asset_identifier", albumParameter: "?2")
+    func groupMembers(groupID: String, album: AlbumSelection = .all,
+                      media: MediaSelection = .all) throws -> [String] {
+        let clause = Self.groupMemberClause(album: album, media: media,
+                                            asset: "m.asset_identifier", albumParameter: "?2")
         let extra = clause.isEmpty ? "" : "AND \(clause)"
         var identifiers: [String] = []
+        // `assets` joined for the same reason as in `groupSummaries`: the media
+        // predicate is an unqualified literal and the members table has no
+        // `media_type`. Primary-key join, so one probe per member.
         try withStatement("""
         SELECT m.asset_identifier FROM similar_group_members m
+        JOIN assets ma ON ma.asset_identifier = m.asset_identifier
         WHERE m.group_id = ?1\(extra)
         ORDER BY m.asset_identifier ASC;
         """) { statement in
@@ -1029,8 +1225,7 @@ actor CacheStore {
     /// One group's stored row, or nil for an identifier this instance never built.
     func groupSummary(id: String) throws -> GroupSummary? {
         try withStatement("""
-        SELECT group_id, member_count, face_member_count, earliest_date,
-               window_seconds, max_distance, ranked_at
+        SELECT group_id, member_count, face_member_count, earliest_date, ranked_at
         FROM similar_groups WHERE group_id = ?;
         """) { statement in
             bind(statement, 1, id)
@@ -1041,10 +1236,8 @@ actor CacheStore {
                 faceMemberCount: Int(sqlite3_column_int(statement, 2)),
                 earliestDate: sqlite3_column_type(statement, 3) == SQLITE_NULL
                     ? nil : sqlite3_column_double(statement, 3),
-                windowSeconds: sqlite3_column_double(statement, 4),
-                maxDistance: Float(sqlite3_column_double(statement, 5)),
-                rankedAt: sqlite3_column_type(statement, 6) == SQLITE_NULL
-                    ? nil : sqlite3_column_double(statement, 6))
+                rankedAt: sqlite3_column_type(statement, 4) == SQLITE_NULL
+                    ? nil : sqlite3_column_double(statement, 4))
         }
     }
 
@@ -1056,14 +1249,15 @@ actor CacheStore {
     /// The album selection is applied **before** the `LIMIT`, not after it: filtering
     /// a full page down to the album would starve a large group of members the
     /// filter keeps and report a page the group never contained.
-    func rankingInputs(groupID: String, limit: Int, album: AlbumSelection = .all) throws -> [RankingInput] {
-        let clause = album.membershipClause(asset: "a.asset_identifier", albumParameter: "?2")
+    func rankingInputs(groupID: String, limit: Int, album: AlbumSelection = .all,
+                       media: MediaSelection = .all) throws -> [RankingInput] {
+        let clause = Self.groupMemberClause(album: album, media: media,
+                                            asset: "a.asset_identifier", albumParameter: "?2")
         let extra = clause.isEmpty ? "" : "AND \(clause)"
         let limitParameter = clause.isEmpty ? "?2" : "?3"
         var inputs: [RankingInput] = []
         try withStatement("""
-        SELECT a.asset_identifier, a.aesthetics_score, a.creation_date,
-               a.width, a.height, a.favorite
+        SELECT a.asset_identifier, a.aesthetics_score, a.creation_date, a.favorite
         FROM similar_group_members m
         JOIN assets a ON a.asset_identifier = m.asset_identifier
         WHERE m.group_id = ?1 \(extra)
@@ -1081,7 +1275,7 @@ actor CacheStore {
                     faces: [],
                     date: sqlite3_column_type(statement, 2) == SQLITE_NULL
                         ? nil : sqlite3_column_double(statement, 2),
-                    favorite: sqlite3_column_int(statement, 5) != 0))
+                    favorite: sqlite3_column_int(statement, 3) != 0))
             }
         }
         let faces = try faceCaptureQualities(for: inputs.map(\.identifier))
@@ -1143,12 +1337,20 @@ actor CacheStore {
         }
     }
 
-    /// Members of the stored groups that have no face result yet, oldest first.
+    /// Members of the stored groups that have no face result yet, oldest capture
+    /// first.
     ///
     /// This is the Tier 3 queue. It is deliberately **not** the whole library: only
     /// photos that grouping has already placed in a group of two or more are
     /// eligible, so face capture quality is computed for the small fraction of a
     /// library that can actually use it.
+    ///
+    /// Capture time is the order, with the identifier as the tie-break, so two runs
+    /// cannot hand out the same work in a different order. What matters is that the
+    /// order is a property of the photos rather than of which group happened to sort
+    /// first: a bounded queue whose order shifts between passes lets a long tail of
+    /// members be looked at last over and over, while the groups containing them
+    /// report themselves as still settling.
     func groupMembersNeedingFaces(limit: Int) throws -> [String] {
         var identifiers: [String] = []
         try withStatement("""
@@ -1156,9 +1358,11 @@ actor CacheStore {
         FROM similar_group_members m
         LEFT JOIN asset_signals s
           ON s.asset_identifier = m.asset_identifier AND s.signal = ?
+        LEFT JOIN assets a
+          ON a.asset_identifier = m.asset_identifier
         WHERE s.asset_identifier IS NULL
         GROUP BY m.asset_identifier
-        ORDER BY MIN(m.group_id) ASC
+        ORDER BY MIN(COALESCE(a.creation_date, 0)) ASC, m.asset_identifier ASC
         LIMIT ?;
         """) { statement in
             bind(statement, 1, Signal.faceCaptureQuality.rawValue)
@@ -1172,11 +1376,12 @@ actor CacheStore {
 
     /// Drops membership rows whose asset has left the library.
     ///
-    /// Normally handled by the foreign key on `assets`, but `finishScan` deletes
-    /// rows with `PRAGMA foreign_keys` cascades active, and this exists for the
-    /// case where a rebuild reads members while the scan is deleting underneath it:
-    /// a member that no longer exists must not keep a group alive with a phantom
-    /// slot.
+    /// Normally handled by the foreign key on `assets` — which `finishScan`'s delete
+    /// cascades through — so on a correct database this is a no-op. It exists for
+    /// the case where a rebuild reads members while the scan is deleting underneath
+    /// it: a member that no longer exists must not keep a group alive with a phantom
+    /// slot. Called once per scan, after the reconciliation that could have left
+    /// such a row, and its count is logged when it is not zero.
     @discardableResult
     func pruneOrphanGroupMembers() throws -> Int {
         try execute("""
@@ -1305,13 +1510,10 @@ actor CacheStore {
                 }
             }
             try withStatement("""
-            UPDATE albums SET indexed_at = ?, estimated_count = (
-                SELECT COUNT(*) FROM asset_albums WHERE album_identifier = ?
-            ) WHERE album_identifier = ?;
+            UPDATE albums SET indexed_at = ? WHERE album_identifier = ?;
             """) { statement in
                 sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970)
                 bind(statement, 2, albumIdentifier)
-                bind(statement, 3, albumIdentifier)
                 try run(statement)
             }
             try execute("COMMIT;")
@@ -1322,9 +1524,21 @@ actor CacheStore {
     }
 
     /// Drops album rows and their membership that Photos no longer reports.
+    ///
+    /// The empty case is the one that looks like a special case and is not: Photos
+    /// reporting *no* user albums is a fact about the library, and every stored row
+    /// is then one Photos no longer reports. Refusing to prune it would leave a
+    /// deleted album filterable for ever. It is also self-healing if the enumeration
+    /// ever answers empty by accident — `AlbumIndexer.shouldRefresh` restarts a pass
+    /// as soon as it has indexed nothing, and membership is only ever written from a
+    /// fresh read of the album.
     @discardableResult
     func removeAlbums(notIn identifiers: [String]) throws -> Int {
-        guard !identifiers.isEmpty else { return 0 }
+        guard !identifiers.isEmpty else {
+            try execute("DELETE FROM albums;")
+            let removed = sqlite3_changes(db)
+            return Int(removed)
+        }
         try execute("BEGIN IMMEDIATE;")
         var removed = 0
         do {
@@ -1488,6 +1702,16 @@ actor CacheStore {
             return cached
         }
         var stats = CacheStats()
+        // The video count is one more column in this statement rather than a second
+        // query. `/api/status` polls this, it is cached for a second at a time and
+        // read straight after a page in `Router.photos`, so a separate round trip
+        // would be paid on every poll to learn a number that costs one `CASE` here —
+        // and the table is already being scanned once, so the marginal cost is
+        // nil.
+        //
+        // `media_type = 2` is a literal, matching `claimJobs`: no placeholder, so
+        // the existing numbering (and therefore the callers' bind indices) is
+        // untouched.
         try withStatement("""
         SELECT COUNT(*),
                COALESCE(SUM(CASE WHEN aesthetics_score IS NOT NULL THEN 1 ELSE 0 END), 0),
@@ -1495,6 +1719,7 @@ actor CacheStore {
                COALESCE(SUM(CASE WHEN analysis_state = 'unavailable' THEN 1 ELSE 0 END), 0),
                COALESCE(SUM(CASE WHEN analysis_state IN ('pending', 'analyzing') THEN 1 ELSE 0 END), 0),
                COALESCE(SUM(favorite), 0),
+               COALESCE(SUM(CASE WHEN media_type = 2 THEN 1 ELSE 0 END), 0),
                MIN(aesthetics_score), MAX(aesthetics_score)
         FROM assets;
         """) { statement in
@@ -1505,11 +1730,12 @@ actor CacheStore {
             stats.unavailable = Int(sqlite3_column_int64(statement, 3))
             stats.pending = Int(sqlite3_column_int64(statement, 4))
             stats.favorites = Int(sqlite3_column_int64(statement, 5))
-            if sqlite3_column_type(statement, 6) != SQLITE_NULL {
-                stats.minScore = Float(sqlite3_column_double(statement, 6))
-            }
+            stats.videos = Int(sqlite3_column_int64(statement, 6))
             if sqlite3_column_type(statement, 7) != SQLITE_NULL {
-                stats.maxScore = Float(sqlite3_column_double(statement, 7))
+                stats.minScore = Float(sqlite3_column_double(statement, 7))
+            }
+            if sqlite3_column_type(statement, 8) != SQLITE_NULL {
+                stats.maxScore = Float(sqlite3_column_double(statement, 8))
             }
         }
         cachedStats = stats
@@ -1669,6 +1895,11 @@ actor CacheStore {
     /// Score bounds are always `?1`/`?2`; the album predicate takes `?3` only
     /// when an album is selected. Both the count query and the page query go
     /// through here, so the numbering cannot drift between them.
+    ///
+    /// There is deliberately nothing to bind for the favourite or media
+    /// predicates: both are literals, which is what keeps `?4` free for keyset
+    /// pagination. A caller adding a fourth bound filter would have to extend this
+    /// and `keysetClause(parameterIndex:)` together.
     private func bindFilter(_ statement: OpaquePointer, _ filter: PhotoFilter) {
         sqlite3_bind_double(statement, 1, Double(filter.lower))
         sqlite3_bind_double(statement, 2, Double(filter.upper))
@@ -1731,8 +1962,23 @@ actor CacheStore {
 
     // MARK: - SQL fragments
 
+    /// Columns every row-shaped read shares, in the order `decodeRow` reads them.
+    ///
+    /// `media_type` and `duration_seconds` are selected here so *every* row the
+    /// grid serves — a page, `photo(identifier:)`, `scoredPhoto` — carries the
+    /// media dimensions, rather than only some of them. The alternative was a
+    /// separate lookup for the two new fields, which would make a video's tile and
+    /// its lightbox disagree if they were read by different statements.
+    ///
+    /// There is deliberately no index on `media_type`. The filter that uses it is
+    /// always combined with a score range, and `idx_assets_score` is a *partial*
+    /// index over exactly the rows that range can return, so the media predicate is
+    /// a per-row integer comparison on a set already narrowed to what the user is
+    /// looking at. A second index on `media_type` would add write cost on every
+    /// upsert of a 53k-row scan to accelerate a filter the client issues once.
     private static let rowSelect = """
-    SELECT asset_identifier, aesthetics_score, creation_date, width, height, favorite
+    SELECT asset_identifier, aesthetics_score, creation_date, width, height, favorite,
+           media_type, duration_seconds
     FROM assets
     """
 
@@ -1747,13 +1993,26 @@ actor CacheStore {
 
     private static func decodeRow(_ statement: OpaquePointer) -> PhotoRow {
         let favorite = sqlite3_column_int(statement, 5) != 0
+        // `media_type` is stored raw — `PHAssetMediaType` values, not a
+        // translation — so this row and the column it came from cannot disagree
+        // about what kind of asset this is. It is always emitted: a client that
+        // read its absence as "image" would then render a clip as a still, which is
+        // the one mistake the field exists to prevent.
+        let mediaType = Int(sqlite3_column_int(statement, 6))
+        // NULL stays nil all the way to the wire, where it is *omitted*. A
+        // pre-version-5 row has no duration and a still has none either; neither is
+        // a zero-length clip, so neither may be reported as `0`.
+        let duration = sqlite3_column_type(statement, 7) == SQLITE_NULL
+            ? nil : sqlite3_column_double(statement, 7)
         return PhotoRow(
             id: String(cString: sqlite3_column_text(statement, 0)),
             score: Float(sqlite3_column_double(statement, 1)),
             date: sqlite3_column_type(statement, 2) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 2),
             width: Int(sqlite3_column_int(statement, 3)),
             height: Int(sqlite3_column_int(statement, 4)),
-            favorite: favorite
+            favorite: favorite,
+            mediaType: mediaType,
+            duration: duration
         )
     }
 
@@ -1783,6 +2042,30 @@ actor CacheStore {
     /// The score key is a `REAL` written from a `Float` and round-tripped
     /// through `Float` in the cursor, so the `=` comparison is exact rather than
     /// approximate — which is what makes the tie-break term fire at all.
+    /// The album and media predicates for a query over group **members**, joined.
+    ///
+    /// Both group filters answer the same question — "is at least one member of
+    /// this group in the requested slice?" — and they are composed here rather than
+    /// at each of the three call sites so a group list, a group's members and a
+    /// group's ranking cannot disagree about what "in the album" means.
+    ///
+    /// The album predicate names the parameter (`?1` for the list, `?2` where the
+    /// group id already occupies `?1`); the media predicate is the literal
+    /// `MediaSelection` supplies, so composing it costs no placeholder and moves no
+    /// numbering. `asset` is the SQL expression for the member's identifier in the
+    /// calling statement — `m.asset_identifier` or `a.asset_identifier` — because
+    /// the two statements alias it differently and a wrong guess here would be a
+    /// predicate on a nonexistent column, which SQLite reports only at prepare time.
+    private static func groupMemberClause(album: AlbumSelection, media: MediaSelection,
+                                          asset: String, albumParameter: String) -> String {
+        var conditions: [String] = []
+        let albumClause = album.membershipClause(asset: asset, albumParameter: albumParameter)
+        if !albumClause.isEmpty { conditions.append(albumClause) }
+        let mediaClause = media.whereSQLClause()
+        if !mediaClause.isEmpty { conditions.append(mediaClause) }
+        return conditions.joined(separator: " AND ")
+    }
+
     private static func keysetClause(sort: SortOrder, parameterIndex: Int) -> String {
         let n = parameterIndex
         switch sort {
@@ -1812,6 +2095,16 @@ extension PhotoFilter {
     /// The album predicate comes from `AlbumSelection.membershipClause`, which is
     /// also what the group queries use — one definition of what each album value
     /// means, so the grid and the group browser cannot disagree about it.
+    ///
+    /// The media predicate is a **literal**, for the same reason the favourite one
+    /// is and not for the same reason: `MediaSelection.whereSQLClause()` is a
+    /// closed set of three values, so a bound parameter here would be a fourth
+    /// placeholder — and `?1`/`?2` are the score bounds, `?3` is the album and
+    /// keyset pagination starts at `?4`. A fourth placeholder would shift every one
+    /// of them, and `page` binds its keyset positions by number. The alternative —
+    /// appending the media value as `?4` — would mean renumbering the keyset clause
+    /// and the limit index on every statement that builds a page, for a value with
+    /// exactly three possible answers.
     func whereSQLClause() -> String {
         var conditions = ["aesthetics_score >= ?1", "aesthetics_score <= ?2"]
         switch favorites {
@@ -1821,6 +2114,8 @@ extension PhotoFilter {
         }
         let albumClause = album.membershipClause(asset: "assets.asset_identifier", albumParameter: "?3")
         if !albumClause.isEmpty { conditions.append(albumClause) }
+        let mediaClause = media.whereSQLClause()
+        if !mediaClause.isEmpty { conditions.append(mediaClause) }
         return conditions.joined(separator: " AND ")
     }
 }

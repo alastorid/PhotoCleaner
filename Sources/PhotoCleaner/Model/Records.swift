@@ -1,4 +1,10 @@
 import Foundation
+// For `PHAssetMediaType` and nothing else. Referencing an enum's raw value does
+// not touch the user's library and needs no permission, so importing Photos here
+// costs the wire-shape layer nothing — and it is worth it, because `MediaSelection`
+// emits the same numbers `PhotoLibrary` reads *out* of PhotoKit rather than a
+// second pair of literals that could drift from it.
+import Photos
 
 /// Lifecycle of one asset in the score cache. Persisted verbatim as `TEXT`.
 enum AnalysisState: String, Sendable, Codable {
@@ -23,6 +29,46 @@ struct ScanRecord: Sendable {
     let favorite: Bool
     let mediaSubtype: Int
     let isScreenshot: Bool
+    /// Seconds, for a video. `nil` for a still — never `0`.
+    ///
+    /// `PHAsset.duration` is `0` for images, so the walk has to decide rather than
+    /// copy: a stored `0` would claim a zero-length video exists, and the browser
+    /// would render an `m:ss` badge reading `0:00` on a photograph. `duration_seconds`
+    /// is `NULL` for every row a pre-version-5 build wrote, which is the same
+    /// answer for a different reason — those rows are stills, or videos this build
+    /// has not walked yet, and "unknown" is the honest value for both.
+    let duration: Double?
+
+    /// Written out, for the same reason as `PhotoRow`'s: Swift **omits** a `let`
+    /// property that carries a default value from the memberwise initializer, so
+    /// declaring `let duration: Double? = nil` would make the field impossible to
+    /// set — every call site would silently store `nil` and every video would be
+    /// stored with no duration, which is the one outcome this field exists to
+    /// prevent and which no compiler error would have caught. A defaulted
+    /// *parameter* is what actually gives the construction sites that predate
+    /// video support their old meaning (`nil`, a still) while leaving the walk
+    /// free to record a real duration.
+    init(identifier: String,
+         mediaType: Int,
+         creationDate: Double?,
+         modificationDate: Double?,
+         width: Int,
+         height: Int,
+         favorite: Bool,
+         mediaSubtype: Int,
+         isScreenshot: Bool,
+         duration: Double? = nil) {
+        self.identifier = identifier
+        self.mediaType = mediaType
+        self.creationDate = creationDate
+        self.modificationDate = modificationDate
+        self.width = width
+        self.height = height
+        self.favorite = favorite
+        self.mediaSubtype = mediaSubtype
+        self.isScreenshot = isScreenshot
+        self.duration = duration
+    }
 }
 
 /// One cached asset as served to the UI.
@@ -33,12 +79,107 @@ struct PhotoRow: Sendable, Codable, Equatable {
     let width: Int
     let height: Int
     let favorite: Bool
+    /// `1` = still, `2` = video: `PHAssetMediaType` raw values.
+    ///
+    /// Stored raw rather than translated, so this row and the `assets` table's
+    /// `media_type` column cannot disagree about what an asset is — there is one
+    /// definition and both read it. Always emitted, and defaulted to `1` by the
+    /// initializer below; a client must not read its absence as "image", which is
+    /// why it is not optional.
+    let mediaType: Int
+    /// Seconds, video only. **Omitted** from JSON for a still, never `null` — the
+    /// whole codebase's rule that an absent key and an explicit `null` mean the
+    /// same thing to the client.
+    let duration: Double?
+
+    /// Written out rather than left to the memberwise initializer, because Swift
+    /// **omits a `let` property that has a default value** from the memberwise
+    /// initializer altogether — it does not merely make the parameter optional.
+    /// Declaring `let mediaType: Int = 1` as the shape suggests would therefore
+    /// have left a `PhotoRow` that no call site could ever set a media type on,
+    /// which is worse than not having the field: `decodeRow` would silently serve
+    /// every video as a still.
+    ///
+    /// The defaults are the point. Every construction site that predates video
+    /// support reads `mediaType: 1` and `duration: nil`, which is exactly what it
+    /// meant before — a still — so none of them changes meaning, and a call site
+    /// that forgets the new fields gets a photograph rather than a clip rendered as
+    /// a photograph.
+    init(id: String,
+         score: Float,
+         date: Double?,
+         width: Int,
+         height: Int,
+         favorite: Bool,
+         mediaType: Int = 1,
+         duration: Double? = nil) {
+        self.id = id
+        self.score = score
+        self.date = date
+        self.width = width
+        self.height = height
+        self.favorite = favorite
+        self.mediaType = mediaType
+        self.duration = duration
+    }
 }
 
 enum FavoriteFilter: String, Sendable, Codable {
     case include
     case exclude
     case only
+}
+
+/// Which media types a filter admits.
+///
+/// A closed set, and an unrecognised value is refused rather than defaulted to
+/// `.all`, for exactly the reason `FavoriteFilter` and `AlbumSelection` are: the
+/// value selects a SQL predicate, so quietly widening `media=videos` to "every
+/// asset" would show the user photos they filtered out, and a *deletion* resolved
+/// under the widened filter would act on them. Refusing is the only safe answer,
+/// and `Router` turns a refusal into a 400 naming the three valid values.
+///
+/// `.all` is a real case rather than a `nil` optional for the same reason
+/// `AlbumSelection` reserves `"all"`/`"none"`: a client cannot forget to send it
+/// and cannot confuse "absent" with a bucket.
+enum MediaSelection: String, Sendable, Codable, CaseIterable {
+    case all
+    case images
+    case videos
+
+    /// The value as it travels on the wire. The raw value *is* the wire value, so
+    /// there is no second spelling of it to keep in step.
+    var wireValue: String { rawValue }
+
+    /// A stable, order-independent fingerprint of the media dimension alone.
+    /// Folded into the pagination token so a cursor issued under `media=images`
+    /// cannot be replayed under `media=videos` — see `PhotoFilter`.
+    var fingerprint: String { "media:\(rawValue)" }
+
+    /// The `WHERE` fragment for this selection, or `""` when it constrains
+    /// nothing.
+    ///
+    /// A **literal** (`media_type = 1` / `media_type = 2`), never a bound
+    /// placeholder, and that is load-bearing rather than stylistic.
+    /// `PhotoFilter.whereSQLClause()` has a fixed parameter budget: `?1` and `?2`
+    /// are the score bounds, `?3` is the album identifier, and keyset pagination
+    /// starts at `?4` — see `CacheStore.page`, which binds `?4`/`?5` for the
+    /// cursor's sort key, `?6` for its identifier and `?7` for `LIMIT`. One more
+    /// placeholder anywhere in the `WHERE` renumbers every one of them, and the
+    /// failure is silent and total: the score bounds would be bound against the
+    /// wrong columns, so the grid would return rows from somewhere else in the
+    /// library, and no test would catch it as a *number* being wrong rather than a
+    /// page being empty. `favorite` already sets this precedent for exactly the
+    /// same reason, and the media predicate is the same shape of fact: a value
+    /// that is chosen from a closed enum in this file and can never be user
+    /// input has nothing to bind.
+    func whereSQLClause() -> String {
+        switch self {
+        case .all: return ""
+        case .images: return "media_type = \(PHAssetMediaType.image.rawValue)"
+        case .videos: return "media_type = \(PHAssetMediaType.video.rawValue)"
+        }
+    }
 }
 
 /// Which album, if any, the grid is scoped to.
@@ -64,27 +205,10 @@ enum FavoriteFilter: String, Sendable, Codable {
 /// of truth for the one flag that protects photos from deletion
 /// (`PhotoLibrary.delete` re-reads `isFavorite` live). Only
 /// `PHCollectionType.album` collections are indexed; see `CacheStore.albums()`.
-enum AlbumSelection: Sendable, Equatable, Codable {
+enum AlbumSelection: Sendable, Equatable {
     case all
     case unassigned
     case album(String)
-
-    // MARK: Codable
-
-    /// Encoded as the *single string* the wire already uses, not as a nested
-    /// object, so `PhotoFilter`'s synthesised `Codable` conformance keeps
-    /// producing the flat `{"lo":…,"hi":…,"album":"…"}` shape. Decoding goes
-    /// through the same parser as the query parameter, so there is exactly one
-    /// definition of which strings mean what.
-    init(from decoder: any Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        self = try AlbumSelection.parse(try container.decode(String.self))
-    }
-
-    func encode(to encoder: any Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(wireValue)
-    }
 
     /// The album identifier, when one is selected.
     var albumIdentifier: String? {
@@ -92,16 +216,10 @@ enum AlbumSelection: Sendable, Equatable, Codable {
         return nil
     }
 
-    /// True when the selection asks for assets that are in *no* indexed album.
-    var isUnassigned: Bool {
-        if case .unassigned = self { return true }
-        return false
-    }
-
     /// What the UI sends and receives: `"all"`, `"none"`, or an album
     /// identifier. Two reserved words rather than optionals, because a client
     /// cannot forget to send one and cannot confuse "absent" with a bucket.
-    enum WireValue: String, Sendable, Codable {
+    enum WireValue: String {
         case all
         case none
     }
@@ -118,6 +236,18 @@ enum AlbumSelection: Sendable, Equatable, Codable {
     /// Parses a wire value. Anything else is an error, never a fallback to
     /// `.all`: quietly widening a filter that was meant to be narrow is the same
     /// class of mistake as defaulting an unknown `favorites` value to `include`.
+    ///
+    /// This is the *only* definition of which strings mean what, and it is what
+    /// both wire shapes go through — the query parameter `Router.resolveAlbumSelection`
+    /// reads and the `album` field of a selection's filter payload. An album
+    /// identifier is only accepted as well-formed here; whether this instance has
+    /// read that album is asked of the cache separately, the same way asset
+    /// identifiers are.
+    ///
+    /// `throws` is kept although nothing in the body can fail: both call sites map
+    /// a failure onto a 400, and narrowing this to a non-throwing signature would
+    /// silently change how they report one. The empty string resolves to `.all`
+    /// because "absent" is what an empty query parameter means.
     static func parse(_ raw: String) throws -> AlbumSelection {
         switch raw {
         case WireValue.all.rawValue: return .all
@@ -141,20 +271,29 @@ enum AlbumSelection: Sendable, Equatable, Codable {
 }
 
 /// The score-range query that drives the whole UI.
-struct PhotoFilter: Sendable, Codable, Equatable {
+///
+/// Deliberately not `Codable`: no route encodes a filter. Each wire shape builds
+/// one from its own payload (`Router.FilterPayload` for a selection, the query
+/// string for the grid), so a coding conformance here would be a second
+/// definition of the wire that nothing reads.
+struct PhotoFilter: Sendable, Equatable {
     var lower: Float
     var upper: Float
     var favorites: FavoriteFilter = .include
     /// Added in schema version 2. Defaults to `.all`, so every pre-existing
     /// construction site keeps its exact old meaning.
     var album: AlbumSelection = .all
+    /// Which media types the grid admits. Defaults to `.all` — again so every
+    /// pre-existing construction site, and every timeline route that builds the
+    /// widest filter it can, keeps its exact old meaning.
+    var media: MediaSelection = .all
     /// Set by the read-only timeline routes, which deliberately build the widest
     /// filter the cache can express out of the *observed* score extremes. Those
     /// extremes move as analysis progresses, so folding the live bounds into a
     /// pagination fingerprint would make the server refuse a continuation of its
-    /// own token the next time a new score arrived. The flag pins the fingerprint
-    /// to a constant instead: these queries are, by construction, unfiltered
-    /// apart from "has a score".
+    /// own token the next time a new score arrived. The flag pins the *score*
+    /// dimension to a constant instead: these queries are, by construction,
+    /// unfiltered apart from "has a score".
     var unboundedByScore = false
 
     // Favourites are deliberately *not* excluded by rewriting the filter:
@@ -171,14 +310,26 @@ struct PhotoFilter: Sendable, Codable, Equatable {
     /// is both exactly what `bindFilter` will bind and immune to any formatting
     /// decision that could make two different bounds look alike.
     var paginationFingerprint: String {
+        // The album, favourite and media dimensions are real filters whatever the
+        // bounds are, so they stay in: a token names a position inside one result
+        // set, and "the rows after this row within album A, photos only" is a
+        // different set of rows from the same question asked about the whole
+        // library, or with videos included. Only the score bounds are pinned,
+        // because only they are a moving target.
+        //
+        // The media dimension matters most for *deletion*: a selection snapshotted
+        // on a grid with videos filtered out resolves to identifiers, and a token
+        // that survived a media change would page a selection into the videos the
+        // user had just filtered away. See `MediaSelection.fingerprint`.
+        let dimensions = "fav:\(favorites.rawValue)|\(album.fingerprint)|\(media.fingerprint)"
         if unboundedByScore {
             // The timeline's bound is "every asset that has a score", which is the
             // same query no matter where the observed extremes currently sit.
-            return "timeline:scored"
+            return "timeline:scored|\(dimensions)"
         }
         let low = lower.bitPattern
         let high = upper.bitPattern
-        return "lo:\(low)|hi:\(high)|fav:\(favorites.rawValue)|\(album.fingerprint)"
+        return "lo:\(low)|hi:\(high)|\(dimensions)"
     }
 }
 
@@ -192,9 +343,10 @@ enum GroupRankOrder: String, Sendable, Codable, CaseIterable {
     case aesthetics
     /// PhotoCleaner's own within-group ranking, built from aesthetics plus
     /// applicable Vision capture signals. See `BestShotRanker`.
+    ///
+    /// The raw value *is* the wire value: `SimilarGroupRow.ranked` encodes this
+    /// enum directly, so there is no second spelling of it to keep in step.
     case bestShot = "best_shot"
-
-    var wireValue: String { rawValue }
 }
 
 /// One photo as served inside a Similar Group.
@@ -216,6 +368,11 @@ struct GroupMemberRow: Sendable, Codable, Equatable {
     let faceCaptureQuality: Float?
     let faceCount: Int?
     let date: Double?
+    /// Always `0` in the group routes, which have no use for a dimension: a
+    /// group is a row of tiles, not a grid page, and the browser treats an
+    /// unpopulated dimension as absent rather than as a real size. Kept as two
+    /// fields rather than dropped so the row's shape matches `PhotoRow`'s; the
+    /// zeroes are not an observation and must not be read as one.
     let width: Int
     let height: Int
     let favorite: Bool

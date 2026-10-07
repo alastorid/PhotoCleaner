@@ -4,13 +4,33 @@
 // first argument.
 //
 // There is no .icns checked into the repository on purpose. A binary blob that
-// nobody can diff is a blob nobody can review, and the icon is four shapes: it
-// is cheaper to keep the drawing as code that reads like the drawing than to keep
-// an image that only opens in an image editor.
+// nobody can diff is a blob nobody can review, and the icon is a handful of
+// shapes: it is cheaper to keep the drawing as code that reads like the drawing
+// than to keep an image that only opens in an image editor.
 //
-// The gradient is the one from `web/app.css`'s `.app-mark`
-// (`linear-gradient(160deg, var(--accent), #6f4bff)`) so the Dock icon, the header
-// mark and the browser tab are the same object.
+// The body gradient is neutral grey, deliberately. A coloured icon has a hue to
+// separate itself from the desktop with; a neutral one does not, so the ramp has
+// to clear the desktop *luminance* instead — every pixel of the body against
+// every wallpaper it might land on, since the whole icon sits on the wallpaper
+// and not half of it. That is a min over both ends and all of them, not a
+// light-end-on-light / dark-end-on-dark pairing; the pairing is the mistake, and
+// it lets a graphite body look like a pass (its dark end scores 12.94:1 on a
+// light desktop) while the light end is invisible at 1.09:1 on a dark one.
+//
+// Both obvious neutrals fail that min outright. Graphite `#4a4a4f` → `#232326`
+// bottoms out at 1.09:1, its dark end on `#1c1c1e`, and the edge vanishes. White
+// `#fbfbfd` → `#dcdce1` reaches 1.00:1, an exact match against the light grey
+// desktop. The mid grey below clears all six wallpapers, worst corner 1.85:1
+// (`#54545a` on `#2c2c2e`). Re-measure before moving it towards either end.
+//
+// `Tests/IconTests.swift` enforces this against the rendered image, not these
+// constants — and the wallpapers it uses are the reason the floor there is 1.25
+// rather than something rounder.
+//
+// Note that `--accent` in `web/app.css` is *not* this colour and `.app-mark` no
+// longer mirrors it. Selection is this app's core action and a grey accent makes
+// a selected tile look unselected, so the UI keeps a real hue while the icon
+// stays neutral. `.app-mark` tracks the icon body instead.
 //
 // Everything is drawn into a 1024x1024 space and scaled, so one set of numbers
 // describes the icon at every size.
@@ -27,26 +47,46 @@ private let canvas = 1024.0
 /// indistinguishable from 64px down, which is where anyone actually looks.
 private let bodyCornerRadius = canvas * 0.2237
 
-/// Three bars of decreasing height: a photo library ordered by score, which is
-/// the one idea this tool has to communicate.
-private struct Bar {
-    let width: Double
-    let height: Double
+/// The mark: a 3×3 contact sheet — the app's own grid — whose tiles fade in
+/// reading order, so the low-scoring tail thins out at the bottom right. This is
+/// the one idea the tool has to communicate, and it is now the icon's shape
+/// rather than an abstract bar chart.
+private struct Tile {
+    let size: Double
     /// White at a falling opacity, so the order reads even in greyscale.
     let opacity: Double
 }
 
-private let bars: [Bar] = [
-    Bar(width: 132, height: 552, opacity: 1.00),
-    Bar(width: 132, height: 388, opacity: 0.72),
-    Bar(width: 132, height: 224, opacity: 0.46),
+/// Row-major from the top left, which is the order the grid is read in and
+/// therefore the order the score sorts in.
+///
+/// The run is shallow — the last tile is 0.46, not the 0.26 a steeper falloff
+/// looks better with at 512px. The measured case for that is modest, and stated
+/// as measured: sweeping the faintest tile from 0.62 down to 0.18 moves its
+/// contrast against the gap beside it only from 1.41:1 to 1.21:1, because a
+/// fainter tile drags the neighbouring gap down with it. So the shallow run is
+/// mostly taste, kept because the fall-off reads as an ordered grid rather than
+/// as a lighting effect.
+private let tiles: [Tile] = [
+    Tile(size: 210, opacity: 1.00),
+    Tile(size: 210, opacity: 1.00),
+    Tile(size: 210, opacity: 1.00),
+    Tile(size: 210, opacity: 0.95),
+    Tile(size: 210, opacity: 0.86),
+    Tile(size: 210, opacity: 0.76),
+    Tile(size: 210, opacity: 0.66),
+    Tile(size: 210, opacity: 0.56),
+    Tile(size: 210, opacity: 0.46),
 ]
 
-private let barGap: Double = 84
-/// Distance from the bottom of the body to the bottom of the shortest bar, which
-/// puts the tallest bar's cap at ~80% of the height: centred enough to look
-/// deliberate, low enough to leave the gradient somewhere to be seen.
-private let barBaseline: Double = 262
+private let tileGrid = 3
+/// Gap between tiles. Wider than the grid's own 1px seam by a lot, which is an
+/// appearance choice rather than a measured requirement: the grid still resolves
+/// at 32px with this tightened to about 26 units, and it is marginal at 16px at
+/// any gap in that range. `Tests/IconTests.swift` pins the size the mark
+/// genuinely reads at rather than pretending 16px is settled.
+private let tileGap: Double = 60
+private let tileCornerRadius: Double = 32
 
 // MARK: - Drawing
 
@@ -74,8 +114,8 @@ private func drawBody(in context: CGContext) {
     let end = CGPoint(x: centre.x + direction.x * reach, y: centre.y + direction.y * reach)
 
     let colours = [
-        NSColor(srgbRed: 0x0a / 255.0, green: 0x84 / 255.0, blue: 0xff / 255.0, alpha: 1).cgColor,
-        NSColor(srgbRed: 0x6f / 255.0, green: 0x4b / 255.0, blue: 0xff / 255.0, alpha: 1).cgColor,
+        NSColor(srgbRed: 0x9a / 255.0, green: 0x9a / 255.0, blue: 0xa0 / 255.0, alpha: 1).cgColor,
+        NSColor(srgbRed: 0x54 / 255.0, green: 0x54 / 255.0, blue: 0x5a / 255.0, alpha: 1).cgColor,
     ] as CFArray
     guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                                     colors: colours,
@@ -92,22 +132,29 @@ private func drawBody(in context: CGContext) {
     context.restoreGState()
 }
 
-private func drawBars(in context: CGContext) {
-    let totalWidth = bars.reduce(0) { $0 + $1.width } + barGap * Double(bars.count - 1)
-    var x = (canvas - totalWidth) / 2
+private func drawTiles(in context: CGContext) {
+    guard let side = tiles.first?.size else { return }
+    let span = side * Double(tileGrid) + tileGap * Double(tileGrid - 1)
+    let origin = (canvas - span) / 2
 
-    for bar in bars {
-        let rect = CGRect(x: x, y: barBaseline, width: bar.width, height: bar.height)
-        // A bar's own corner radius tracks its width, so the shortest bar is not
-        // a stubby lozenge and the tallest is not a thin stick.
-        let radius = bar.width * 0.30
+    // Enumerated rather than looked up by value: the three leading tiles are
+    // identical (size 210, opacity 1.00), so a value search would return the
+    // first of them three times and the grid would come out as one column.
+    for (index, tile) in tiles.enumerated() {
+        // `tiles` is filled row by row from the top left, so row 0 is the top
+        // row. CoreGraphics counts y up from the bottom, hence the flip.
+        let column = index % tileGrid
+        let row = index / tileGrid
+        let rect = CGRect(x: origin + Double(column) * (side + tileGap),
+                          y: origin + Double(tileGrid - 1 - row) * (side + tileGap),
+                          width: side,
+                          height: side)
         context.addPath(CGPath(roundedRect: rect,
-                               cornerWidth: radius,
-                               cornerHeight: radius,
+                               cornerWidth: tileCornerRadius,
+                               cornerHeight: tileCornerRadius,
                                transform: nil))
-        context.setFillColor(NSColor.white.withAlphaComponent(bar.opacity).cgColor)
+        context.setFillColor(NSColor.white.withAlphaComponent(tile.opacity).cgColor)
         context.fillPath()
-        x += bar.width + barGap
     }
 }
 
@@ -127,7 +174,7 @@ private func renderPNG(pixels: Int) -> Data? {
     context.setShouldAntialias(true)
     context.interpolationQuality = .high
     drawBody(in: context)
-    drawBars(in: context)
+    drawTiles(in: context)
 
     guard let image = context.makeImage() else { return nil }
     let bitmap = NSBitmapImageRep(cgImage: image)

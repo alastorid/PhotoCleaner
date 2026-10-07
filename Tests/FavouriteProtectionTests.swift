@@ -132,18 +132,54 @@ func registerFavouriteProtectionTests() {
         checkEqual(nulled.int("protectedFavorites"), 1, "the favourite stays protected")
     })
 
-    Registry.shared.add(suite: suite, TestCase(name: "protection off in settings includes favourites and reports zero",
+    Registry.shared.add(suite: suite, TestCase(name: "a stored off is ignored and protection still applies",
         knownBug: nil) {
-        let fixture = try await Fixture.make("fav-setting-off", protectFavorites: false)
+        // The shape of the hazard this guards: a `settings.json` written by a build
+        // that had the switch. Honouring it would leave the user with favourites
+        // that can be deleted and no control left to change it.
+        let fixture = try await Fixture.make("fav-stored-off")
         try await fixture.seed([
             .init(id: "plain", score: 0.1, date: 1),
             .init(id: "fav", score: 0.2, date: 2, favorite: true),
         ])
+        let url = fixture.root.appendingPathComponent("settings.json")
+        try Data(#"{"protectFavorites":false,"analysisConcurrency":9}"#.utf8).write(to: url)
+        let reloaded = Settings(url: url)
+        checkEqual(reloaded.snapshot().protectFavorites, true,
+                   "a stored false is ignored, not applied")
+        checkEqual(reloaded.snapshot().analysisConcurrency, 9,
+                   "and the rest of the file is still read normally")
+
         let reply = await fixture.router.reply(Req.post("/api/selection/preview",
             json: #"{"mode":"ids","ids":["plain","fav"]}"#))
-        checkEqual(reply.int("resolved"), 2, "protection off is an explicit, remembered choice")
-        checkEqual(reply.int("protectedFavorites"), 0, "and nothing is claimed to be protected")
-        checkEqual(fixture.settings.snapshot().protectFavorites, false, "the setting really is off")
+        checkEqual(reply.int("resolved"), 1, "the favourite is still excluded")
+        checkEqual(reply.int("protectedFavorites"), 1, "and reported as protected")
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "the server refuses to turn protection off",
+        knownBug: nil) {
+        let fixture = try await Fixture.make("fav-refuse-off")
+        let refused = await fixture.router.reply(Req.post("/api/settings",
+            json: #"{"protectFavorites":false}"#))
+        // Refused, not ignored: a silent success would let a stale client believe
+        // favourites are now deletable.
+        checkEqual(refused.status, 400, "turning protection off is an error")
+        check(refused.errorMessage.contains("always protected"),
+              "the message must say why, got: \(refused.errorMessage)")
+        checkEqual(fixture.settings.snapshot().protectFavorites, true,
+                   "and nothing was written")
+
+        // A related preference in the same request must still land, so a stale
+        // client retrying without the dead field is not left with nothing applied.
+        let mixed = await fixture.router.reply(Req.post("/api/settings",
+            json: #"{"protectFavorites":false,"downloadFromICloud":true}"#))
+        checkEqual(mixed.status, 400, "the whole request is refused, not partly applied")
+        checkEqual(fixture.settings.snapshot().downloadFromICloud, false,
+                   "no field from a refused request is applied")
+
+        let other = await fixture.router.reply(Req.post("/api/settings",
+            json: #"{"protectFavorites":true}"#))
+        checkEqual(other.status, 200, "restating the guarantee is still accepted")
     })
 
     Registry.shared.add(suite: suite, TestCase(name: "protection survives more than one chunk of identifiers",

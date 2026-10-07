@@ -49,6 +49,16 @@ struct Router: Sendable {
     /// Builds and ranks Similar Groups. Same injection terms as `albumIndex`:
     /// optional so every existing construction site keeps working.
     let groupEngine: SimilarGroupEngine
+    /// Video-specific PhotoKit work: export, frame decoding, the export cache.
+    ///
+    /// Injected rather than reached through `library` because `PhotoLibrary` is the
+    /// *image* path and every AVFoundation call is meant to live in `VideoLibrary`
+    /// (see that file's doc comment). Optional so the existing construction sites —
+    /// the test fixture included — keep compiling without naming it; the default is
+    /// `VideoLibrary.shared`, the same instance the scan reaches for, because two
+    /// instances would mean two views of one on-disk export cache and its eviction
+    /// bound enforced twice against the same directory.
+    let videos: VideoLibrary
 
     /// The Photos authorization this router gates on.
     ///
@@ -69,6 +79,7 @@ struct Router: Sendable {
          settings: Settings, bus: EventBus, images: ImageCache,
          albumIndex: AlbumIndexer? = nil,
          groupEngine: SimilarGroupEngine? = nil,
+         videos: VideoLibrary? = nil,
          authorizationStatus: @escaping @Sendable () -> PHAuthorizationStatus = {
              PhotoLibrary.currentAuthorization()
          }) {
@@ -81,6 +92,7 @@ struct Router: Sendable {
         self.albumIndex = albumIndex ?? AlbumIndexer(cache: cache, library: library)
         self.groupEngine = groupEngine ?? SimilarGroupEngine(cache: cache, library: library,
                                                              settings: settings, bus: bus)
+        self.videos = videos ?? VideoLibrary.shared
         self.authorizationStatus = authorizationStatus
     }
 
@@ -220,7 +232,7 @@ struct Router: Sendable {
         var remaining = Array(segments.dropFirst(2))
         var action = "detail"
         if let last = remaining.last, remaining.count > 1,
-           last == "thumbnail" || last == "preview" || last == "similar" {
+           last == "thumbnail" || last == "preview" || last == "similar" || last == "video" {
             action = last
             remaining.removeLast()
         }
@@ -244,6 +256,11 @@ struct Router: Sendable {
                                kind: "preview", usePreviewLadder: true)
         case "similar":
             return await similarPhotos(identifier: identifier)
+        case "video":
+            // `video`, not `play`/`stream`: the route serves a file, and a name that
+            // said what it did would invite a future caller to expect a transcoded or
+            // re-muxed stream from it. It is a byte range of what Photos holds.
+            return await video(identifier: identifier, request: request)
         default:
             return await photo(identifier: identifier)
         }
@@ -297,6 +314,13 @@ struct Router: Sendable {
             /// "the album the server actually applied", which matters because an
             /// unknown album is refused rather than silently ignored.
             let album: String
+            /// Which media types the page contains: `all`, `images` or `videos`.
+            /// Echoed for the same reason as `album`, and it matters more here: the
+            /// dimension was added later than the client that reads this echo, and a
+            /// client that assumes the field is there when it is not would render a
+            /// videos-only grid without one badge. Absent means nothing is filtered,
+            /// which is exactly what an older server meant.
+            let media: String
             /// The albums each row in this page belongs to, keyed by asset
             /// identifier. `[{id, title}]`, so a tag can be rendered *and* filtered
             /// without matching titles back to identifiers. Omitted entirely when
@@ -335,8 +359,17 @@ struct Router: Sendable {
         case .refused(let response): return .response(response)
         case .resolved(let selection): album = selection
         }
+        // The media dimension is resolved through the same refuse-or-apply shape as
+        // the album, and for the same reason: `?media=vidoes` must not quietly mean
+        // "all" on a grid the user believes holds only clips.
+        let media: MediaSelection
+        switch resolveMediaSelection(request) {
+        case .refused(let response): return .response(response)
+        case .resolved(let selection): media = selection
+        }
         var filter = base
         filter.album = album
+        filter.media = media
 
         do {
             let page = try await cache.page(filter: filter, sort: sort, cursor: cursor, limit: limit, offset: offset)
@@ -356,6 +389,7 @@ struct Router: Sendable {
                 filter: .init(lower: filter.lower, upper: filter.upper, sort: sort.rawValue,
                               favorites: filter.favorites.rawValue,
                               album: album.wireValue,
+                              media: media.wireValue,
                               albums: tags.isEmpty ? nil : tags)
             )))
         } catch let error as CacheError {
@@ -429,6 +463,24 @@ struct Router: Sendable {
     /// by definition *not* filtered — the client must not be able to narrow the
     /// timeline with `lo`, `hi` or `favorites` query parameters, and
     /// those are exactly what that helper would read.
+    ///
+    /// **`?media=` is deliberately not read here either, and the two timeline routes
+    /// are the only browsing routes that do not take it.** The invariant these routes
+    /// exist to keep is that the chronology cannot be narrowed: "All Photos" is the
+    /// user's *whole* library in date order, and a photo shown there must not depend
+    /// on which filter chip happened to be selected in the grid. Adding a media
+    /// dimension to one of the two keyset walks — and the two walks are exact
+    /// complements of each other, so a filter applied to one but not the other would
+    /// put the anchor in a gap — would break that. It would also make the same token
+    /// mean different things on the two routes, which is the failure
+    /// `PhotoFilter.paginationFingerprint` exists to prevent, and it would have to be
+    /// solved by pinning the media dimension in the fingerprint too, i.e. by making
+    /// the fingerprint carry a filter that is never applied.
+    ///
+    /// Nothing is lost by this. Videos are scored assets, so they are in `assets`,
+    /// and they appear in All Photos automatically with their dates in the right
+    /// places. The media filter is a *narrowing* control; the timeline is not
+    /// narrowable.
     private func timelineFilter() async -> PhotoFilter {
         let stats = (try? await cache.stats(maxAge: 0.25)) ?? CacheStats()
         // `unboundedByScore` pins the pagination fingerprint: these bounds are the
@@ -594,6 +646,17 @@ struct Router: Sendable {
         /// it from the payload would silently widen a snapshotted selection to
         /// the whole library — the exact failure §4.9 exists to prevent.
         var album: String?
+        /// `all`, `images` or `videos`. Absent means `.all`.
+        ///
+        /// **Load-bearing, not politeness.** This is the same argument as `album`,
+        /// one dimension newer and with a sharper edge. "Select all matching"
+        /// snapshots the filter the user is looking at; a snapshot missing the media
+        /// dimension resolves to *every* photo and video on a grid that is showing
+        /// only photos — so the confirmation dialog would count a library's worth of
+        /// clips the user never saw, and the deletion would then be authorised
+        /// against that count. The selection is only safe if the dimension the user
+        /// filtered by is part of what it pins.
+        var media: String?
 
         /// An unrecognised value is an error, never a fallback.
         ///
@@ -613,6 +676,15 @@ struct Router: Sendable {
             if let favorites, FavoriteFilter(rawValue: favorites) == nil {
                 throw SelectionError.invalidFilter("unknown favorites filter \"\(favorites)\"")
             }
+            // Same rule as `favorites`, one step sharper: substituting `.all` for an
+            // unrecognised media value would *add* every video on the machine to a
+            // selection the user took believing the grid held only photos, and the
+            // alternative that looks safer — substituting `.images` — is no better,
+            // because it silently drops rows. A typo must be an error.
+            if let media, MediaSelection(rawValue: media) == nil {
+                throw SelectionError.invalidFilter(
+                    "unknown media filter \"\(media)\"; expected \"all\", \"images\" or \"videos\"")
+            }
             var filter = PhotoFilter(
                 lower: lo,
                 upper: hi,
@@ -620,6 +692,9 @@ struct Router: Sendable {
             )
             if let album {
                 filter.album = try AlbumSelection.parse(album)
+            }
+            if let media, let selection = MediaSelection(rawValue: media) {
+                filter.media = selection
             }
             return filter
         }
@@ -901,6 +976,22 @@ struct Router: Sendable {
             report.errors = outcome.failedMessages
             if !outcome.deletedIdentifiers.isEmpty {
                 try? await cache.remove(identifiers: outcome.deletedIdentifiers)
+                // Drop each deleted asset's exported video from the disk cache. The
+                // cache is bounded (see `VideoLibrary`), so a deleted clip's export
+                // would eventually be reclaimed by eviction pressure — but only
+                // pressure. Without this, a user who deletes their worst clips
+                // frees no space at all until the directory happens to fill, and
+                // the directory is on the same volume as the library being
+                // tidied. `evict` is a no-op for an asset that has no export, which
+                // is every still and every clip never played.
+                //
+                // Best-effort, like the cache write above it: a failed eviction
+                // leaves a file the bounded cache will still collect, so it is not
+                // worth failing a completed deletion over — that deletion has
+                // already happened in Photos and cannot be taken back.
+                for identifier in outcome.deletedIdentifiers {
+                    videos.evict(identifier: identifier)
+                }
             }
             await engine.publishStatus(force: true)
         }
@@ -951,17 +1042,29 @@ struct Router: Sendable {
         case .refused(let response): return .response(response)
         case .resolved(let selection): album = selection
         }
+        // Same filter, same validation, as the grid: a group list built from the whole
+        // library while the user is looking at photos-only is the same silent
+        // widening the album dimension refuses. In practice this yields the unfiltered
+        // list under `images` and an empty one under `videos`, because videos are
+        // never group members — a deliberate exclusion, not a gap.
+        let media: MediaSelection
+        switch resolveMediaSelection(request) {
+        case .refused(let response): return .response(response)
+        case .resolved(let selection): media = selection
+        }
         await groupEngine.rebuildIfNeeded()
         let order = Self.groupRankOrder(from: request)
         let limit = request.queryInt("limit", default: 24, range: 1...100) ?? 24
         let offset = request.queryInt("offset", default: 0, range: 0...1_000_000) ?? 0
         do {
-            let page = try await cache.groupSummaries(limit: limit, offset: offset, album: album)
+            let page = try await cache.groupSummaries(limit: limit, offset: offset,
+                                                     album: album, media: media)
             let config = settings.snapshot().similarGroups
             var rows: [SimilarGroupRow] = []
             for summary in page.groups {
                 rows.append(await groupRow(summary: summary, order: order, config: config,
-                                        memberLimit: Self.maxGroupMembers, album: album))
+                                        memberLimit: Self.maxGroupMembers,
+                                        album: album, media: media))
             }
             return .response(.json(GroupsResponse(
                 groups: rows,
@@ -992,6 +1095,11 @@ struct Router: Sendable {
         case .refused(let response): return .response(response)
         case .resolved(let selection): album = selection
         }
+        let media: MediaSelection
+        switch resolveMediaSelection(request) {
+        case .refused(let response): return .response(response)
+        case .resolved(let selection): media = selection
+        }
         do {
             guard let summary = try await cache.groupSummary(id: id) else {
                 return .response(.error("unknown group", status: 404))
@@ -1000,7 +1108,7 @@ struct Router: Sendable {
                                    order: Self.groupRankOrder(from: request),
                                    config: settings.snapshot().similarGroups,
                                    memberLimit: Self.maxGroupMembers,
-                                   album: album)
+                                   album: album, media: media)
             return .response(.json(row))
         } catch {
             return .response(.error("could not read that group: \(error)", status: 500))
@@ -1092,10 +1200,14 @@ struct Router: Sendable {
 
     /// The within-group order, defaulting to aesthetics.
     ///
-    /// An unrecognised value is refused rather than defaulted, for the same reason
-    /// `SortOrder` is a closed enum: `best_shot` and `aesthetics` are different
-    /// rankings and silently serving one when the other was asked for would be a
-    /// claim the user never made.
+    /// An unrecognised value *defaults* rather than being refused, which is the
+    /// opposite of `TimelineDirection` and `FilterPayload.resolved`, and
+    /// deliberately so: this is the one closed enum on a route where guessing
+    /// cannot mislead. A wrong `direction` or `favorites` would resolve a
+    /// different set of photos than the one asked for, but a wrong `order` only
+    /// re-ranks the group that was already selected, and the response reports
+    /// what it did in `ranked` — so the browser labels the strip from the
+    /// server's answer rather than from the one it sent.
     private static func groupRankOrder(from request: HTTPRequest) -> GroupRankOrder {
         guard let raw = request.queryValue("order"), !raw.isEmpty else { return .aesthetics }
         return GroupRankOrder(rawValue: raw) ?? .aesthetics
@@ -1115,9 +1227,10 @@ struct Router: Sendable {
     /// faces, would be two true sentences and one obviously wrong one.
     private func groupRow(summary: CacheStore.GroupSummary, order: GroupRankOrder,
                           config: SimilarGroupSettings, memberLimit: Int,
-                          album: AlbumSelection = .all) async -> SimilarGroupRow {
+                          album: AlbumSelection = .all,
+                          media: MediaSelection = .all) async -> SimilarGroupRow {
         let inputs = (try? await cache.rankingInputs(groupID: summary.id, limit: memberLimit,
-                                                     album: album)) ?? []
+                                                     album: album, media: media)) ?? []
 
         let ranking = order == .bestShot ? BestShotRanker.rank(inputs, settings: config) : []
         let bestShot = Dictionary(uniqueKeysWithValues: ranking.map { ($0.identifier, Float($0.bestShot)) })
@@ -1172,7 +1285,12 @@ struct Router: Sendable {
         var memberCount = summary.memberCount
         var faceMemberCount = summary.faceMemberCount
         var hiddenMemberCount: Int?
-        if album != .all, let kept = try? await cache.groupMembers(groupID: summary.id, album: album) {
+        // Recounted under *either* filter, not just the album. `album != .all` alone
+        // would leave the stored counts in place under `media`, which is fine today
+        // (no video is ever a member, so nothing is hidden) and wrong the day one is —
+        // a count that says "6 photos" above a strip of 4 with no explanation.
+        if album != .all || media != .all,
+           let kept = try? await cache.groupMembers(groupID: summary.id, album: album, media: media) {
             memberCount = kept.count
             hiddenMemberCount = summary.memberCount > kept.count
                 ? summary.memberCount - kept.count : nil
@@ -1189,6 +1307,162 @@ struct Router: Sendable {
             items: items,
             ranked: order,
             incomplete: summary.rankedAt == nil || !outstanding.isEmpty)
+    }
+
+    // MARK: - Video
+
+    /// `GET /api/photo/{id}/video` — a playable file for a video, with byte ranges.
+    ///
+    /// The only route whose body is not produced by this process, and the only one
+    /// that can be tens of thousands of times larger than any other response. Three
+    /// things about it are load-bearing:
+    ///
+    /// 1. **The identifier is validated before any PhotoKit call.** Not only against
+    ///    the cache — the cached row must also say this asset is a *video*. The two
+    ///    checks are separate because they answer different questions: "is this an
+    ///    asset this instance has scanned" is the invariant every route here upholds,
+    ///    and "is it the right *kind* of thing" is specific to this route. A crafted
+    ///    identifier naming a photo, or naming nothing at all, must not reach
+    ///    `VideoLibrary`: that call is the most expensive one in the app (it can
+    ///    export a multi-gigabyte clip), so an unauthenticated-in-spirit probe should
+    ///    not be able to trigger one, and the error the client gets for a still must
+    ///    be the same 404 a photo gets from `photo(identifier:)` rather than
+    ///    something that says "that exists, but not here".
+    /// 2. **`allowNetwork` comes from the user's iCloud preference**, never from the
+    ///    request. A query parameter that could turn a download on would let any page
+    ///    that reached the loopback port pull an iCloud library down to disk; the
+    ///    preference is the only input, and it defaults off.
+    /// 3. **The response is a byte range of a file**, handed to `HTTPConnection` as
+    ///    `.file`, which streams it. Nothing here reads the clip: `HTTPResponse.body`
+    ///    is `Data`, and a 2 GB `Data` is the failure this design exists to avoid.
+
+    /// `Range` needs the file's length before it can be resolved, so this is read
+    /// from the exported file rather than from a cache column. It is a `stat` on a
+    /// file that was just written, so it is the same number the bytes are.
+    ///
+    /// Zero on a failed `stat` rather than a thrown error: a clip whose length cannot
+    /// be read is not worth a `500` from a route the client has no alternative to, and
+    /// zero degrades to "this file is empty" — a `200` with no body, or a `416` for
+    /// every range. Both are answers a media element can act on, and both are honest
+    /// about what is actually known.
+    private static func byteLength(of url: URL) -> Int64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    /// Content type from the exported file's extension.
+    ///
+    /// **Not sniffed.** Reading the first bytes to decide would mean a file read on
+    /// every response for an answer the extension already gives, and — worse — a
+    /// server that reports a type derived from content is one whose answer can
+    /// disagree with what the file is, which is the situation `nosniff` exists to
+    /// contain. Photos reports the original's extension, and passthrough export keeps
+    /// it, so the extension is authoritative.
+    ///
+    /// `.m4v`, `.m4a`-style variants are deliberately not special-cased: they are
+    /// QuickTime containers too, and an unlisted extension falls through to
+    /// `application/octet-stream`, which a `<video>` element will decline rather than
+    /// mis-play.
+    private static func videoContentType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "mov", "mp4", "m4v": return "video/quicktime"
+        default: return "application/octet-stream"
+        }
+    }
+
+    private func video(identifier: String, request: HTTPRequest) async -> RouteResult {
+        // Gated on Photos authorization, unlike `thumbnail`/`preview`. Those read a
+        // frame and fail closed on their own — no frame, no bytes — while this route
+        // exports a clip through PhotoKit and would happily produce one from whatever
+        // access remains. The group routes gate for the same reason: what they answer
+        // is a claim about the user's library, and a claim PhotoCleaner can no longer
+        // verify is not one it should make.
+        if let refusal = photosAccessRefusal() { return .response(refusal) }
+        // The gate, in full, before any PhotoKit call. Two reads rather than one
+        // because they answer two questions: `known()` is this instance's own
+        // membership test — the same one the delete and favourite paths run, and the
+        // invariant every route on this router upholds — and the cached row says what
+        // kind of asset it is. Neither is asked of PhotoKit: a `PHAsset` fetch to
+        // learn "is this a video" would be the expensive call the gate exists to
+        // avoid, and it would answer a question the cache already holds the answer
+        // to. The second read is an exact primary-key lookup, and the whole thing
+        // costs less than the export that follows it by three orders of magnitude.
+        //
+        // One 404 for all three refusals — unknown identifier, not a video, and not a
+        // row at all — because a caller learns nothing useful from being told which
+        // of those it hit, and "that exists, but not here" would be an oracle.
+        let known = (try? await cache.known(identifiers: [identifier])) ?? []
+        guard known.contains(identifier),
+              let row = try? await cache.photo(identifier: identifier),
+              row.mediaType == PHAssetMediaType.video.rawValue else {
+            return .response(.error("unknown asset", status: 404))
+        }
+
+        let allowNetwork = settings.snapshot().downloadFromICloud
+        let url: URL
+        do {
+            url = try await videos.exportedFile(identifier: identifier, allowNetwork: allowNetwork)
+        } catch PhotoLibraryError.imageNotLocal {
+            // A 409, naming the setting, and not a 404.
+            //
+            // This is the one place in the API where "the thing you asked for exists
+            // and you can have it" and "the thing you asked for does not exist" are
+            // both plausible answers, and the client can only act on one of them. A
+            // 404 here reads as "this video is gone" — the lightbox would show a
+            // missing-asset message and the user would go looking for a file that is
+            // sitting in iCloud. A 409 that names the preference says "turn this on
+            // and press play again", which is the actual remedy, and the setting is
+            // already on the settings screen.
+            return .response(.error(
+                "this clip is stored in iCloud only; turn on \"Download from iCloud\" in Settings "
+                + "and try again", status: 409))
+        } catch let error as PhotoLibraryError {
+            return .response(.error("\(error)", status: 404))
+        } catch {
+            return .response(.error("could not export that clip: \(error)", status: 500))
+        }
+
+        let size = Self.byteLength(of: url)
+        // The header is read from the request, not from a query parameter, and it is
+        // optional: absent means the whole file, which is what a `<video>` element
+        // asks for on its first request anyway.
+        let range = HTTPRange.resolve(header: request.header("range"), fileSize: size)
+        switch range {
+        case .unsatisfiable:
+            // `416` with `Content-Range: bytes */size`, per the table in the contract.
+            // The client learns the real length from it, which is the one case where
+            // the error carries more information than the success would have.
+            var response = HTTPResponse.error(
+                "that byte range is past the end of this clip (\(size) bytes)", status: 416)
+            if let value = range.contentRangeHeader(fileSize: size) {
+                response.headers["Content-Range"] = value
+            }
+            return .response(response)
+        case .whole(let length):
+            var headers = Self.videoHeaders(for: url)
+            headers["Accept-Ranges"] = "bytes"
+            return .file(HTTPFile(status: 200, headers: headers, url: url,
+                                   start: 0, length: length))
+        case .partial(let start, let length):
+            var headers = Self.videoHeaders(for: url)
+            headers["Accept-Ranges"] = "bytes"
+            if let value = range.contentRangeHeader(fileSize: size) {
+                headers["Content-Range"] = value
+            }
+            return .file(HTTPFile(status: 206, headers: headers, url: url,
+                                  start: start, length: length))
+        }
+    }
+
+    private static func videoHeaders(for url: URL) -> [String: String] {
+        // `private, max-age=3600` rather than the `no-store` every JSON route carries:
+        // the bytes are immutable once exported and the export is itself cached on
+        // disk, so a re-fetch costs a `stat` and nothing else — while `no-store` would
+        // forbid the client from keeping the ranges it has already pulled, which is
+        // how a scrub bar works. `private` because this is a user's own library being
+        // served off loopback and nothing else may hold it.
+        ["Content-Type": videoContentType(for: url),
+         "Cache-Control": "private, max-age=3600"]
     }
 
 // MARK: - Reveal in Photos
@@ -1309,6 +1583,8 @@ struct Router: Sendable {
 
     private struct SettingsPayload: Decodable {
         var downloadFromICloud: Bool?
+        // Present only so a client that still sends the old switch gets a refusal
+        // rather than silence. There is no `false` to apply: see `updateSettings`.
         var protectFavorites: Bool?
         var concurrency: Int?
         // The Similar Group knobs. Optional individually, so a client can move one
@@ -1321,31 +1597,30 @@ struct Router: Sendable {
     }
 
     private func updateSettings(_ request: HTTPRequest) async -> RouteResult {
-        // Preference changes are mutating too: `protectFavorites: false` is the
-        // one setting that weakens a safety rail, so the same-origin gate applies
-        // here. Deliberately *not* gated on Photos authorization — refusing to
-        // change preferences would strand a user whose access was revoked, and
-        // `protectFavorites` in particular must stay settable at any time.
+        // Preference changes are mutating, so the same-origin gate applies here.
+        // Deliberately *not* gated on Photos authorization — refusing to change
+        // preferences would strand a user whose access was revoked.
         if let refusal = Self.crossOriginRefusal(for: request) { return .response(refusal) }
         guard let payload = try? JSONDecoder().decode(SettingsPayload.self, from: request.body) else {
             return .response(.error("malformed settings", status: 400))
         }
+        // Favourite protection is not a preference, so a request to turn it off is
+        // refused outright rather than quietly ignored. Silently ignoring it would
+        // leave a stale client reporting success and a stale checkbox drawn as
+        // unchecked, which is a false account of what will happen to favourites.
+        if payload.protectFavorites == false {
+            Log.warn("refused a request to disable favourite protection")
+            return .response(.error("favorites are always protected and cannot be turned off", status: 400))
+        }
         let previous = settings.snapshot()
         let updated = settings.update { current in
             if let value = payload.downloadFromICloud { current.downloadFromICloud = value }
-            if let value = payload.protectFavorites { current.protectFavorites = value }
             if let value = payload.concurrency { current.analysisConcurrency = value }
             if let value = payload.groupWindowSeconds { current.groupWindowSeconds = value }
             if let value = payload.groupMaxDistance { current.groupMaxDistance = value }
             if let value = payload.groupFaceWeight { current.groupFaceWeight = value }
             if let value = payload.groupMinimumFaceArea { current.groupMinimumFaceArea = value }
             if let value = payload.groupMaximumSize { current.groupMaximumSize = value }
-        }
-
-        // Leave a trail for the one setting that weakens a safety rail, so
-        // "why did that favourite go?" can be answered from the log.
-        if previous.protectFavorites != updated.protectFavorites {
-            Log.info("favourite protection turned \(updated.protectFavorites ? "ON" : "OFF")")
         }
 
         // Changing a grouping parameter invalidates the stored groups: they were
@@ -1409,6 +1684,44 @@ struct Router: Sendable {
     /// and is not going to become one.
     private enum AlbumResolution {
         case resolved(AlbumSelection)
+        case refused(HTTPResponse)
+    }
+
+    /// `?media=`, resolved the same way and with the same reasoning as `?album=`.
+    ///
+    /// Absent or empty means `.all`. Anything else must name one of the three values
+    /// `MediaSelection` defines; an unrecognised string is a 400 that names them,
+    /// never a silent fall back to `all`.
+    ///
+    /// The failure that motivates that is the same one `resolveAlbumSelection`
+    /// documents, and it is worth being concrete about why the media case is *worse*
+    /// rather than merely equal: a client that sent `?media=videos` and was quietly
+    /// answered with the unfiltered grid would render a page containing every photo in
+    /// the library under a "Videos" heading. A user deleting from that page would be
+    /// deleting photos while looking at what they believe is a list of clips, and
+    /// every confirmation count in between would be true — of the wrong set.
+    ///
+    /// There is no `knownAlbums`-style validation step after the parse: the three
+    /// values are a closed set rather than identifiers, so there is nothing a caller
+    /// could name that this instance has not heard of. That is also why this is
+    /// **synchronous** where `resolveAlbumSelection` is not — the album's second step
+    /// is an awaited cache read, and there is no such step here to await. The shape
+    /// is otherwise deliberately the same, including the return type, so a reader who
+    /// knows one knows the other.
+    private func resolveMediaSelection(_ request: HTTPRequest) -> MediaResolution {
+        guard let raw = request.queryValue("media"), !raw.isEmpty else {
+            return .resolved(.all)
+        }
+        guard let selection = MediaSelection(rawValue: raw) else {
+            return .refused(.error("unknown media filter \"\(raw)\"; "
+                                   + "expected \"all\", \"images\" or \"videos\"", status: 400))
+        }
+        return .resolved(selection)
+    }
+
+    /// Either a media selection the server will apply, or the refusal to apply one.
+    private enum MediaResolution {
+        case resolved(MediaSelection)
         case refused(HTTPResponse)
     }
 

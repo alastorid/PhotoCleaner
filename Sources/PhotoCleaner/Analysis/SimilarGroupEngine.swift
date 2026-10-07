@@ -70,13 +70,30 @@ actor SimilarGroupEngine {
         /// True when the stored groups were built under different settings than the
         /// current ones and should be rebuilt before they are trusted.
         var stale = false
+        /// The knobs the *stored* groups were built under, so a client can say
+        /// which rules produced what it is looking at rather than only that the
+        /// current ones do not match. Absent when no group is stored, or when the
+        /// rows predate schema version 4 — "not recorded" is not "current".
+        var builtWithSettings: SimilarGroupSettings?
         var lastError: String?
+    }
+
+    /// The pass the stored groups came from.
+    ///
+    /// This process's own record while it is still true, and the row the pass wrote
+    /// otherwise. That fallback is the point: the alternative is process state, and
+    /// a settings change followed by a quit would leave groups built under rules the
+    /// user has moved on from being reported — and served — as current, with nothing
+    /// in the UI to say so. The stored row is what makes "built with different
+    /// rules" survive a restart.
+    private func storedPass() async -> (builtAt: Date, settings: SimilarGroupSettings)? {
+        if let lastBuiltAt, let lastBuiltSettings { return (lastBuiltAt, lastBuiltSettings) }
+        return try? await cache.newestGroupPass()
     }
 
     func status() async -> Status {
         var result = Status()
         result.building = running
-        result.lastBuiltAt = lastBuiltAt?.timeIntervalSince1970
         result.lastError = lastError
         if let counts = try? await cache.signalCounts() {
             result.featurePrints = counts.featurePrints
@@ -88,30 +105,38 @@ actor SimilarGroupEngine {
         }
         result.facesPending = faceBacklog.count
         let current = settings.snapshot().similarGroups
-        result.stale = lastBuiltSettings.map { $0 != current } ?? false
+        if let pass = await storedPass() {
+            result.lastBuiltAt = pass.builtAt.timeIntervalSince1970
+            result.builtWithSettings = pass.settings
+            result.stale = pass.settings != current
+        } else {
+            result.stale = false
+        }
         return result
     }
 
     /// Whether this identifier is still waiting for face capture quality.
     ///
-    /// Populated when a pass finishes. A membership row whose asset has since been
-    /// deleted keeps its entry in the cache's `group_members` only until the next
-    /// pass, so a `false` here means "analysed or unknown", never "analysed and
-    /// had no faces" — the distinction the caller needs is between *not yet
-    /// analysed* and *analysed*, and this reports the former.
+    /// Populated when a pass finds its groups and again once it has finished, so it
+    /// counts *during* a pass rather than only after one. A membership row whose
+    /// asset has since been deleted keeps its entry in the cache's
+    /// `group_members` only until the next pass, so a `false` here means "analysed
+    /// or unknown", never "analysed and had no faces" — the distinction the caller
+    /// needs is between *not yet analysed* and *analysed*, and this reports the
+    /// former.
     func isAwaitingFaceAnalysis(_ identifier: String) -> Bool {
         faceBacklog.contains(identifier)
     }
 
     /// Refreshes the backlog, so `status()` reports real progress during a pass.
+    ///
+    /// Read from the database rather than derived from what this pass happens to be
+    /// holding, so it is also the answer for a pass this process never ran.
     private func refreshFaceBacklog() async {
         let pending = (try? await cache.groupMembersNeedingFaces(limit: 50_000)) ?? []
         faceBacklog = Set(pending)
     }
 
-    /// Rebuilds the groups, then tops up face capture quality for their members.
-    ///
-    /// Returns immediately; the pass runs detached. `reason` is only for the log.
     /// Starts a pass if the stored groups are stale.
     ///
     /// Called from the group routes. Returns immediately — the pass is detached,
@@ -155,9 +180,13 @@ actor SimilarGroupEngine {
         let counts = try? await cache.signalCounts()
         guard (counts?.featurePrints ?? 0) > 0 else { return false }
         let current = settings.snapshot().similarGroups
-        if let built = lastBuiltSettings, built != current { return true }
-        guard let lastBuiltAt else { return true }
-        return Date().timeIntervalSince(lastBuiltAt) > Self.maxAge
+        // The stored row is consulted as well as this process's own record, so a
+        // rebuild also fires when a *previous* process built the groups under rules
+        // the user has since changed — and, symmetrically, a relaunch does not
+        // throw away a pass that is still inside `maxAge`.
+        guard let pass = await storedPass() else { return true }
+        if pass.settings != current { return true }
+        return Date().timeIntervalSince(pass.builtAt) > Self.maxAge
     }
 
     static let maxAge: TimeInterval = 6 * 60 * 60
@@ -189,8 +218,12 @@ actor SimilarGroupEngine {
             }
 
             // Face capture quality for the members, so the stored face counts and
-            // the Best Shot ranking are real rather than "not analysed yet".
+            // the Best Shot ranking are real rather than "not analysed yet". The
+            // backlog is read *before* Tier 3 so `status()` counts down while the
+            // pass runs, which is the whole reason it is a set on the actor rather
+            // than a number derived at the end.
             let members = built.flatMap { $0.members }
+            await refreshFaceBacklog()
             let faces = try await analyzeFaces(for: members, config: config)
 
             var faceCounts: [String: Int] = [:]
@@ -205,7 +238,12 @@ actor SimilarGroupEngine {
             }
             try await cache.replaceGroups(built, settings: config,
                                           faceMemberCounts: faceCounts, earliestDates: earliest)
-            for group in built where (faceCounts[group.id] ?? 0) > 0 {
+            // A group is ranked when *every* member has a face result — including a
+            // member with no faces in it. Marking only the groups that contain a face
+            // left every landscape burst reporting "still analysing" for ever, which
+            // is the one thing the flag must never say: those photos were analysed and
+            // the answer was no faces, which is a settled answer.
+            for group in built where group.members.allSatisfy({ faces[$0] != nil }) {
                 try? await cache.markGroupRanked(id: group.id)
             }
 
@@ -233,7 +271,9 @@ actor SimilarGroupEngine {
     /// not abandon the ranking of the other 40 in its group. A photo whose pixels
     /// are not on this Mac is recorded as having no faces *for this run's purposes*
     /// by simply not being written, so it is retried on the next rebuild rather
-    /// than being recorded as a face-free result it might not be.
+    /// than being recorded as a face-free result it might not be. Each result that
+    /// does land leaves the in-memory backlog as it is written, so `facesPending`
+    /// counts down while the pass runs rather than jumping at the end of it.
     private func analyzeFaces(for identifiers: [String],
                               config: SimilarGroupSettings) async throws -> [String: [FaceCapture]] {
         var unique: [String] = []
@@ -274,6 +314,7 @@ actor SimilarGroupEngine {
                             pixelSize: snapshot.analysisPixelSize,
                             allowNetwork: snapshot.downloadFromICloud) {
                             collected.append(analysed)
+                            await self.noteFaceAnalysed(analysed.0)
                         }
                     }
                     return collected
@@ -296,6 +337,15 @@ actor SimilarGroupEngine {
         guard faceCursor < count else { return -1 }
         defer { faceCursor += 1 }
         return faceCursor
+    }
+
+    /// Drops one identifier from the outstanding-face set, as its result is written.
+    ///
+    /// A no-op for an identifier that was not in the set, which is the normal case
+    /// for a photo the current pass did not queue — the set is a report, not a
+    /// second source of truth about what has been analysed.
+    private func noteFaceAnalysed(_ identifier: String) {
+        faceBacklog.remove(identifier)
     }
 
     private func analyzeOneFace(identifier: String, pixelSize: Int,

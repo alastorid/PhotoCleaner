@@ -106,6 +106,17 @@ actor Updater {
 
     private var status = Status()
     private var observers: [UUID: @MainActor (Status) -> Void] = [:]
+    /// Whether a state has been published that the observers have not seen, and
+    /// whether a delivery pass is already draining them.
+    private var undelivered = false
+    private var delivering = false
+    /// Whether a `start()` owns the flow.
+    ///
+    /// Not the same question as `Phase.isBusy`, and the difference is the bug it
+    /// exists to close: `start()` awaits `check()` before publishing anything, so
+    /// two clicks arriving in that window both find a non-busy phase and both go
+    /// on to download the same image into the same path.
+    private var flowActive = false
 
     init(settings: Settings, installer: UpdateInstaller = UpdateInstaller(),
          feedURL: URL? = AppPaths.updateFeedURL,
@@ -160,8 +171,7 @@ actor Updater {
     func observe(_ handler: @escaping @MainActor (Status) -> Void) -> UUID {
         let id = UUID()
         observers[id] = handler
-        let snapshot = status
-        Task { @MainActor in handler(snapshot) }
+        enqueueDelivery()
         return id
     }
 
@@ -171,10 +181,39 @@ actor Updater {
 
     private func publish(_ phase: Phase) {
         status.phase = phase
-        let snapshot = status
-        for handler in observers.values {
-            Task { @MainActor in handler(snapshot) }
+        enqueueDelivery()
+    }
+
+    /// Ask for the current state to reach the observers, coalescing a burst of
+    /// progress ticks into a single hop to the main actor.
+    private func enqueueDelivery() {
+        undelivered = true
+        guard !delivering else { return }
+        delivering = true
+        Task { await drain() }
+    }
+
+    /// Hand over every state published since the last pass, in order.
+    ///
+    /// One draining task rather than one per transition. A task created for each
+    /// transition reaches the main actor in an order the concurrency model does
+    /// not promise, so a title bar could be left showing a phase the updater has
+    /// already left — a download finishing on a stale progress reading — with
+    /// nothing left to correct it. This also collapses a burst of progress ticks
+    /// to the last one, which is all a ring can draw anyway.
+    private func drain() async {
+        while undelivered {
+            undelivered = false
+            let snapshot = status
+            for handler in observers.values {
+                await handler(snapshot)
+            }
         }
+        // No suspension point between the loop condition and this line, and both
+        // are actor-isolated, so a state published while the loop was running set
+        // `undelivered` before the loop went round again. Reaching here with
+        // something still undelivered would mean a publish slipped past.
+        delivering = false
     }
 
     // MARK: - The automatic check
@@ -185,12 +224,19 @@ actor Updater {
     /// arriving during this is refused by `Phase.isBusy`, and one arriving before
     /// it has started is only superseded if the user genuinely checked a moment
     /// ago.
+    ///
+    /// The interval is deliberately *not* re-read after the sleep. The timestamp
+    /// was read a moment before it started and nothing in between can move it —
+    /// the only writer is `check`, and this is the only check — so a user who
+    /// opens the menu to check by hand during those two seconds gets the
+    /// automatic check anyway, which is at worst one redundant HTTPS request.
     func checkOnLaunch(after delay: Duration = .seconds(2)) async {
-        guard settings.snapshot().checkForUpdates else { return }
+        let settings = settings.snapshot()
+        guard settings.checkForUpdates else { return }
         guard currentVersion != nil else { return }
 
-        let last = settings.snapshot().lastUpdateCheck
-        if let last, Date().timeIntervalSince(last) < Self.automaticCheckInterval {
+        if let last = settings.lastUpdateCheck,
+           Date().timeIntervalSince(last) < Self.automaticCheckInterval {
             Log.info("update check skipped; last ran \(Int(Date().timeIntervalSince(last)) / 60) minute(s) ago")
             return
         }
@@ -281,7 +327,12 @@ actor Updater {
     /// answered.
     @discardableResult
     func start() async -> Outcome {
-        if status.phase.isBusy { return .failed("an update is already in progress") }
+        // Both, and neither alone. `flowActive` covers the window before any
+        // phase is published; `isBusy` covers a check that somebody else started
+        // — the launch check, or the check `setAutomaticChecks(true)` runs.
+        if flowActive || status.phase.isBusy { return .failed("an update is already in progress") }
+        flowActive = true
+        defer { flowActive = false }
 
         let offer: AvailableUpdate
         if let known = status.offered, status.phase.isActionable {
@@ -313,15 +364,6 @@ actor Updater {
         }
     }
 
-    /// Forget a known update and go back to "nothing known".
-    ///
-    /// Used after an install and when a manual check finds nothing, so a stale
-    /// offer cannot outlive the version it referred to.
-    func reset() {
-        status.offered = nil
-        publish(.idle)
-    }
-
     // MARK: - Steps
 
     /// Where this update will be installed, before anything is downloaded.
@@ -329,25 +371,27 @@ actor Updater {
     /// Refusing early is the point: finding out after a 15 MB download that the
     /// app is running from a mounted disk image wastes the user's bandwidth to
     /// deliver a message that was knowable at launch.
+    /// No `currentVersion` guard here: an offer can only have come from `check`,
+    /// which refuses to produce one without a readable version, and `currentVersion`
+    /// is fixed for the life of the process. Re-checking would be a second copy of
+    /// a rule that cannot be broken.
     private func installPlan(for offer: AvailableUpdate) throws -> UpdatePlan {
-        guard let installed = currentVersion else {
-            throw UpdateError.notSelfInstallable("this build carries no version")
-        }
-        let plan = try UpdateTarget.plan(bundleURL: bundleURL, installed: installed,
-                                         scratch: AppPaths.updateDirectory)
+        let plan = try UpdateTarget.plan(bundleURL: bundleURL, scratch: AppPaths.updateDirectory)
         Log.info("update plan: \(plan.bundleURL.path) <- \(offer.asset.name)")
         return plan
     }
 
     private func download(_ offer: AvailableUpdate, into plan: UpdatePlan) async throws {
         try FileManager.default.createDirectory(at: plan.scratchDirectory, withIntermediateDirectories: true)
-        let destination = plan.scratchDirectory.appendingPathComponent(offer.asset.name)
+        let destination = try Self.destination(for: offer.asset.name, in: plan.scratchDirectory)
         // A previous run may have left a partial file; `ditto` would then stage
         // the *old* truncated image.
         try? FileManager.default.removeItem(at: destination)
 
-        let session = makeSession()
+        // The transfer is the session's delegate, so it has to exist first: a
+        // `URLSession` takes its delegate at construction.
         let transfer = Download()
+        let session = makeSession(delegate: transfer)
         defer { session.finishTasksAndInvalidate() }
 
         transfer.onProgress { [weak self] received, expected in
@@ -384,13 +428,35 @@ actor Updater {
         return url
     }
 
+    /// Where a download of `name` is written, or a refusal.
+    ///
+    /// The asset name comes out of a release body, and it is about to be turned
+    /// into a path component. `UpdateCheck` has already matched it against a name
+    /// it computed itself, so a name that escapes its directory cannot arrive from
+    /// the feed — but "cannot arrive" is a property of another file, and this is
+    /// the function that would append a path separator to something remote if it
+    /// ever stopped being true. It checks, and it is `nonisolated` and static so
+    /// the suite can call it directly.
+    nonisolated static func destination(for name: String, in scratch: URL) throws -> URL {
+        guard !name.isEmpty,
+              !name.contains("/"),
+              name != ".",
+              name != ".." else {
+            throw UpdateError.downloadFailed("the release's file name is not a plain file name")
+        }
+        return scratch.appendingPathComponent(name)
+    }
+
     private func noteProgress(received: Int64, expected: Int64?) {
         guard case .downloading = status.phase else { return }
         publish(.downloading(received: received, expected: expected))
     }
 
     private func install(_ offer: AvailableUpdate, plan: UpdatePlan) async throws {
-        let image = plan.scratchDirectory.appendingPathComponent(offer.asset.name)
+        // The same re-derivation as in `download`, deliberately rather than passed
+        // down: this is the last thing standing between remote release text and a
+        // path the installer then mounts.
+        let image = try Self.destination(for: offer.asset.name, in: plan.scratchDirectory)
         guard FileManager.default.fileExists(atPath: image.path) else {
             throw UpdateError.installFailed("the downloaded image is missing")
         }
@@ -481,15 +547,19 @@ actor Updater {
     /// true now that the app makes a request off the machine. A cached release
     /// feed would also mean a user on a plane could be told they were up to date
     /// for as long as the cache entry lived.
-    private func makeSession() -> URLSession {
+    ///
+    /// `HTTPSOnlyRedirectDelegate` is the session delegate rather than nothing: the
+    /// scheme is checked on the URL, but a redirect is a second URL that arrives
+    /// after that check and is followed by default, including from https down to
+    /// http. The release endpoint redirects legitimately — a release's asset
+    /// lives on `objects.githubusercontent.com` — so this cannot be "no redirects";
+    /// it has to be "https the whole way".
+    private func makeSession(delegate: URLSessionTaskDelegate = HTTPSOnlyRedirectDelegate()) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
         configuration.httpCookieStorage = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        // The user agent is set per request; this stops Foundation appending its
-        // own so the feed sees one stable identity.
-        configuration.httpAdditionalHeaders = nil
-        return URLSession(configuration: configuration)
+        return URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
     }
 
     private static func message(for error: any Error) -> String {
@@ -502,6 +572,48 @@ actor Updater {
     }
 }
 
+/// Whether a redirect the updater asked for may be followed.
+///
+/// A redirect is a URL that arrives *after* the release body has been read and
+/// after the asset URL was checked for https, and it is followed by default. So
+/// the scheme has to be checked again here: GitHub legitimately serves release
+/// assets from `objects.githubusercontent.com` through a redirect, which is why
+/// redirects cannot be refused outright, but a downgrade to http would fetch the
+/// wrong bytes over a channel nothing in the release mentioned.
+///
+/// The host is deliberately not pinned — that redirect target is a CDN name that
+/// changes. The scheme is the part that must not move.
+enum Redirect {
+    static func isAcceptable(_ url: URL?) -> Bool {
+        url?.scheme?.lowercased() == "https"
+    }
+}
+
+/// A session delegate that follows https redirects and refuses every other.
+///
+/// A base *class* rather than a protocol extension, because the delegate method is
+/// an optional `@objc` protocol requirement: only a method declared on the
+/// concrete class satisfies it, and a protocol extension's copy would be silently
+/// ignored — the session would then follow every redirect, including downgrades,
+/// which is the opposite of what the protocol says.
+///
+/// `Download` subclasses it so it can be the delegate for progress and files *and*
+/// for this; `Updater` uses it directly for the feed fetch, which needs nothing
+/// else.
+class HTTPSOnlyRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        if Redirect.isAcceptable(request.url) {
+            completionHandler(request)
+        } else {
+            Log.warn("refused a redirect to \(request.url?.absoluteString ?? "an unknown URL")")
+            completionHandler(nil)
+        }
+    }
+}
+
 /// One download, with progress, that leaves the file where the installer wants it.
 ///
 /// Delegate-driven rather than `URLSession.download(for:delegate:)` because of
@@ -509,7 +621,7 @@ actor Updater {
 /// under it is deleted when the delegate call that produced it returns. Moving it
 /// here, inside `didFinishDownloadingTo`, is the only point at which the file is
 /// guaranteed to still exist.
-private final class Download: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+private final class Download: HTTPSOnlyRedirectDelegate, URLSessionDownloadDelegate, @unchecked Sendable {
     private struct State {
         var continuation: CheckedContinuation<URL, Error>?
         var destination: URL?

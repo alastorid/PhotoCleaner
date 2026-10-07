@@ -21,16 +21,22 @@ Two rules govern everything below:
 
 ```
 Apple Photos ──PhotoKit──► PhotoLibrary ──► AnalysisEngine (4 bounded workers)
-                                │                    │
-                                │                    ├─► VisionAnalyzer (aesthetics
-                                │                    │   + FeaturePrint + face quality)
-                                │                    └─► CacheStore (SQLite actor)
-                                │
-                                ├─► AlbumIndexer ──► CacheStore
-                                ├─► SimilarGroupEngine ──► CacheStore
-                                │
-                                └──► Router ──► HTTPServer (NWListener, 127.0.0.1)
-                                                 EventBus (SSE) ──► AppWindow (WKWebView)
+                              │  │                │
+                              │  │                ├─► VisionAnalyzer (aesthetics
+                              │  │                │   + FeaturePrint + face quality)
+                              │  │                └─► CacheStore (SQLite actor)
+                              │  │
+                              │  └─► VideoLibrary (clips: frames, export, playback)
+                              │
+                              ├─► AlbumIndexer ──► CacheStore
+                              ├─► SimilarGroupEngine ──► CacheStore
+                              │
+                              └──► Router ──► HTTPServer (NWListener, 127.0.0.1)
+                                              EventBus (SSE) ──► AppWindow (WKWebView)
+                                                                    │
+                                                              UpdateIndicator
+                                                                    │
+                                               Updater ──► release feed ──► UpdateInstaller
 ```
 
 Three views sit over the same cache:
@@ -64,6 +70,21 @@ grid's own wire values and the grid's own validation, and `AlbumSelection` grows
 `membershipClause(asset:albumParameter:)` that both the score filter and the group
 queries build their predicate from — one definition of what each value means, so the
 two cannot drift.
+
+The **media** dimension travels with it, and the client resets both windows when it
+changes for the same reason it resets on album: a cursor and a pair of offsets name
+a position inside one result set, so a page still in flight for the previous filter
+must be discarded rather than appended to the new one. What it *does* to a group
+list is worth being explicit about: a clip never has a FeaturePrint and so is never
+a member, so `media=images` and `media=all` return the same groups and
+`media=videos` returns none. `media` is accepted rather than refused because the
+client sends the grid's whole filter as it stands, and refusing the dimension would
+be a worse answer than answering it honestly.
+
+Changing the media filter also makes a "matching" selection stale, exactly as an
+album change does: `sameFilter` reads `media`, and deletion is blocked until the
+user re-snapshots or clears it. An explicit id selection is unaffected — those are
+assets the reader pointed at.
 
 Two decisions, deliberately different:
 
@@ -149,14 +170,19 @@ re-derived wrongly.
 | Machine | macOS 26.5.1 (build 25F80), Apple M3, arm64 |
 | Toolchain | Swift 6.3.2, **Command Line Tools only** — no Xcode |
 | **SwiftPM does not work here** | `swift package dump-package` fails to link `libPackageDescription` even for a three-line manifest. **There is no `Package.swift`, deliberately.** `build.sh` calls `swiftc` directly. |
-| Library | 53,177 stills, 1,953 videos (videos are never scored), 107 favourites |
-| **iCloud-only share** | **15,784 of 53,177 (~30%)** are not on this Mac. Normal for an optimised library, not a failure. |
-| **Score range** | observed **−0.9476 … +1.0000** — *not* 0…1 |
-| Analysis input | 1024 px longest edge. 256 px drifts up to **0.135**; 512 / 1024 / 2048 agree within **0.02**. |
-| Throughput | whole library in **2 min 27 s** (147 s, from the log), concurrency 4 — ~240 genuinely scored/s, ~360 photos/s once cloud-only skips are counted |
+| Library | 52,661 stills, 113 favourites, in the cache this run measured. Enumeration now covers clips as well, so `library.total` is photos *and* videos and `library.videos` says how many of them are which. |
+| **iCloud-only share** | **15,600 of 52,661 (~30%)** are not on this Mac. Normal for an optimised library, not a failure. |
+| **Score range** | observed **−0.9399 … +1.0000** — *not* 0…1 |
+| Analysis input | 1024 px longest edge, per frame. 256 px drifts up to **0.135**; 512 / 1024 / 2048 agree within **0.02**. |
+| Throughput | whole library in **2 min 27 s** (147 s, from the log), concurrency 4 — ~250 genuinely scored/s, ~360 photos/s once cloud-only skips are counted |
 | CPU | ~3%; inference runs on the Neural Engine |
-| Cache, aesthetics only | ~15 MB for 53k assets including `-wal`/`-shm` |
-| Cache, with FeaturePrints | **~175 MB** — vectors are ~2.7 KB each and are by far the largest thing in it |
+| Cache, asset rows and indexes | ~40 MB, `-wal`/`-shm` included |
+| Cache, `asset_signals` | **~150 MB** — 37,056 compressed FeaturePrints at a measured 2,562 B each, plus face capture quality |
+
+A library is not a constant: photos arrive and are deleted, so the counts above are
+a snapshot of one library at one moment and the numbers are expected to drift. What
+does not drift is the shape — roughly 30% of an optimised library is cloud-only,
+and the minimum score is well below zero.
 
 **Why 1024 px.** It is the cheapest point on the measured plateau: about 4 MB of
 RGBA per in-flight image and no full-resolution HEIC/RAW decode. Below it the score
@@ -190,14 +216,15 @@ Line Tools reinstall steps instead of a module dump.
 
 ## 3. Data model
 
-One SQLite database, schema version 3, in Application Support. Migration is additive
-and idempotent: every step is `IF NOT EXISTS`, nothing is dropped or rewritten, and
-no existing table's shape changes, so an older cache upgrades in place.
+One SQLite database, schema version 5, in Application Support. Migration is
+additive and idempotent: every step is `IF NOT EXISTS` or
+`addColumnIfMissing`, nothing is dropped or rewritten, and no existing row changes
+meaning, so an older cache upgrades in place.
 
 | Table | Holds |
 |---|---|
-| `assets` | one row per asset: dates, dimensions, favourite, screenshot flag, aesthetics score, analysis state, attempts, last error, `scored_at`, analyzer version |
-| `asset_signals` | one row per (asset, signal kind) — FeaturePrint and per-face capture quality, LZFSE-compressed |
+| `assets` | one row per asset: media type, dates, dimensions, favourite, screenshot flag, clip duration (`NULL` for a still), aesthetics score, analysis state, attempts, last error, `scored_at`, analyzer version |
+| `asset_signals` | one row per (asset, signal kind) — FeaturePrint and per-face capture quality, zlib-compressed behind a one-byte codec marker |
 | `albums` / `asset_albums` | user-album membership, many-to-many. `asset_albums`' primary key *is* the index for the filter's correlated `EXISTS`, and it makes duplicate membership impossible. Foreign keys cascade, so a deletion takes its album rows with it. |
 | `similar_groups` / `similar_group_members` | materialised groups plus the settings they were built under, so "stale" can be told from "built with different rules" |
 | `featureprint_queue` | scored assets with no vector yet — see §5.3 |
@@ -226,16 +253,19 @@ service is never reachable from the LAN. `lsof` must never show `*:8765`.
 
 ```
 GET  /                        GET  /api/photo/{id}/thumbnail   ?size=128|256|384|512
-GET  /api/status              GET  /api/photo/{id}/preview     ?size=512…4096
-GET  /api/photos              GET  /api/photo/{id}/similar     → {groupId?, totalCount, analyzed}
-GET  /api/albums              POST /api/delete
-GET  /api/albums/index        POST /api/favorites    {ids, favorite}
-GET  /api/groups              POST /api/photos/reveal {id}
-GET  /api/group               POST /api/groups/rebuild
-GET  /api/events  (SSE)       POST /api/selection/preview
-GET  /api/timeline/around     POST /api/settings
-GET  /api/timeline/page       POST /api/analysis/retry
-                               POST /api/library/rescan
+GET  /app.css                 GET  /api/photo/{id}/preview     ?size=512…4096
+GET  /app.js                  GET  /api/photo/{id}/similar     → {groupId?, totalCount, analyzed}
+GET  /favicon.ico   (204)     GET  /api/photo/{id}/video       a byte range of the clip
+                              POST /api/albums/index
+GET  /api/status              POST /api/delete
+GET  /api/photos              POST /api/favorites    {ids, favorite}
+GET  /api/albums              POST /api/photos/reveal {id}
+GET  /api/photo/{id}          POST /api/groups/rebuild
+GET  /api/groups              POST /api/selection/preview
+GET  /api/group               POST /api/settings
+GET  /api/events  (SSE)       POST /api/analysis/retry
+GET  /api/timeline/around     POST /api/library/rescan
+GET  /api/timeline/page
 ```
 
 - Every mutating route is **POST-only** and same-origin gated.
@@ -252,12 +282,29 @@ GET  /api/timeline/page       POST /api/analysis/retry
 - Asset identifiers contain `/`; clients must `encodeURIComponent`.
 - Optional fields are **omitted**, never sent as `null`. A client must treat an absent
   key and an explicit `null` identically.
+- **Every JSON answer carries `Cache-Control: no-store`.** `no-cache` would still let
+  the body be *stored* and only oblige a revalidation, which is the write this
+  prevents. It is on the 404 too: a not-found is as much a live answer as a 200.
+  `smoke-test.sh` fails the run if the URL cache ever holds a response.
 - **Slider bounds are data-derived**: `lo`/`hi` default to `MIN`/`MAX(aesthetics_score)`
   in the cache. The score is never normalised, clamped or assumed to be 0…1.
 - Pagination is keyset, and `CacheStore.keysetClause` must stay in step with
   `SortOrder.orderByClause` — direction, tie-break direction and null handling are one
   invariant expressed in two places. Change one without the other and pagination
   silently skips rows.
+- **Every filter dimension is in the pagination fingerprint**, media included: a
+  cursor issued under `media=images` replayed under `media=videos` would splice the
+  two sets together, in a list whose positions no longer mean what they did.
+- **`/api/photo/{id}/video` is the one route that answers 409.** A clip that exists
+  but is iCloud-only is not a 404 — that would read as "this video is gone" and send
+  the user looking for a file that is sitting in iCloud. It says which preference
+  turns the answer from 409 into 200.
+- **The media dimension is a closed set of literals, not placeholders.** `PhotoFilter`'s
+  `whereSQLClause` has a fixed parameter budget (`?1`, `?2` the score bounds, `?3` the
+  album, then keyset), so `media_type = 1` / `media_type = 2` are written into the
+  SQL rather than bound. `claimJobs` takes the same shape as `IN (1, 2)` for the
+  mirror-image reason: `!= 1` would start scoring an asset whose media type is
+  `audio` or `unknown`, which this pass has no way to produce frames for.
 
 ---
 
@@ -266,6 +313,19 @@ GET  /api/timeline/page       POST /api/analysis/retry
 `VisionAnalyzer` issues Apple's `CalculateImageAestheticsScoresRequest` and unwraps
 it. Nothing else is ever substituted for it, and the score range is taken as it comes
 back.
+
+**One frame or three.** `framesForAnalysis` returns a single still for a photo and up
+to three frames for a clip, sampled at 10%, 50% and 90% of its duration. A frame that
+fails is dropped rather than failing the asset — three samples become two, and two
+become one, which `analyzeFrames` still scores and still logs. The alternative is a
+second, video-only failure path in which a clip had to be guessed at, which is
+exactly the "one bad moment aborts the pass" failure the shared path avoids.
+
+**A clip's score is a median, and it has no vector.** `analyzeFrames` takes the median
+of the per-frame scores and returns `nil` for the FeaturePrint whenever there was more
+than one frame. Both facts are one function because "no vector for a clip" is a
+property of what a clip *is*, not of which pass is running. A clip can be deleted,
+filtered, sorted and previewed; it can never be a group member.
 
 ### 5.1 The state machine
 
@@ -341,7 +401,7 @@ Supporting measurements:
 | | |
 |---|---|
 | FeaturePrint revision | `.revision2` is the only one the macOS 15 Swift API exposes (revision 1 is ObjC-only) |
-| FeaturePrint size | 768 floats · 3,072 B raw · 4,351 B JSON · ~2,708 B LZFSE |
+| FeaturePrint size | 768 floats · 3,072 B raw · 4,351 B JSON · **2,562 B** zlib, measured across the 37,056 vectors in a real cache |
 | Codable round trip | **bit-exact** — worst distance error `0.0` over 400 pairs |
 | Raw payload | **not reconstructible** through any public API, so JSON is the only persistable form |
 | Neighbours in a 120 s window | median 16, p90 177, **max 939** |
@@ -404,10 +464,11 @@ route.
 
 ### 6.4 Cost, and the lack of eviction
 
-A FeaturePrint is LZFSE'd to ~2.7 KB, so a 53k library costs roughly **144 MB** of
-extra cache — against 15 MB before. It is the largest thing in the cache and there is
-**no eviction**: an asset that loses its vector gets it back on the next pass, but
-nothing prunes one that is no longer needed.
+A FeaturePrint is zlib'd to a measured **2,562 B**, so the 37,056 vectors in a real
+cache are **~90 MB** of it — against ~40 MB for the asset rows, album membership and
+groups together. It is the largest thing in the cache and there is **no eviction**:
+an asset that loses its vector gets it back on the next pass, but nothing prunes
+one that is no longer needed.
 
 ---
 
@@ -448,8 +509,80 @@ Each of these is load-bearing:
 - **No private API.** `WKWebView.inspector` does not exist on macOS; the Web Inspector
   is opted into with `PHOTOCLEANER_WEB_INSPECTOR=1`, which registers
   `WebKitDeveloperExtras` in the *registration* domain so nothing is written to disk.
-- **The icon is drawn by `tools/make-icon.swift`, not checked in.** Its gradient
-  matches `.app-mark` in `web/app.css`; keep them in step.
+- **The icon is drawn by `tools/make-icon.swift`, not checked in.** Its body
+  gradient matches `.app-mark` in `web/app.css`; keep those two in step. It is
+  deliberately **not** `--accent`: the icon is neutral grey while selection keeps
+  a real hue, because a grey accent makes a selected tile look unselected and
+  selection is this app's core action.
+
+  The grey is a measured choice, not a preference. A neutral icon has no hue to
+  separate itself from the desktop with, so the ramp has to clear the desktop's
+  *luminance* instead — and because the whole icon sits on the wallpaper, that
+  means **every pixel of the body against every wallpaper**, a min over both ramp
+  ends and all of them. Pairing them light-end-on-light and dark-end-on-dark is
+  the trap: it reports a graphite body as a comfortable pass (its dark end scores
+  12.94:1 on a light desktop) while the light end is sitting at 1.09:1 on a dark
+  one. That error is what `Tests/IconTests.swift` was first written with.
+
+  Against that min, both obvious neutrals fail outright. Graphite
+  `#4a4a4f` → `#232326` bottoms out at **1.09:1** — the dark end on `#1c1c1e`,
+  where the edge vanishes. White `#fbfbfd` → `#dcdce1` reaches **1.00:1**, an
+  exact match against the light grey desktop. The mid grey `#9a9aa0` → `#54545a`
+  clears all six wallpapers at a worst corner of **1.85:1** (`#54545a` on
+  `#2c2c2e`), which is what sets the 1.25 floor in the suite. Re-measure before
+  moving it towards either end.
+
+  The mark is a 3×3 contact sheet — the app's own grid — fading in reading order.
+  What was measured about it, and what was not:
+
+  * The grid resolves cleanly at **32px**, and keeps resolving with the tile gap
+    tightened from 60 units to about 26. At 16px it is marginal at *any* gap in
+    this range — three tile runs are only separable at a threshold within a few
+    percent of the way up the tile-to-gap contrast. So the gap is not what makes
+    the grid work; it is set wide because it looks right, and the suite pins the
+    size at which the grid genuinely reads rather than pretending 16px is fine.
+  * The opacity run ends at 0.46 rather than the 0.26 a steeper falloff looks
+    better with at 512px. The measured reason is modest: at 32px the faintest
+    tile's contrast against the gap beside it only moves from 1.41:1 to 1.25:1
+    across that whole range, because tile and gap darken together. The floor in
+    `Tests/IconTests.swift` is set to catch a tile disappearing altogether, not
+    to police this particular number.
+
+### The title-bar arc
+
+The window carries one accessory view: `UpdateIndicatorController`, added at
+construction as an `NSTitlebarAccessoryViewController`, which draws the updater's
+state and posts a click back to `AppDelegate`. Several properties of it are
+deliberate:
+
+- **The window draws and starts nothing.** It holds no `Updater` and never touches
+  the network. The one place in the app that can replace the running bundle is
+  `PhotoCleanerApp`, which owns the process; a view controller that could start a
+  download would be a second owner of that.
+- **The arc is a control, and its title says what a click will do** — "Update to
+  1.2.4…" when there is an update, "Check for Updates…" when there is not, and the
+  phase while one is in flight. A fixed label next to a known version is a question
+  the user has to answer mentally.
+- **A click is not confirmed.** The affordance is labelled with what it does and
+  the app replaces itself; a confirmation sheet on the app's own title bar would be
+  a dialog it had already answered.
+- **A failure is shown; success is not.** Success ends in the window being replaced,
+  so an alert then would race the restart. A failure has to be loud, because an app
+  that silently stays on the old version is worse than one that says why.
+- **The flow is one actor.** `Updater` is an actor because the flow is a state
+  machine with exactly one writer: a second check arriving mid-download must not
+  start a second one. `Phase.isBusy` is what refuses it.
+- **The session is ephemeral, with no cache and no cookie storage.** That is not
+  tidiness — it is what keeps `smoke-test.sh`'s check that the URL cache holds no
+  response true now that the app makes a request off the machine. A cached release
+  feed would also mean a user on a plane could be told they were up to date for as
+  long as the cache entry lived.
+
+`UpdateTarget.plan` decides where the update goes *before* anything is downloaded,
+and the install is verified twice: once on the copy staged inside Application
+Support and once on the bundle that is actually installed afterwards, with the
+outgoing bundle moved aside first so a failed swap rolls back rather than leaving no
+app.
 
 ---
 
@@ -471,6 +604,20 @@ bug, not a cleanup.
   if the favourite check itself errors, the selection resolves to *nothing* rather
   than to "no favourites". `PhotoLibrary.delete` re-reads `asset.isFavorite` live at
   the point of destruction, because the cached flag is only as fresh as the last scan.
+- **Favourite protection is not a setting.** `POST /api/settings` refuses
+  `protectFavorites: false` with a 400 rather than quietly ignoring it — a stale
+  client reporting success, with a checkbox drawn unchecked, is a false account of
+  what will happen to favourites — and `SettingsSnapshot.init(from:)` does not decode
+  the key at all, so a `settings.json` written by a build that had the switch still
+  round-trips and still reads as protected. There is no undo for turning it off,
+  which is why there is no turning it off. **The key stays in `CodingKeys` on
+  purpose**, so the value is still written and a stale key in an old file is ignored
+  rather than fatal; removing the entry as dead code would break the round trip.
+- **Hiding a control is not the same as enforcing the behaviour behind it.** Removing
+  the switch without touching the backend would have left every user who had turned
+  it off with deletable favourites and no way to notice. The invariant has to be
+  established on the side that decides, and only then is the UI free to stop offering
+  it.
 - **The Photos authorization gate covers the routes that act,** not the ones that
   report. Deletion, favourites, reveal, album reindex and the group routes refuse
   with 403 when access is absent; `/api/status`, `/api/settings` and the
@@ -493,8 +640,13 @@ bug, not a cleanup.
 - **`CacheStore.keysetClause` and `SortOrder.orderByClause` must stay in step.** See §4.
 - **`node --check` parses; it does not resolve.** It cannot see a call to a function
   that does not exist, so grep for the callee. A `$('id')` with no matching element in
-  `index.html` throws only on the branch that needs it, which is why the two files are
-  cross-checked mechanically.
+  `web/index.html` throws only on the branch that needs it, which is why the two
+  files are cross-checked mechanically.
+- **A JS animation must be skippable, and its timing must be bounded.** Anything that
+  moves an element is driven by `setTimeout` rather than by `transitionend`, because
+  `prefers-reduced-motion` collapses transition durations to ~0 and under a headless
+  DOM the events never fire at all. Every timer must have a cap, or a failed or silent
+  async step leaves an element stranded on screen.
 - **A fresh count must never sit beside a stale token.** The selection holds the
   `confirmToken` from the `/api/selection/preview` that produced the count printed on the
   Delete button, and presents it on the deletion. With no staged list in between, the
@@ -508,6 +660,78 @@ bug, not a cleanup.
   cannot disagree. It requires `selection.resolved > 0`, which means the button is dead
   until the server has said how many photos a press would destroy — a deletion of
   unknown size is refused rather than guessed at.
+- **The preview overlay is `hidden` first, then `.is-open` — with a flush in
+  between.** `display: none` cannot be transitioned and `[hidden]` wins with
+  `!important`, so an animated overlay needs three states, not two. Setting
+  `hidden = false` and adding `.is-open` in the same tick leaves the browser with no
+  previous computed style to transition from and the backdrop arrives in one frame;
+  reading `offsetWidth` between them is what gives it a `opacity: 0` to fade up from.
+  Closing is the same walk in reverse, with `hidden` set only after the fade.
+- **`.lightbox-stage` has a pinned height, not one fitted to the image.** The preview
+  animation has to know where the photograph is going before the photograph arrives —
+  the 2048px preview is still being fetched when the travel starts — so the box holding
+  it must not resize itself on arrival and move its own destination out from under the
+  animation. Anything that lets the stage grow with its content reintroduces a jump
+  halfway through every open.
+- **What travels is the thumbnail, never the preview.** The preview is a 2048px JPEG
+  that has not been requested when Space is pressed; animating toward it would mean
+  animating the absence of a bitmap. A copy of the already-decoded thumbnail makes the
+  trip, positioned `fixed` in viewport coordinates so a resizing stage cannot drag it,
+  and the two cross-fade once the real bitmap has decoded.
+- **The hand-over waits for the travel *and* the decode.** Crossing over while the
+  thumbnail is still in flight puts the sharp photograph at full size with a blurred
+  copy of itself sliding into the grid on top of it. The decode wait is bounded
+  (`PREVIEW_DECODE_GRACE_MS`) because a photo whose preview cannot be read raises
+  `error` rather than `load`, and the travelling copy has to be taken away either way.
+- **The animation is optional to every caller.** It is skipped when there is no tile to
+  fly from (a failed or not-yet-loaded thumbnail), no layout to measure, or under
+  `prefers-reduced-motion`. A preview has to work identically without it.
+- **The preview travels; a clip's poster frame is what travels.** For a still the
+  hand-over waits for `decode()`. For a clip it waits for `loadedmetadata`, which is
+  bounded by `preload="metadata"` and therefore costs no bytes of the body — and the
+  waiting element still gets the `lightbox-entering` opacity hold, because the frame
+  on screen behind the travelling copy *is* that clip's poster. Holding it until the
+  clip could play would hold a frame that is already visible for however long the
+  export takes.
+- **`/api/photo/{id}/video` must stream a range, and it must not buffer the file.**
+  Every other route answers from `Data` because a 2048 px JPEG is a `Data`. A clip is
+  not: `AVAssetExportPresetPassthrough` keeps the original codec and the original
+  container, so a 4 GB 4K clip is 4 GB. Reading it into a `RouteResult` before the
+  first byte goes out turns a seek into a wait for the whole file, holds it in memory
+  while it writes, and makes the server's memory proportional to what the reader
+  happened to open. Hence a file-backed `RouteResult` and a 512 KB read chained off
+  each write's completion rather than a blocking read on the connection queue — the
+  same reason the thumbnail path is off-actor.
+- **The chunked write chain has four ways to be silently wrong**, all of which
+  corrupt the *next* response rather than this one: the keep-alive re-arm must happen
+  exactly once, after the final chunk's completion (two re-arms desynchronise the
+  connection); a mid-body read error must **close** rather than write a short body
+  under a `Content-Length` that promised more (the client waits for bytes that will
+  never come); `close()` cancels the task mid-body, so the chain must not resurrect
+  the connection afterwards; and a client that disconnects must end the chain on the
+  completion's `error` rather than spin. `HTTPConnection.send` must therefore stop
+  unconditionally overwriting `Content-Length` with `response.body.count` — for this
+  case the body is empty and the length is the range.
+- **`Range` is parsed, never obeyed by reflex.** `bytes=a-b`, `bytes=a-` and
+  `bytes=-suffix` are honoured; `start >= size` and `a > b` are `416` with
+  `Content-Range: bytes */size`; an **unparseable** range and a **multi-range** one
+  are both ignored and answered `200` with the whole file. Multipart ranges are
+  optional in RFC 9110 and the framing risk is not worth taking. Answering a bad
+  range with a `500` or with the wrong bytes is the failure; serving the file is a
+  correct answer to a request the client can recover from on its own.
+- **The clip's `<video>` is paused and emptied on *every* render, not only on close.**
+  `renderLightbox` is also the repaint path for a favourite toggle applied from the
+  lightbox, and the bug the queue reindexing comments describe — something still
+  running underneath the next photo — arrives in this feature as sound rather than a
+  stale image. Pausing *before* the source is removed is the load-bearing order:
+  dropping `src` from a playing element does not reliably stop it, because the media
+  stack may be mid-buffer. Removing the attribute rather than assigning `''` is what
+  lets the decoder and the open request go, and `load()` is what tells the element it
+  has no resource.
+- **A retained `<video>` is a resource leak, so `hideLightbox` tears it down.** Not
+  `hidden = true`: a paused-but-attached clip holds its decoder and its half-open
+  export request for the rest of the session, and the next open races a resource the
+  previous one still owns. The same reason clears the still's `src`.
 
 ---
 
@@ -517,13 +741,25 @@ bug, not a cleanup.
 - No way to re-score the whole library. `analysisPixelSize` is exposed read-only over
   HTTP precisely so it cannot trigger a full run.
 - No writing to the Photos library other than deletions you ask for. Deletion is one
-  step: the Delete button, `⌘⌫`, a tile menu's item and the preview's own button all
-  build a *spec* and send it to `/api/delete` through one function. Nothing else in the
-  app calls that route. There is no staged list and no undo — the deletion goes to
-  Recently Deleted, and the server refuses it outright if the set no longer resolves to
-  the fingerprint the count was printed with.
-- No video scoring — enumeration is media-type parameterised, so the 1,953 videos sit
-  unscored.
+  step: the Delete button, `⌫` or `Delete`, a tile menu's item and the preview's own
+  button all build a *spec* and send it to `/api/delete` through one function. Nothing
+  else in the app calls that route. There is no staged list and no undo — the deletion
+  goes to Recently Deleted, and the server refuses it outright if the set no longer
+  resolves to the fingerprint the count was printed with.
+- **Clips are scored, not grouped.** Videos are first-class assets: enumerated,
+  scanned, scored, browsable, playable, favouritable and deletable under exactly the
+  same protections as a photograph. What they never get is a Similar Group. A video
+  is sampled at 10%, 50% and 90% of its duration and takes the **median** of those
+  frames' scores. It gets no FeaturePrint, so it never becomes a group member and
+  never enters the group builder's input.
+  `analyzeFrames` makes both facts one call, because "no vector for a clip" is a
+  property of what a clip *is* rather than of which pass happens to be running.
+  `import AVFoundation` appears in `VideoLibrary.swift` and nowhere else, so the
+  video path cannot leak into the image path by accident.
+- No transcoding or re-muxing. `GET /api/photo/{id}/video` is a byte range of what
+  Photos holds, exported once through `PHAssetResourceManager` and cached under
+  Application Support — the name says `video`, not `stream`, because a name that
+  promised a stream would invite a caller to expect one.
 - No face identity recognition. Never, for any reason.
 
 ### Vision capabilities deliberately not used
@@ -546,10 +782,11 @@ within-group ordering? If neither, it does not belong.
 
 ## 10. Known limitations
 
-- Ad-hoc signing means a rebuilt app may re-prompt for Photos permission. A Developer
+- Ad-hoc signing means a rebuilt app may re-prompt for Photos permission, and a
+  self-update installs a freshly signed bundle, so it does the same. A Developer
   ID signature would keep the grant stable; ad-hoc is what a dependency-free local
   build can do.
-- **The cache grows by ~144 MB** once FeaturePrints are computed, and there is **no
+- **The cache grows by ~90 MB** once FeaturePrints are computed, and there is **no
   eviction** (§6.4).
 - The ~30% of the library that is cloud-only can be neither grouped nor
   face-analysed until iCloud downloads are enabled, so the group list covers a minority
@@ -574,8 +811,53 @@ within-group ordering? If neither, it does not belong.
 - Deletion speed depends on iCloud. Removing cloud-only originals is slow and syncs to
   every device, and a large batch can make Photos show progress UI. This is an observed
   effect of the platform, not suppressible through any public API.
+- **A clip in HEVC does not play in Chrome.** The export is
+  `AVAssetExportPresetPassthrough` — no re-encode, so it is fast, lossless and keeps
+  whatever codec Photos holds, which on any iPhone-shot library since 2017 is HEVC in
+  a `.mov`. Safari and `WKWebView` play that; Chrome does not, and shows a broken
+  player. Accepted: the shipped presentation *is* `WKWebView`, so the only affected
+  user is somebody who has deliberately opened PhotoCleaner in their own browser and
+  who has a HEVC clip. The alternative — transcoding to H.264 on a click — means
+  re-encoding up to 4 GB on the request path, for a browser that is not the product.
+  **What it would take to measure the cost**: time `AVAssetExportSession` for one
+  known 4K clip at `AVAssetExportPresetHighestQuality`, on the same machine, and
+  compare it against the passthrough export of the same file.
+- **The clip export cache is bounded, and the bound is a guess.** Under Application
+  Support, evicted least-recently-used-first until the directory is under **2 GB and
+  32 files**, whichever bites first; every eviction is logged. The bound exists because
+  an unbounded video cache on a 53k-asset library is a disk-fill bug, but the numbers
+  are not measured: they were chosen to hold "a handful of clips you are actually
+  reviewing" without becoming the largest thing the app writes. **What it would take
+  to measure it**: record the mean and p95 export size and the viewing cadence over a
+  real review session, and set the bound from the distribution rather than from taste.
+  A cache miss only costs a re-export from Photos, so a bound that is too small is a
+  performance annoyance rather than a correctness problem — which is why it can be
+  tuned later without a migration.
+- **The export cache is keyed on the identifier alone, and is not invalidated on
+  modification.** A clip edited in Photos keeps serving the bytes exported before the
+  edit until its entry is evicted, and `evict(identifier:)` is called from deletion
+  only, so the file outlives a modification. What it would take to fix: include the
+  modification date in the cache filename, which the `assets` row already carries, so
+  an edited clip simply misses and re-exports. This was left alone because it is a
+  narrow case with a bounded cost — an extra export — against a change to the cache's
+  key format.
 - A scan is not a consistent snapshot: the library can mutate mid-enumeration. That is
   handled, but not prevented.
+- **Self-update cannot install everything.** `UpdateTarget.plan` refuses a bundle that
+  is not an `.app`, one running from a mounted disk image (the write would vanish on
+  eject, whatever the volume's own flag says), and one in a folder this process cannot
+  write — which includes `/Applications` on a Mac where it needs authentication. Each
+  refusal is reported in the title bar's arc rather than discovered after a 15 MB
+  download.
+- **Self-update replaces the running bundle.** There is no way to launch the new copy
+  from inside the process that is about to be replaced, so the install schedules a
+  relaunch against the old pid and exits. The outgoing bundle is moved aside first and
+  put back if the swap cannot be verified, so a failed update leaves the previous
+  version installed rather than no app at all.
+- The updater downloads over HTTPS from one exact feed — this repository's
+  `releases/latest` — and refuses any asset URL whose scheme is not `https`.
+  `smoke-test.sh` holds the binary to that one URL, so a second outbound host cannot
+  be introduced quietly.
 
 ---
 
@@ -584,18 +866,27 @@ within-group ordering? If neither, it does not belong.
 There is no Xcode project and no test framework dependency — the suite is a plain
 executable, because SwiftPM does not work here.
 
-1. **`./run-tests.sh`** — the regression suite. Currently **210 assertions, 0 failing**
-   (~6 s), covering selection resolution, the count contract, fail-closed favourites,
-   keyset pagination over tied values, the analysis state machine, HTTP parsing and
-   single-response latching, timeline ordering, confirm tokens, albums, similar groups,
-   schema migration, the Photos authorization gate, and the window's launch-flag
-   parsing, shutdown relay and navigation policy. It needs no Photos library and no
-   network.
+1. **`./run-tests.sh`** — the regression suite, over the production sources compiled
+   unmodified. `./run-tests.sh --list` prints how many cases are registered; the run
+   itself reports pass, fail and known-bug counts. It covers selection resolution,
+   the count contract, favourite protection, keyset pagination over tied values, the
+   analysis state machine, HTTP parsing and single-response latching, timeline
+   ordering, confirm tokens, albums, similar groups, schema migration, the Photos
+   authorization gate, self-update, the icon, and the window's launch-flag parsing,
+   shutdown relay and navigation policy. It needs no Photos library and no network.
 2. **`./build.sh`** — compiles with `-warnings-as-errors` and assembles the bundle.
 3. **`./smoke-test.sh`** — audits the real cache and, importantly, **what the app has
    written outside Application Support and Logs**. The windowed app is allowed exactly
-   one preferences key; anything else fails the run.
-4. **Against the real library**, for anything structural that needs real PhotoKit or
+   one preferences key; anything else fails the run. It also greps `web/` for the
+   phrases a removed control would leave behind, so a control *returning* fails the run
+   even in a build where nobody opens the panel — see the note on paired absence and
+   presence checks below.
+4. **`node tools/web-ui-tests.mjs <url>`** — the `web/` half, driven in jsdom against a
+   running server. Not wired into CI; see [WEB-UI-TESTS.md](WEB-UI-TESTS.md) for how
+   to run it and the five things jsdom does not have. **A change to `web/` needs this
+   suite too** — `run-tests.sh` compiles `web/` into the binary but asserts nothing
+   about how it behaves.
+5. **Against the real library**, for anything structural that needs real PhotoKit or
    Vision behaviour.
 
 Set `PHOTOCLEANER_SLOW_TESTS=1` to include the cases that wait on production
@@ -606,6 +897,18 @@ timeouts.
 load-bearing by reverting the guarantee in a scratch tree and watching it fail. Tests
 that have never failed prove nothing.
 
+**An absence check is satisfied by deleting the information.** This is the failure
+mode of every check phrased as "X must not appear" — including the grep in
+`smoke-test.sh` that keeps the favourite-protection control out of `web/`. Removing a
+control and *relocating* what it said looks identical to removing it and losing the
+sentence, and the absence check passes either way. So each one is paired with the
+presence half of the same claim: the greps that assert `protectFavorites` and
+`protectedCount` are gone are paired with one asserting `"protected from deletion"` is
+still in `web/app.js`, and the jsdom case that finds no switch is paired with one
+asserting a favourite's heart and accessible name still say they are protected. Keep
+them together — deleting the presence half turns the pair back into a check that
+rewards silence.
+
 ---
 
 ## 12. Commands
@@ -614,16 +917,30 @@ that have never failed prove nothing.
 ./build.sh                       # compile + bundle + draw icon + ad-hoc sign
 ./run-tests.sh                   # full suite
 ./run-tests.sh --list            # how many cases are registered
-./run-tests.sh --only groups     # one suite
+./run-tests.sh --only "group album filter"   # one suite, matched as a substring
 ./run-tests.sh --strict          # also fail on known-bug cases
+PHOTOCLEANER_SLOW_TESTS=1 ./run-tests.sh      # include the cases that wait on real timers
 ./smoke-test.sh                  # real-cache and filesystem audit
+./smoke-test.sh --no-server      # what CI runs: no instance to inspect
+
+./make-dmg.sh --version 1.2.3    # build, package and verify the DMG
+./make-dmg.sh --version 1.2.3 --no-build       # package what is already in dist/
+./make-dmg.sh --arch x86_64 --version 1.2.3    # an Intel DMG
+
+node tools/web-ui-tests.mjs http://127.0.0.1:8791   # the web/ client, in jsdom
 
 ./photo-cleaner                  # build if needed, start, show the window
 ./photo-cleaner --foreground     # logs to this terminal
 ./photo-cleaner --browser        # the default browser instead of the window
 ./photo-cleaner --no-browser     # no interface at all; just the server
 ./photo-cleaner --port 8766      # a different loopback port
+./photo-cleaner --version        # the version stamped into this build
 
 lsof -nP -iTCP:8765 -sTCP:LISTEN # confirm the loopback-only binding
+sqlite3 -readonly ~/Library/Application\ Support/PhotoCleaner/cache.sqlite "PRAGMA user_version;"
 rm -rf ~/Library/Application\ Support/PhotoCleaner ~/Library/Logs/PhotoCleaner
 ```
+
+`--only` matches a suite name as a case-insensitive substring, so it selects by what
+a suite is called rather than by what it contains: `--only group` runs every group
+suite, `--only timeline` the All Photos one.

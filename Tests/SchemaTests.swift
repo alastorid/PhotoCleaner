@@ -138,4 +138,74 @@ func registerSchemaTests() {
         checkEqual(try await upgraded.cache.signalCounts().featurePrints, 1,
                    "and the stored vector is counted as one")
     })
+
+    Registry.shared.add(suite: suite, TestCase(name: "a version 3 cache gains the group settings it did not record",
+        knownBug: nil) {
+        // Version 4 is the one step that alters an existing table rather than
+        // creating a new one, so it is the step whose failure mode is different: a
+        // migration that dropped the table to reshape it would take every stored
+        // group with it, and a migration that forgot to stamp the version would
+        // leave the next launch believing the cache predates the columns.
+        //
+        // The fixture therefore reproduces a version 3 database *shaped* like one —
+        // the table rebuilt with its version 3 columns, a group in it, the stamp
+        // behind — rather than merely claiming to be one, since a version 4 file
+        // with its version number edited would already have the columns.
+        let fixture = try await Fixture.make("schema-v3")
+        try await fixture.seed([
+            .init(id: "a1", score: 0.5, date: 100),
+            .init(id: "a2", score: 0.6, date: 101),
+        ])
+        try fixture.rewindSchemaToVersion3Groups()
+        checkEqual(try fixture.columnNames(of: "similar_groups").contains("face_weight"), false,
+                   "the fixture really is missing the version 4 columns")
+
+        let upgraded = try await Fixture.reopen(fixture)
+        checkEqual(try await upgraded.cache.schemaUserVersion(), CacheStore.schemaVersion,
+                   "the upgrade advances the stamp")
+
+        // The columns exist…
+        let columns = try upgraded.columnNames(of: "similar_groups")
+        for column in ["face_weight", "minimum_face_area", "maximum_group_size"] {
+            check(columns.contains(column), "\(column) is added by the migration")
+        }
+        // …and the groups an older build stored are still there, with the settings
+        // that build *did* record intact. "Not recorded" is not "recorded as
+        // current", so the three new columns stay null and the pass reads back as
+        // unrecorded rather than as current.
+        let groups = try await upgraded.cache.groupSummaries(limit: 10, offset: 0)
+        checkSetEqual(groups.groups.map(\.id), ["a1"], "the stored group survives the upgrade")
+        checkEqual(groups.groups.first?.memberCount, 2, "with its membership intact")
+        checkNil(try await upgraded.cache.newestGroupPass(),
+                 "and a pass with no recorded settings is reported as unrecorded, not as current")
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "the group settings a pass recorded survive a re-open",
+        knownBug: nil) {
+        // The point of version 4: "built with different rules" has to outlive the
+        // process that built them, or a settings change followed by a quit leaves
+        // stale groups being reported as current.
+        let fixture = try await Fixture.make("schema-v4-settings")
+        try await fixture.seed([
+            .init(id: "a1", score: 0.5, date: 100),
+            .init(id: "a2", score: 0.6, date: 101),
+        ])
+        var config = SimilarGroupSettings.default
+        config.maxDistance = 0.42
+        config.faceWeight = 0.25
+        config.minimumFaceAreaFraction = 0.02
+        config.maximumGroupSize = 17
+        try await fixture.cache.replaceGroups([SimilarGroup(id: "a1", members: ["a1", "a2"])],
+                                              settings: config, faceMemberCounts: [:], earliestDates: [:])
+        let stored = checkNotNil(try await fixture.cache.newestGroupPass(), "the pass reads back")
+        checkEqual(stored?.settings, config.validated(), "every setting comes back as it was applied")
+
+        // And it is still there for a *different* connection over the same file,
+        // which is what a relaunch is.
+        let reopened = try await Fixture.reopen(fixture)
+        checkEqual(try await reopened.cache.newestGroupPass()?.settings, config.validated(),
+                   "a re-opened cache still says which rules produced its groups")
+        check((try await reopened.cache.newestGroupPass()?.builtAt.timeIntervalSince1970 ?? 0) > 0,
+               "and when the pass ran")
+    })
 }

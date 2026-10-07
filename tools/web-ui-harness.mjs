@@ -14,9 +14,10 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-// jsdom is a developer dependency of this harness only. It is resolved from
-// NODE_PATH rather than a local install so the app's own tree stays free of it,
-// and the harness is not part of anything that ships.
+// jsdom is a developer dependency of this harness, declared in package.json and
+// fetched by `npm install` — never vendored, and the harness ships in nothing.
+// `JSDOM_PATH` still overrides the resolution, so a checkout with no install can
+// point at an entry point resolved anywhere else.
 const { JSDOM, VirtualConsole } = await import(
   process.env.JSDOM_PATH || 'jsdom'
 );
@@ -25,12 +26,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const web = join(here, '..', 'web');
 let base = process.argv[2] || 'http://127.0.0.1:8791';
 
-const errors = [];
-
 /** The harness surface the tests use. */
 export async function openApp(options = {}) {
   base = options.base || base;
   const html = readFileSync(join(web, 'index.html'), 'utf8');
+  // Per window, not per module: a harness that collects into one shared list makes
+  // every later `openApp` fail its "booted cleanly" check on an error a previous
+  // window already logged, which is a failure in the test rather than in the client.
+  const errors = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on('jsdomError', (error) => errors.push(error));
   virtualConsole.on('error', (...args) => errors.push(new Error(args.join(' '))));
@@ -97,7 +100,7 @@ export async function openApp(options = {}) {
   }
   if (errors.length) {
     const first = errors[0];
-    throw new Error(`app.js failed to boot cleanly: ${first && (first.stack || first.message || first)}`);
+    throw new Error(`app.js failed to boot cleanly: ${first.stack || first.message || first}`);
   }
 
   // The client boots on DOMContentLoaded, which jsdom fires for `dangerously`
@@ -121,7 +124,7 @@ async function settled(window, timeout, errors) {
     if (window.document.querySelector('#grid .tile')) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  const first = errors && errors[0];
+  const first = errors[0];
   throw new Error(`the client never rendered a tile${first ? `: ${first.message || first}` : ''}`);
 }
 
@@ -138,11 +141,6 @@ class Harness {
       .map((tile) => tile.dataset.id);
   }
 
-  tileIdsIn(container) {
-    return [...this.window.document.querySelectorAll(`${container} .tile`)]
-      .map((tile) => tile.dataset.id);
-  }
-
   /** Presses a key on `target` (default: the document). */
   key(name, init = {}) {
     const event = new this.window.KeyboardEvent('keydown', {
@@ -150,12 +148,6 @@ class Harness {
     });
     (init.target ? this.$(init.target) : this.window.document).dispatchEvent(event);
     return event;
-  }
-
-  keyUp(name, init = {}) {
-    this.window.dispatchEvent(new this.window.KeyboardEvent('keyup', {
-      key: name, bubbles: true, cancelable: true, ...init,
-    }));
   }
 
   click(selector, init = {}) {

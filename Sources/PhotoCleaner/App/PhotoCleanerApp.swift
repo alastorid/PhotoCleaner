@@ -85,6 +85,18 @@ final class PhotoCleanerApp: Sendable {
         }
 
         let settings = Settings()
+        // The updater is built here rather than by the host because it needs the
+        // same `Settings` the rest of the graph uses, and it is handed over
+        // straight away. Every presentation mode gets one: `--no-browser` has no
+        // window to draw it in, but it can still find out there is a fix.
+        //
+        // Handed over *before* the server starts, not after. `requestAuthorization`
+        // below can put a system dialog in front of the user for as long as they
+        // take to answer it, and the menu's "Check for Updates Automatically"
+        // checkmark is a setting read from `settings.json` — the one thing about
+        // the updater a user can see before the window even exists.
+        let updater = Updater(settings: settings)
+        await hooks.didBuild(updater)
         let bus = EventBus()
         let library = PhotoLibrary.shared
         let engine = AnalysisEngine(cache: cacheStore, library: library, settings: settings, bus: bus)
@@ -133,16 +145,11 @@ final class PhotoCleanerApp: Sendable {
         let signals = installSignalHandlers()
         hooks.shutdown.add { signals.trigger() }
 
-        // The updater is built here rather than by the host because it needs the
-        // same `Settings` the rest of the graph uses, and it is handed over
-        // afterwards. Every presentation mode gets one: `--no-browser` has no
-        // window to draw it in, but it can still find out there is a fix.
-        let updater = Updater(settings: settings)
-        await hooks.didBuild(updater)
-        // Detached, deliberately. This is the one thing in the launch sequence
-        // that must not be able to delay the window: the check is deferred a
-        // couple of seconds, needs no UI thread, and ends by `exit`ing on success.
-        // Nothing else here may wait on it.
+        // The updater was built above, with `settings`; what is left is the check
+        // itself. Detached, deliberately. This is the one thing in the launch
+        // sequence that must not be able to delay the window: the check is
+        // deferred a couple of seconds, needs no UI thread, and ends by `exit`ing
+        // on success. Nothing else here may wait on it.
         Task.detached(priority: .background) { [updater] in
             await updater.checkOnLaunch()
         }

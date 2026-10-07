@@ -1,0 +1,11 @@
+# Every tracked file is text and every tool that reads one expects LF: the shell
+# scripts and the `photo-cleaner` launcher have shebangs that a CRLF checkout
+# would break outright, and smoke-test.sh compares the bytes served for web/*
+# against the files on disk. macOS git does not convert by default, so this is
+# belt-and-braces for anyone who has core.autocrlf set or clones from Windows.
+* text=auto eol=lf
+
+# The one binary this tree can produce is not tracked, but a stray .icns or .dmg
+# in a working copy should not be diffed as text if one is ever committed.
+*.icns binary
+*.dmg binary

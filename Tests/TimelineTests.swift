@@ -255,15 +255,15 @@ func registerTimelineTests() {
         }
     })
 
-    Registry.shared.add(suite: suite, TestCase(name: "lo, hi, favorites and the retired utility cannot narrow the window",
+    Registry.shared.add(suite: suite, TestCase(name: "lo, hi, favorites and unknown parameters cannot narrow the window",
         knownBug: nil) {
         let fixture = try await Fixture.make("timeline-unfilterable")
         let base = TimelineDataset.seeds()
         // A favourite, the top-scoring row and the bottom-scoring row: each of them
         // would visibly disappear if the matching parameter were honoured instead of
-        // ignored. `utility` is in the hostile set below even though it is no longer a
-        // filter at all — a client predating its removal still sends it, and the window
-        // must be as unfilterable to it as to any other parameter.
+        // ignored. `utility` and `sort` are in the hostile set because a client may
+        // still send parameters this view has never honoured — the window must be as
+        // unfilterable to those as to any parameter it does read.
         let extras: [Fixture.Seed] = [
             .init(id: "x-fav", score: 0.5, date: 1000, favorite: true),
             .init(id: "x-high", score: 1.0, date: 1002),
@@ -272,7 +272,8 @@ func registerTimelineTests() {
         let seeds = base + extras
         try await fixture.seed(seeds)
 
-        let hostile: [String: String] = ["lo": "0.99", "hi": "1.0", "favorites": "only", "utility": "only"]
+        let hostile: [String: String] = ["lo": "0.99", "hi": "1.0", "favorites": "only",
+                                     "utility": "only", "sort": "date_asc", "album": "none"]
         let baseline = await fixture.router.reply(Req.get("/api/timeline/around", query: ["id": "d-020", "limit": "200"]))
         let filtered = await fixture.router.reply(Req.get("/api/timeline/around",
             query: ["id": "d-020", "limit": "200"].merging(hostile) { $1 }))

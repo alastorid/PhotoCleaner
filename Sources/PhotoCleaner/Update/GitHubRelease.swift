@@ -96,7 +96,9 @@ enum UpdateError: Error, Equatable, CustomStringConvertible {
             // Naming what *is* there is what makes this actionable: the usual
             // cause is that the release was cut for the other architecture.
             let list = offered.isEmpty ? "it has no files attached" : "it has \(offered.joined(separator: ", "))"
-            return "PhotoCleaner \(named.replacingOccurrences(of: ".dmg", with: "")) is not published for this Mac — \(list)."
+            // Suffix-stripped rather than prefix-and-suffix-matched, so a name
+            // that happens to contain `.dmg` twice loses exactly the extension.
+            return "PhotoCleaner \((named as NSString).deletingPathExtension) is not published for this Mac — \(list)."
         case .notSelfInstallable(let detail):
             return "This copy of PhotoCleaner cannot update itself: \(detail)."
         case .downloadFailed(let detail):

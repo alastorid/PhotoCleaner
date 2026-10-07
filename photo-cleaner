@@ -24,7 +24,8 @@ BINARY="$APP/Contents/MacOS/PhotoCleaner"
 PORT=8765
 # An explicit --foreground still wins over the environment variable.
 FOREGROUND="${PHOTOCLEANER_FOREGROUND:-0}"
-# --help/--version print and exit: they never need a build or a staleness note.
+# --help/--version print and exit: they skip the staleness note, because a
+# note about web/ being newer is noise in the middle of a version query.
 INFO_ONLY=0
 ARGS=()
 
@@ -61,13 +62,20 @@ while [ $# -gt 0 ]; do
                     exit 2
                     ;;
             esac
+            # Range-checked here, not left to the binary. The binary parses a
+            # UInt16 and silently keeps its default when that fails, so an
+            # out-of-range --port would launch on 8765 while this script waited
+            # for a listener on a port nothing ever bound.
+            if [ "$2" -lt 1 ] || [ "$2" -gt 65535 ]; then
+                echo "photo-cleaner: --port must be between 1 and 65535" >&2
+                exit 2
+            fi
             PORT="$2"
             ARGS+=("--port" "$PORT")
             shift 2
             ;;
         --help|-h|--version|-v)
-            # Handled entirely by the binary; run it in the foreground.
-            FOREGROUND=1
+            # Handled entirely by the binary, in the foreground.
             INFO_ONLY=1
             ARGS+=("$1")
             shift
@@ -79,14 +87,17 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ "$INFO_ONLY" = "1" ]; then
-    exec "$BINARY" ${ARGS[@]+"${ARGS[@]}"}
-fi
-
 if [ ! -x "$BINARY" ] || [ ! -f "$APP/Contents/Info.plist" ]; then
     echo "PhotoCleaner is not built yet — building now."
     "$ROOT/build.sh"
     echo
+fi
+
+# After the build, so `--version` works on a fresh checkout: the version lives in
+# the bundle's own Info.plist, and a binary that is not there has no version to
+# report.
+if [ "$INFO_ONLY" = "1" ]; then
+    exec "$BINARY" ${ARGS[@]+"${ARGS[@]}"}
 fi
 
 # A rebuild is never implicit: `open`ing an old binary would silently serve the

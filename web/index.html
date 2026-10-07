@@ -35,7 +35,17 @@
 
   <div class="app-summary" id="librarySummary">
     <span class="summary-total" id="headerTotal">—</span>
-    <span class="summary-label">photos</span>
+    <span class="summary-label" id="headerTotalLabel">assets</span>
+    <!-- Clips are broken out rather than folded into the total silently: on a
+         library with no videos this reads as absent rather than as "0", and a
+         Videos filter that returns nothing is then explicable instead of
+         mysterious. Reported by the server, not inferred by subtraction — a
+         subtraction could not tell "no videos" from "not scanned yet". -->
+    <span class="summary-clips" id="headerVideosWrap" hidden>
+      <span class="summary-sep">·</span>
+      <span class="summary-total" id="headerVideos">0</span>
+      <span class="summary-label">videos</span>
+    </span>
     <span class="summary-sep">·</span>
     <span class="summary-total" id="headerAnalyzed">—</span>
     <span class="summary-label">analyzed</span>
@@ -58,7 +68,7 @@
     <div class="range-readout">
       <span class="inequality"><span id="lowerReadout">—</span> ≤ SCORE ≤ <span id="upperReadout">—</span></span>
       <span class="sep">·</span>
-      <span><strong id="matchCount">0</strong> matching photos</span>
+      <span><strong id="matchCount">0</strong> matching <span id="matchCountNoun">assets</span></span>
       <span class="sep">·</span>
       <span class="muted"><span id="analyzedCount">0</span> analyzed / <span id="totalCount">0</span> total</span>
       <span class="sep" id="problemSeparator" hidden>·</span>
@@ -111,27 +121,43 @@
 
   <div class="controls-row">
     <div class="toggle-group">
-      <label class="check" id="protectFavoritesOption"><input type="checkbox" id="protectFavorites" checked> Protect Favorites</label>
-      <!-- The protected count, stated next to the switch that decides whether
-           favourites are protected at all. "Protected" means exactly one thing
-           here: excluded from bulk deletion, unless the deletion explicitly
-           overrides it. The switch's own tooltip carries the same sentence, since
-           the count is what a reader hovers the *switch* about — "is turning this
-           on going to protect anything?" — and `aria-describedby` points the
-           checkbox's description at the count, so it is not hover-only. The heart is
-           decorative: it names nothing the sentence does not already say, and it is the
-           one glyph the favourite flag wears anywhere in the app. -->
-      <span class="protected-count" id="protectedCountWrap">
-        <span aria-hidden="true">♥</span> <span id="protectedCount">—</span> protected from deletion
-      </span>
-      <label class="check is-disabled" title="PhotoCleaner version 1 analyzes still photos. Video support is planned.">
-        <input type="checkbox" checked disabled> Images only
-      </label>
+      <!-- Favourite protection used to be a switch here, with a "♥ 113 protected
+           from deletion" count beside it. There is nothing to switch any more:
+           excluding favourites from bulk deletion is not a preference a user can
+           weaken, so it is not offered. What the switch and the count used to
+           announce on demand is now stated where the favourite is actually acted on
+           — the heart's tooltip, the tile's accessible name, and the lightbox's
+           favourite button — so the guarantee travels with the photo it is about
+           rather than sitting in the control panel describing photos you cannot
+           see. -->
       <label class="check"><input type="checkbox" id="icloudDownloads"> Download from iCloud when required</label>
       <button class="ghost" id="rescanButton" title="Re-read the Photos library and score anything new">Rescan library</button>
       <button class="ghost" id="retryButton" title="Re-queue assets whose analysis failed">Retry failures</button>
       <button class="ghost" id="groupsButton"
               title="Browse photos that are alternate captures of the same shot">Similar Groups…</button>
+    </div>
+
+    <!-- Media, beside Sort and not inside the album row: all three are filters on
+         the same grid, and Sort stays last and furthest right because it is the one
+         that changes no membership. The three chips are `.chip` and nothing else —
+         the same class, the same padding, the same selected state — so a reader who
+         has learned the sort chips already knows what a pressed one looks like.
+
+         This control replaced a *disabled* checkbox reading "Images only", whose
+         tooltip said video support was planned. That was a control that could not
+         be operated and stated a falsehood about what the app does, which is worse
+         than no control: a reader who believed it would think videos were being
+         held back on purpose. Videos are scored assets now, they are in this grid,
+         and "All" is the honest default.
+
+         Unlike the album chips there is nothing to clear. Clicking the pressed chip
+         again keeps it, because "All" is a real bucket rather than the absence of a
+         filter, so the clearable affordance would have nothing to mean. -->
+    <div class="media-group" id="mediaChips" role="group" aria-label="Filter by media type">
+      <span class="control-label">Media</span>
+      <button class="chip" data-media="all">All</button>
+      <button class="chip" data-media="images">Photos</button>
+      <button class="chip" data-media="videos">Videos</button>
     </div>
 
     <div class="sort-group">
@@ -146,12 +172,12 @@
 
 <!-- Similar Groups: photos that are alternate captures of approximately the same
      shot, each group ordered either by Apple's aesthetics score or by Best Shot
-     (PhotoCleaner's within-group ranking). Opened from the control panel; the score
-     grid below is hidden while it is open and restored on the way back. -->
-<!-- Similar Groups. The bar's own two lines are addressed by id because the view
-     has two modes: the whole list, and one group opened for a specific photo by
-     "Show Similar Photos". Same browser, same sort control, different heading —
-     and the heading is what tells the user which of the two they are looking at. -->
+     (PhotoCleaner's within-group ranking). Opened from the control panel, or for a
+     single photo by "Show Similar Photos", which is the same browser with the list
+     taken away — so the bar's own two lines are addressed by id and are the only
+     thing that differs: the heading is what tells the user which of the two they
+     are looking at. The score grid below is hidden while it is open and restored on
+     the way back. -->
 <section class="groups-bar" id="groupsBar" hidden>
   <button class="ghost" id="groupsBack" title="Back to the grid (Esc)">← Back</button>
   <div class="groups-titles">
@@ -177,10 +203,11 @@
        sentinel cannot go backwards either. Two sentinels bracketing the list fix
        both: scrolling to either end pulls the next page in that direction.
 
-       They are margins rather than zero-height rules, so `rootMargin` can start
-       the fetch *before* the edge is reached and the strip never visibly stalls.
-       They carry no text of their own — the loading state is the row above the
-       list, which is one message for both ends. -->
+       They are hairlines rather than nothing, so the observer has a box to
+       measure, and their `rootMargin` starts the fetch *before* the edge is
+       reached so the strip never visibly stalls. They carry no text of their own
+       — the loading state is the row below the list, which is one message for
+       both ends. -->
   <div class="groups-sentinel" id="groupsSentinelTop" aria-hidden="true"></div>
   <div id="groupsList"></div>
   <div class="groups-sentinel" id="groupsSentinelBottom" aria-hidden="true"></div>
@@ -256,6 +283,20 @@
       <button class="lightbox-nav prev" id="lightboxPrev" title="Previous (←)">‹</button>
       <button class="lightbox-nav next" id="lightboxNext" title="Next (→)">›</button>
       <img id="lightboxImage" alt="">
+      <!-- The clip. A `<video>` rather than a second `<img>` because a clip is not a
+           photograph of one of its moments: it has to be *played*, and the only way
+           to play it in a window that has no business spawning QuickTime is to put
+           the element on the stage. Both live in the markup and exactly one is
+           shown, because the stage's box, the travelling copy's geometry and the
+           return flight all read a stable element that never has to be found again.
+
+           `preload="metadata"` and no `autoplay`, both load-bearing. The client
+           never calls `play()`: paging through a grid of clips and having each one
+           start making noise is not a photo cleaner, and a clip the user is only
+           *looking* at should not pull a whole export off the disk. `controls` so
+           playback and seeking are the platform's, which is why a click on the
+           scrub bar must not page the overlay — see the stage's click handler. -->
+      <video id="lightboxVideo" controls preload="metadata" playsinline hidden></video>
       <div class="lightbox-fallback" id="lightboxFallback" hidden>Preview unavailable — the original is not on this Mac.</div>
     </div>
     <div class="lightbox-meta">
@@ -263,6 +304,12 @@
       <dl>
         <div><dt>Date</dt><dd id="lightboxDate">—</dd></div>
         <div><dt>Dimensions</dt><dd id="lightboxDimensions">—</dd></div>
+        <!-- Length, for a clip only. Hidden rather than showing "—" on a
+             photograph, because a row that is present and empty is a field
+             PhotoCleaner failed to fill rather than one that does not apply. A
+             clip whose length has not been scanned prints nothing at all for the
+             reason the tile badge does. -->
+        <div id="lightboxDurationRow" hidden><dt>Length</dt><dd id="lightboxDuration">—</dd></div>
         <div><dt>Favorite</dt><dd id="lightboxFavorite">—</dd></div>
         <!-- Album names, as clickable chips: clicking one filters the grid to that
              album. Built by JS because the set comes from PhotoKit. A photo can be
@@ -278,9 +325,9 @@
         <button class="chip" id="lightboxSimilarPhotos">Show Similar Photos</button>
         <button class="chip" id="lightboxSelect">Select (Space)</button>
         <!-- The favourite toggle, in the same heart the tiles use: one glyph for one
-             flag, everywhere. Favourite *means* "excluded from bulk deletion"
-             while Protect Favorites is on — that is the one protection this tool
-             has — so the button says so rather than offering a vague "protect". -->
+             flag, everywhere. Favourite *means* "excluded from bulk deletion" —
+             that is the one protection this tool has, and it is unconditional — so
+             the button says so rather than offering a vague "protect". -->
         <button class="chip" id="lightboxFavoriteToggle" aria-pressed="false">♥ Favourite</button>
         <!-- Destroys the photo on screen. One photo, one press, and the same
              function the bar's button and the tile menu's item call. -->

@@ -95,6 +95,131 @@ struct VisionAnalyzer: Sendable {
         return (result, encoded)
     }
 
+    /// Scores one asset's frames and returns its score, plus a FeaturePrint when
+    /// — and only when — the subject was a single image.
+    ///
+    /// `PhotoLibrary.framesForAnalysis` hands over one frame for a still and one
+    /// to three for a clip, and these two rules are why a clip is *not* simply
+    /// scored like a photo.
+    ///
+    /// ## Why the median, and not the mean
+    ///
+    /// A clip is sampled because it is not one picture, and the samples are
+    /// sampled at fixed fractions of a timeline the tool did not choose. That
+    /// guarantees some samples are of moments that are not the photograph anyone
+    /// would have kept: a black or blue leader at the head, a fade to black at
+    /// the tail, a blown window when the camera auto-exposes for a dark room, a
+    /// frame where the operator's thumb is across the lens. Those frames are not
+    /// unusual — they are *expected*, and they are exactly the ones a mean lets
+    /// decide the answer. With three samples the median ignores one outlier by
+    /// construction: two good frames outvote a bad one, and a bad frame can move
+    /// the score not at all. A mean would let one black frame pull a good clip's
+    /// score down by a third, and because the grid sorts by this number, "one clip
+    /// in a hundred scored terribly" would read as "one clip in a hundred is
+    /// terrible".
+    ///
+    /// The mean was rejected rather than tuned (trimmed, winsorised): a trimmed
+    /// mean needs a rule for how many samples to discard, and the rule has to be
+    /// decided before anything is measured. The median needs none — for three
+    /// samples it *is* the trimmed mean with the trim chosen by the data.
+    ///
+    /// For an even count — two samples, which a clip short enough to clamp its
+    /// moments together produces — there is no majority, so the midpoint of the
+    /// two is returned. That is the weakest statement the median rule can make, and
+    /// it is the honest one: with two samples a bad frame can shift the result,
+    /// and dropping one of them instead would mean choosing arbitrarily *which*
+    /// frame to believe. The alternative of always scoring the middle moment was
+    /// rejected because it throws away information for a rule that only holds when
+    /// nothing is wrong.
+    ///
+    /// ## Why no FeaturePrint for a clip
+    ///
+    /// Similar Groups answers one question: "are these alternate captures of the
+    /// same shot?" A FeaturePrint taken from one arbitrary frame of a clip claims
+    /// something stronger and untrue — that the clip *is* that photograph. A clip
+    /// pans away from the very thing the still shows, so the frame is a moment of
+    /// the scene rather than the scene, and it will match a still that resembles
+    /// that moment.
+    ///
+    /// It would also silently change what a distance *means*. `maxDistance` and the
+    /// capture window were both calibrated on stills, against bursts and retakes,
+    /// and admitting clip-frames into the same comparison would move what a given
+    /// distance signifies for **every existing group**, with no signal that
+    /// anything changed. A FeaturePrint failure is a quiet degradation; a
+    /// recalibration that quietly changes every group is not, and there is no way
+    /// to tell the two apart from inside the feature.
+    ///
+    /// So videos score, browse, play, favourite and delete, and they do not group.
+    /// This is deliberate, not an oversight — the same decision is enforced at the
+    /// other end in `CacheStore.refreshFeaturePrintQueue`, so a video cannot be
+    /// given a vector by the backfill pass either.
+    ///
+    /// A single frame — a still, or a clip so short that its moments collapse onto
+    /// one — takes the measured `analyzeWithFeaturePrint` path unchanged, including
+    /// running the two models concurrently and treating a FeaturePrint failure as
+    /// a missing vector rather than a failed asset. Exactly one frame is the only
+    /// case where the clip *is* the frame.
+    ///
+    /// ## On failing
+    ///
+    /// Frames are scored concurrently, because they are independent models over
+    /// pixels already decoded and the three passes overlap. Individual frame
+    /// failures are tolerated while at least one frame scored: a clip whose middle
+    /// moment is unreadable still gets a score from the two that are, and the
+    /// caller learns how many samples the median was taken over from how many
+    /// FeaturePrints it did *not* get — a two-sample median is a weaker claim than
+    /// a three-sample one, and hiding that would be worse than either. Only when
+    /// every frame failed is the error rethrown, so a genuinely unanalysable asset
+    /// is still reported and the scan is not quietly advancing over it.
+    func analyzeFrames(_ frames: [CGImage]) async throws -> (AestheticsResult, Data?) {
+        guard let first = frames.first else {
+            // Unreachable from `framesForAnalysis`, which documents that it never
+            // returns an empty array. Guarded anyway: a median of nothing is not a
+            // number, and returning `score: 0` for an asset nothing was read from
+            // would put a photo at the bottom of the grid that was never looked at.
+            throw VisionAnalyzerError.noObservation("no frames were supplied to analyse")
+        }
+        guard frames.count > 1 else { return try await analyzeWithFeaturePrint(first) }
+
+        let scores = await withTaskGroup(of: Float?.self) { group in
+            for frame in frames {
+                group.addTask { [self] in
+                    // Cancellation propagates through the group's own checks; a
+                    // cancelled run must not be scored on the frames that did
+                    // finish.
+                    if Task.isCancelled { return nil }
+                    return try? await analyze(frame).score
+                }
+            }
+            var collected: [Float] = []
+            for await score in group {
+                if let score { collected.append(score) }
+            }
+            return collected
+        }
+        guard !scores.isEmpty else {
+            throw VisionAnalyzerError.noObservation("every frame of the clip failed to analyse")
+        }
+        if scores.count < frames.count {
+            Log.warn("scored \(scores.count) of \(frames.count) frames; the median is taken over \(scores.count)")
+        }
+        // No FeaturePrint: see above.
+        return (AestheticsResult(score: Self.median(of: scores)), nil)
+    }
+
+    /// The median of `values`, ascending. Odd counts take the middle value; even
+    /// counts take the midpoint of the two middle values.
+    ///
+    /// Not in place and not order-independent by accident: `sorted()` on three
+    /// `Float`s is cheaper than any of the alternatives and the caller keeps its
+    /// own array.
+    static func median(of values: [Float]) -> Float {
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count % 2 == 1 { return sorted[middle] }
+        return (sorted[middle - 1] + sorted[middle]) / 2
+    }
+
     /// Apple's FeaturePrint for one image, used **only** to decide whether two
     /// photos are alternate captures of the same shot.
     ///

@@ -134,18 +134,134 @@ final class Fixture: @unchecked Sendable {
         try RawSQL.exec(cachePath, "PRAGMA user_version = \(version);")
     }
 
+    /// Rebuilds `similar_groups` with the columns schema version 3 had.
+    ///
+    /// Version 4 is the only step that alters a table rather than creating one, so
+    /// rewinding by *dropping* a table is the wrong tool for it: the version 3 shape
+    /// is the same table minus three columns, and SQLite has no portable way to
+    /// subtract a column. Rebuilding it is faithful — a foreign key is off on the
+    /// `RawSQL` handle by default, so the member rows and the group rows an older
+    /// build wrote are exactly what gets left behind.
+    func rewindSchemaToVersion3Groups() throws {
+        try RawSQL.exec(cachePath, """
+        DROP TABLE IF EXISTS similar_groups;
+        CREATE TABLE similar_groups (
+            group_id            TEXT PRIMARY KEY,
+            member_count        INTEGER NOT NULL DEFAULT 0,
+            face_member_count   INTEGER NOT NULL DEFAULT 0,
+            earliest_date       REAL,
+            window_seconds      REAL,
+            max_distance        REAL,
+            ranked_at           REAL,
+            built_at            REAL
+        );
+        INSERT INTO similar_groups VALUES ('a1', 2, 0, 100, 120, 0.35, NULL, 1700000000);
+        PRAGMA user_version = 3;
+        """)
+    }
+
+    /// Rebuilds `assets` with the columns schema version 4 had.
+    ///
+    /// Version 5 is the other step that alters a table rather than creating one, so
+    /// rewinding it by *dropping* the table is the wrong tool: the version 4 shape is
+    /// the same table minus one column, and SQLite has no `ALTER TABLE … DROP
+    /// COLUMN` that is safe to reach for in a fixture. Rebuilding it is faithful —
+    /// copy every column into the older shape, drop, rename.
+    ///
+    /// `PRAGMA foreign_keys = OFF` first, because `asset_signals`,
+    /// `asset_albums` and `featureprint_queue` all reference `assets` and the drop
+    /// would otherwise be refused (or, worse, cascade away the rows an older build
+    /// had legitimately written). The pragma is a no-op inside a transaction and
+    /// SQLite defaults it to off anyway, so this is stating the assumption rather
+    /// than changing it. Their rows are left exactly as they were — a version 4 cache
+    /// had album membership *and* a one-column-narrower `assets`, and the migration
+    /// must cope with that combination rather than with an empty table.
+    ///
+    /// The indexes on `assets` go with the dropped table and are recreated by
+    /// `migrate()`, which is why the cases assert behaviour through `CacheStore`
+    /// rather than by reading the index list.
+    func rewindSchemaToVersion4Assets() throws {
+        try RawSQL.exec(cachePath, """
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE assets_v4 (
+            asset_identifier  TEXT PRIMARY KEY,
+            media_type        INTEGER NOT NULL DEFAULT 1,
+            creation_date     REAL,
+            modification_date REAL,
+            width             INTEGER NOT NULL DEFAULT 0,
+            height            INTEGER NOT NULL DEFAULT 0,
+            favorite          INTEGER NOT NULL DEFAULT 0,
+            media_subtype     INTEGER NOT NULL DEFAULT 0,
+            is_screenshot     INTEGER NOT NULL DEFAULT 0,
+            aesthetics_score  REAL,
+            analysis_state    TEXT NOT NULL DEFAULT 'pending',
+            attempts          INTEGER NOT NULL DEFAULT 0,
+            last_error        TEXT,
+            scored_at         REAL,
+            scan_marker       INTEGER NOT NULL DEFAULT 0,
+            analyzer_version  INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO assets_v4 SELECT asset_identifier, media_type, creation_date,
+            modification_date, width, height, favorite, media_subtype, is_screenshot,
+            aesthetics_score, analysis_state, attempts, last_error, scored_at,
+            scan_marker, analyzer_version FROM assets;
+        DROP TABLE assets;
+        ALTER TABLE assets_v4 RENAME TO assets;
+        PRAGMA user_version = 4;
+        """)
+    }
+
+    /// Identifiers of assets still waiting to be scored, restricted to one media
+    /// type, newest first — the order `CacheStore.claimJobs` claims in.
+    ///
+    /// Written out as its own query rather than reusing `claimJobs` with a filter,
+    /// because the claim under test is that `claimJobs` *does* hand over media type 2
+    /// and a photos-only predicate would not have: reading the pending set under each
+    /// media type is what shows the two disagreeing. Claiming to compare would consume
+    /// the rows it was comparing.
+    func pendingIdentifiers(mediaType: Int) throws -> [String] {
+        try query("SELECT asset_identifier FROM assets WHERE analysis_state = 'pending' "
+                  + "AND media_type = ? ORDER BY creation_date DESC, asset_identifier ASC;") { statement in
+            RawSQL.bind(statement, 1, String(mediaType))
+            var identifiers: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let identifier = RawSQL.string(statement, 0) { identifiers.append(identifier) }
+            }
+            return identifiers
+        }
+    }
+
+    /// How many rows a table holds, for a fixture that rebuilt one.
+    ///
+    /// A rebuild that silently dropped every row would leave an upgrade case
+    /// asserting that nothing was lost — which is true, and vacuous.
+    func rowCount(of table: String) throws -> Int {
+        try query("SELECT COUNT(*) FROM \(table);") { statement in
+            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+            return Int(sqlite3_column_int(statement, 0))
+        }
+    }
+
+    /// The column names of a table in the temporary test database.
+    func columnNames(of table: String) throws -> [String] {
+        try query("PRAGMA table_info(\(table));") { statement in
+            var names: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let name = RawSQL.string(statement, 1) { names.append(name) }
+            }
+            return names
+        }
+    }
+
     /// The tables schema 2 and 3 added, i.e. everything a version 1 database lacks.
     static let postV1Tables = [
         "similar_group_members", "similar_groups", "featureprint_queue",
         "asset_albums", "albums",
     ]
 
-    static func make(_ label: String = "fixture", protectFavorites: Bool = true) async throws -> Fixture {
+    static func make(_ label: String = "fixture") async throws -> Fixture {
         let fixture = try Fixture(label: label)
         try await fixture.cache.migrate()
-        // `protectFavorites` defaults to true in production, so make it explicit
-        // rather than relying on the absence of a settings file.
-        fixture.settings.update { $0.protectFavorites = protectFavorites }
         return fixture
     }
 
@@ -175,6 +291,14 @@ final class Fixture: @unchecked Sendable {
         var state: AnalysisState = .done
         var width = 4032
         var height = 3024
+        /// 1 = still, 2 = video — `PHAssetMediaType` raw values, stored as the
+        /// production walk stores them. Defaults to `1`, which is what every
+        /// pre-video call site meant.
+        var mediaType = 1
+        /// Seconds, videos only. Defaults to `nil` and not to `0`, because
+        /// `PHAsset.duration` is `0` for an image and storing that would be a stored
+        /// lie about a clip.
+        var duration: Double? = nil
     }
 
     /// Inserts rows through the production write path (`upsert`, then `record` /
@@ -182,9 +306,10 @@ final class Fixture: @unchecked Sendable {
     /// state the application itself could not produce.
     func seed(_ assets: [Seed]) async throws {
         let records = assets.map {
-            ScanRecord(identifier: $0.id, mediaType: 1, creationDate: $0.date,
+            ScanRecord(identifier: $0.id, mediaType: $0.mediaType, creationDate: $0.date,
                        modificationDate: $0.date, width: $0.width, height: $0.height,
-                       favorite: $0.favorite, mediaSubtype: 0, isScreenshot: false)
+                       favorite: $0.favorite, mediaSubtype: 0, isScreenshot: false,
+                       duration: $0.duration)
         }
         try await cache.upsert(batch: records, marker: 1)
         for asset in assets {
@@ -413,13 +538,17 @@ struct Row: Hashable {
 
 extension Router {
     /// Runs a request and unwraps the non-streaming cases. A `.stream` result is a
-    /// test error, not a silent empty reply.
+    /// test error, not a silent empty reply, and so is a `.file` — nothing in the
+    /// suite exercises a video route, so reaching one means a request was answered
+    /// by a route the case did not mean to reach.
     func reply(_ request: HTTPRequest) async -> Reply {
         switch await handle(request) {
         case .response(let response):
             return Reply(status: response.status, headers: response.headers, body: response.body)
         case .stream:
             return Reply(status: -1, headers: [:], body: Data("unexpected SSE stream".utf8))
+        case .file(let file):
+            return Reply(status: file.status, headers: file.headers, body: Data("unexpected file body".utf8))
         }
     }
 }

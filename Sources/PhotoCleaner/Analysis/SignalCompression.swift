@@ -3,12 +3,12 @@ import Foundation
 import SQLite3
 import Vision
 
-/// LZFSE compression for the blobs stored in `asset_signals.payload`.
+/// zlib compression for the blobs stored in `asset_signals.payload`.
 ///
 /// ## Why compress at all
 ///
 /// A FeaturePrint is 768 floats — 3,072 B raw, 4,351 B as JSON. For 53,177 assets
-/// that is 231 MB of cache against an otherwise-15 MB cache. LZFSE brings the
+/// that is 231 MB of cache against an otherwise-15 MB cache. zlib brings the
 /// JSON to ~2.7 KB each, about 144 MB: still the largest thing in the cache, but
 /// roughly a third of the size, for a few lines of code and a decode cost of
 /// microseconds.
@@ -21,9 +21,13 @@ import Vision
 /// distance error `0.0` across 400 measured pairs. So the bytes are JSON, and
 /// these are the only two places that know it.
 ///
-/// A one-byte prefix records the codec, so a payload written before compression
-/// existed (or by any future change of codec) still decodes rather than being
-/// mistaken for compressed garbage.
+/// A one-byte prefix records the codec. It earns its keep for the *older* format:
+/// a payload with no marker is read as plain JSON, which is what a build from
+/// before compression wrote. A payload written by some future codec is a different
+/// case and is not covered by this branch — such a change is expected to come with
+/// an `analyzerVersion` bump, and `CacheStore.refreshFeaturePrintQueue` re-queues
+/// every vector written under an older version, so the two mechanisms agree rather
+/// than overlapping.
 enum SignalCompression: Sendable {
     /// `zlib` streaming format, not raw deflate, so the stored bytes carry their
     /// own checksum: a truncated payload fails to decompress instead of decoding
@@ -34,8 +38,16 @@ enum SignalCompression: Sendable {
     /// prefix; normal payloads are far below it.
     private static let maximumDecompressedSize = 1 << 20
 
+    /// `nil` for input that cannot usefully be stored — an empty payload, or one
+    /// the output buffer could not hold.
+    ///
+    /// Empty in, `nil` out rather than the empty `Data` back: a zero-length blob
+    /// reads back as *no* value at all (`read` cannot see one), which would leave a
+    /// signal row that looks written and never is — and, because the row exists, the
+    /// backfill queue would never re-queue it. Storing nothing is the answer that
+    /// leaves the asset eligible.
     static func compress(_ data: Data) -> Data? {
-        guard !data.isEmpty else { return data }
+        guard !data.isEmpty else { return nil }
         let capacity = data.count + 1024
         var out = Data(count: capacity + 1)
         let written = out.withUnsafeMutableBytes { destination -> Int in
@@ -56,6 +68,12 @@ enum SignalCompression: Sendable {
 
     /// Decompresses a payload, tolerating an unmarked one written before
     /// compression existed.
+    ///
+    /// `nil` for anything that does not inflate — which is the point of the zlib
+    /// container: a truncated or corrupt payload fails here instead of decoding
+    /// into plausible-looking nonsense. Callers skip a row that will not decode
+    /// rather than failing the whole read, so one damaged vector costs one photo its
+    /// place in a group instead of costing the library every group.
     static func decompress(_ data: Data) -> Data? {
         guard let first = data.first else { return nil }
         guard first == marker else { return data }
@@ -102,9 +120,16 @@ enum SignalCompression: Sendable {
         }
     }
 
+    /// Copies a blob column out, or `nil` when the column holds no value.
+    ///
+    /// A zero-length blob and SQL NULL are both `nil` here: `sqlite3_column_blob`
+    /// cannot tell them apart, and neither is a payload anything can decode, so the
+    /// caller treats both as "this signal is not stored" — which is what
+    /// `refreshFeaturePrintQueue` and the face queue both mean by absence.
     static func read(_ statement: OpaquePointer, _ column: Int32) -> Data? {
         guard let pointer = sqlite3_column_blob(statement, column) else { return nil }
         let count = Int(sqlite3_column_bytes(statement, column))
+        guard count > 0 else { return nil }
         return Data(bytes: pointer, count: count)
     }
 

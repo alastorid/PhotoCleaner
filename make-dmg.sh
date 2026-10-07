@@ -28,7 +28,8 @@ usage: ./make-dmg.sh [--version N.N.N] [--arch arm64|x86_64] [--output FILE] [--
 
   --version N.N.N   Version stamped into the app and the DMG filename.
                     Defaults to PHOTOCLEANER_VERSION, else 1.0.0.
-  --arch ARCH       Architecture to build for. Defaults to this Mac's.
+  --arch ARCH       Architecture to build for. Defaults to PHOTOCLEANER_ARCH,
+                    else this Mac's.
   --output FILE     Where to write the DMG. Defaults to dist/PhotoCleaner-<version>-<arch>.dmg
   --no-build        Package the app that is already in dist/ instead of rebuilding.
   -h, --help        This text.
@@ -55,6 +56,17 @@ if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+(\.[0-9]+){0,2}$'; then
     echo "make-dmg: invalid version '$VERSION' — expected N, N.N or N.N.N" >&2
     exit 1
 fi
+
+# Checked here as well as in build.sh, because `--no-build` skips build.sh and a
+# typo would otherwise only surface as an architecture mismatch against whatever
+# is already in dist/.
+case "$ARCH" in
+    arm64|x86_64) ;;
+    *)
+        echo "make-dmg: unsupported architecture '$ARCH' — expected arm64 or x86_64" >&2
+        exit 1
+        ;;
+esac
 
 [ -n "$OUTPUT" ] || OUTPUT="$ROOT/dist/$APP_NAME-$VERSION-$ARCH.dmg"
 
@@ -87,9 +99,16 @@ fi
 # the destination directory instead of the bundle itself, and the volume would
 # contain MacOS/ and Resources/ lying around loose.
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/photocleaner-dmg.XXXXXX")"
-MOUNT=""
+# The mountpoint is its own `mktemp -d`, so it has to be removed explicitly —
+# hdiutil detaches the volume but leaves the empty directory behind, and a
+# leaked one per run in $TMPDIR is exactly the kind of litter a build script
+# should not produce.
+MOUNTPOINT=""
 cleanup() {
-    if [ -n "$MOUNT" ]; then hdiutil detach "$MOUNT" -quiet 2>/dev/null || true; fi
+    if [ -n "$MOUNTPOINT" ]; then
+        hdiutil detach "$MOUNTPOINT" -quiet 2>/dev/null || true
+        rmdir "$MOUNTPOINT" 2>/dev/null || true
+    fi
     rm -rf "$STAGE"
 }
 trap cleanup EXIT
@@ -116,7 +135,8 @@ echo "==> Verifying"
 hdiutil verify "$OUTPUT" >/dev/null 2>&1 \
     || { echo "make-dmg: hdiutil verify failed on $OUTPUT" >&2; exit 1; }
 
-MOUNT="$(mktemp -d "${TMPDIR:-/tmp}/photocleaner-mount.XXXXXX")"
+MOUNTPOINT="$(mktemp -d "${TMPDIR:-/tmp}/photocleaner-mount.XXXXXX")"
+MOUNT="$MOUNTPOINT"
 hdiutil attach "$OUTPUT" -mountpoint "$MOUNT" -nobrowse -readonly -quiet
 
 verify_failed=0
@@ -163,7 +183,8 @@ fi
 
 hdiutil detach "$MOUNT" -quiet
 MOUNT=""
-rmdir "$MOUNT" 2>/dev/null || true
+rmdir "$MOUNTPOINT" 2>/dev/null || true
+MOUNTPOINT=""
 
 if [ "$verify_failed" -ne 0 ]; then
     echo "make-dmg: $OUTPUT failed verification — not releasing this" >&2
@@ -173,4 +194,4 @@ fi
 echo
 echo "Built $OUTPUT"
 echo "  $(du -h "$OUTPUT" | cut -f1), $APP_NAME $VERSION ($ARCH)"
-echo "Release it with: gh release create v$VERSION $OUTPUT"
+echo "To publish it: git tag v$VERSION && git push origin v$VERSION"

@@ -41,26 +41,6 @@ function assertEqual(actual, expected, message) {
   if (a !== b) throw new Error(`${message}\n            expected ${b}\n            actual   ${a}`);
 }
 
-/**
- * Asserts that `expected` appears in `actual`, in the same relative order.
- *
- * A plain equality check would be hostage to pagination: the client loads the next
- * page whenever the sentinel comes into view, so the grid legitimately *grows*
- * between two reads of it. What these tests are about is that a particular photo
- * left, and that everything else stayed put — not that no new page arrived.
- */
-function assertSubsequence(actual, expected, message) {
-  let at = 0;
-  for (const id of actual) {
-    if (id === expected[at]) at += 1;
-  }
-  if (at !== expected.length) {
-    const missing = expected.filter((id) => !actual.includes(id));
-    throw new Error(`${message}\n            ${missing.length} missing: ${missing.slice(0, 3).join(', ')}`
-      + `\n            order ${at}/${expected.length} of the expected ids were in place`);
-  }
-}
-
 /** Clicks the tile whose data-id is `id`. */
 function clickTile(app, id) {
   const tile = app.window.document.querySelector(`#grid .tile[data-id="${id}"]`);
@@ -131,14 +111,17 @@ await check('Delete is armed with the count the server resolved', async (app) =>
   await app.settle(500);
   const button = app.$('deleteButton');
   assertEqual(button.disabled, false, 'the button was disabled with a selection present');
-  assertEqual(button.textContent, 'Delete 2 photos',
+  // "assets", not "photos": the default media filter admits both, so the noun the
+  // button prints has to be able to name a clip. Asserting "photos" here would be
+  // asserting the inaccuracy.
+  assertEqual(button.textContent, 'Delete 2 assets',
     'the button does not carry the count the server resolved');
 });
 
 await check('the count is the resolved one, and it is singular for one photo', async (app) => {
   clickTile(app, app.tileIds()[0]);
   await app.settle(500);
-  assert(/^Delete 1 photo$/.test(app.$('deleteButton').textContent),
+  assert(/^Delete 1 asset$/.test(app.$('deleteButton').textContent),
     `wrong singular/plural or count: ${app.$('deleteButton').textContent}`);
 });
 
@@ -229,10 +212,8 @@ console.log('preview: space is a toggle');
 
 await check('Space on a tile opens the preview and Space again closes it', async (app) => {
   const tile = app.window.document.querySelector('#grid .tile');
-  const id = tile.dataset.id;
-  const target = tile;
 
-  target.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+  tile.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
   await app.settle(200);
   assertEqual(app.$('lightbox').hidden, false, 'Space did not open the preview');
   assertEqual(app.$('lightboxScore').textContent !== '—', true, 'the preview did not load a photo');
@@ -240,17 +221,14 @@ await check('Space on a tile opens the preview and Space again closes it', async
   app.key(' ');
   await app.settle(200);
   assertEqual(app.$('lightbox').hidden, true, 'Space did not close the preview');
-  void id;
 });
 
 await check('Space no longer toggles the selection', async (app) => {
-  const target = app.window.document.querySelector('#grid .tile');
-  const id = target.dataset.id;
-  target.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+  const tile = app.window.document.querySelector('#grid .tile');
+  tile.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
   await app.settle(150);
   const summary = app.$('selectionSummary').textContent;
   assert(/Nothing selected/.test(summary), `Space selected the photo instead of previewing it: ${summary}`);
-  void id;
 });
 
 await check('click selects, double-click previews', async (app) => {
@@ -282,6 +260,325 @@ await check('⌫ in the preview destroys the photo on screen', async (app) => {
   assertEqual(sent[0].ids, [ids[0]], 'the deletion did not carry the photo on screen');
   assertEqual(app.$('lightbox').hidden, true, 'the preview stayed open over a destroyed photo');
 });
+
+console.log('preview: it arrives and leaves rather than appearing');
+
+/**
+ * Gives the client a layout, which jsdom has none of.
+ *
+ * The preview's animation measures the tile it is flying out of and the stage it is
+ * flying into, so without this there is nothing for it to measure and the travel is
+ * correctly skipped — which would make every assertion below pass for the wrong
+ * reason.
+ *
+ * Each element is given its own stub rather than the prototype's, because jsdom
+ * resolves `getBoundingClientRect` per concrete element class: patching
+ * `Element.prototype` leaves every subclass's own method in front of it, and those
+ * delegate back up, so the stub calls itself.
+ *
+ * jsdom does not fetch images, so a tile's `<img>` is also told it is loaded and
+ * given a size: the client declines to fly a thumbnail with no pixels in it, which is
+ * right and would otherwise skip the travel here too. Only the tile's own image is
+ * given those properties — the preview image is deliberately left "not loaded", which
+ * is the state a photograph still being fetched is in, and which the client has to
+ * survive.
+ *
+ * jsdom has no CSS transitions, so nothing here can watch a photograph move. Two
+ * things stand in for that. `pose` records the inline styles at the instant a
+ * travelling copy is inserted, which is the only moment its start pose exists — the
+ * release that begins the transition clears them immediately afterwards. And the
+ * states the code owns outright — classes, the `hidden` attribute — are read off the
+ * live DOM as usual.
+ */
+function withLayout(app) {
+  const stubs = [];
+  const flights = [];
+
+  /**
+   * A travelling copy's styles, as a list of steps.
+   *
+   * A pose only exists in the inline styles, and it does not stay there: the way out
+   * sets the start pose and then *clears* the styles to begin the transition, and the
+   * way back appends the copy at rest and writes the destination afterwards. So a
+   * single read either way would catch the wrong moment — and catching the release
+   * instead of the pose would look like "nothing was transformed at all".
+   *
+   * Every step is therefore kept, and the pose is found by looking for the step that
+   * carries a scale, which is the step that says where the photograph is going.
+   */
+  function watchFlight(node) {
+    const flight = { node, steps: [] };
+    flights.push(flight);
+    const step = () => ({
+      left: Number.parseFloat(node.style.left),
+      top: Number.parseFloat(node.style.top),
+      width: Number.parseFloat(node.style.width),
+      height: Number.parseFloat(node.style.height),
+      transform: node.style.transform,
+      filter: node.style.filter,
+      opacity: node.style.opacity,
+    });
+    flight.step = step;
+    flight.steps.push(step());
+    // Written as an own property on this one declaration: the client's own writes go
+    // through it, and the element's `style` is a fresh object per element.
+    const declaration = node.style;
+    for (const property of ['transform', 'opacity', 'filter']) {
+      const setter = Object.getOwnPropertyDescriptor(
+        app.window.CSSStyleDeclaration.prototype, property,
+      ) || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(declaration), property);
+      Object.defineProperty(declaration, property, {
+        configurable: true,
+        get() { return setter.get.call(this); },
+        set(value) {
+          setter.set.call(this, value);
+          flight.steps.push(step());
+        },
+      });
+    }
+    return flight;
+  }
+
+  // Two jsdom details make this need care. `appendChild` is reached through a wrapper
+  // per element class that delegates up to `Node.prototype`, so the wrapper is called
+  // instead of being replaced by calling through to it — the original is reached via
+  // the prototype, or the stub calls itself. And an own property is deleted on the way
+  // out rather than assigned back: jsdom shares element classes between windows, so a
+  // restored function assigned as an own property would outlive this window and be
+  // found already patched by the next one.
+  const body = app.window.document.body;
+  const append = app.window.Node.prototype.appendChild;
+  let inside = false;
+  Object.defineProperty(body, 'appendChild', {
+    configurable: true,
+    value(node) {
+      // Every other insertion goes straight through, so the guard cannot be tripped
+      // by something this wrapper did not start.
+      if (inside) return append.call(this, node);
+      inside = true;
+      try {
+        if (node.classList && node.classList.contains('preview-ghost')) watchFlight(node);
+        return append.call(this, node);
+      } finally {
+        inside = false;
+      }
+    },
+  });
+  stubs.push(() => { delete body.appendChild; });
+  /** Gives `node` a box, and remembers the getter it had. */
+  function place(node, rect) {
+    const box = { x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+      top: rect.y, left: rect.x, bottom: rect.y + rect.height, right: rect.x + rect.width };
+    const had = Object.getOwnPropertyDescriptor(node, 'getBoundingClientRect');
+    Object.defineProperty(node, 'getBoundingClientRect', { value: () => box, configurable: true });
+    stubs.push(() => {
+      if (had) Object.defineProperty(node, 'getBoundingClientRect', had);
+      else delete node.getBoundingClientRect;
+    });
+  }
+  /** Tells an `<img>` it is a loaded, square thumbnail. */
+  function loaded(image, side = 256) {
+    const values = { complete: true, naturalWidth: side, naturalHeight: side };
+    const had = {};
+    for (const [name, value] of Object.entries(values)) {
+      had[name] = Object.getOwnPropertyDescriptor(image, name);
+      Object.defineProperty(image, name, { get: () => value, configurable: true });
+    }
+    stubs.push(() => {
+      for (const [name, descriptor] of Object.entries(had)) {
+        if (descriptor) Object.defineProperty(image, name, descriptor);
+        else delete image[name];
+      }
+    });
+  }
+  return {
+    place,
+    loaded,
+    /** Every travelling copy inserted so far, oldest first. */
+    flights: () => flights.slice(),
+    restore() { for (const undo of stubs.reverse()) undo(); stubs.length = 0; },
+  };
+}
+
+/** The travelling copy of the photograph, if one is on the screen. */
+function ghost(app) {
+  return app.window.document.querySelector('.preview-ghost');
+}
+
+/** The one step of a flight that says where the photograph is going. */
+function poseOf(flight) {
+  const pose = flight.steps.find((step) => /scale\(/.test(String(step.transform)));
+  assert(pose, `no pose was ever set: the copy was only ever placed, never transformed (${JSON.stringify(flight.steps)})`);
+  return pose;
+}
+
+/**
+ * Checks a recorded pose against where it should have begun.
+ *
+ * Asserted as geometry rather than as a literal `translate(…) scale(…)` string,
+ * because the box is fitted to the photograph's real aspect ratio — which the server,
+ * not this test, decides — inside a stage of known size. Three things have to hold:
+ * the box is the preview's own box inside the stage, the transform lands the
+ * photograph's centre on the tile's centre, and it was scaled down to get there. That
+ * is what makes the motion read as one photograph moving rather than one photograph
+ * becoming another.
+ */
+function poseIs(pose, stage, tile) {
+  const [dx, dy, scale] = String(pose.transform)
+    .match(/translate\((-?[\d.]+)px, (-?[\d.]+)px\) scale\((-?[\d.]+)\)/).slice(1).map(Number);
+  return {
+    within: pose.left >= stage.x - 0.5 && pose.top >= stage.y - 0.5
+      && pose.left + pose.width <= stage.x + stage.width + 0.5
+      && pose.top + pose.height <= stage.y + stage.height + 0.5
+      // Filling the stage on one axis is what a `contain`-fitted preview looks like,
+      // as opposed to the stage's own shape.
+      && (Math.abs(pose.width - stage.width) < 0.5 || Math.abs(pose.height - stage.height) < 0.5),
+    overTile: Math.abs(pose.left + pose.width / 2 + dx - (tile.x + tile.width / 2)) < 0.5
+      && Math.abs(pose.top + pose.height / 2 + dy - (tile.y + tile.height / 2)) < 0.5,
+    smaller: scale < 1,
+    scale,
+    transform: pose.transform,
+  };
+}
+
+/** A square tile, and a stage big enough to contain anything. */
+const TILE_BOX = { x: 100, y: 200, width: 200, height: 200 };
+const STAGE_BOX = { x: 500, y: 100, width: 1000, height: 1000 };
+
+/**
+ * Puts the client in a world with a layout: this tile at `box`, the stage at
+ * `STAGE_BOX`, and the tile's thumbnail loaded.
+ */
+function layoutWith(app, tiles) {
+  const layout = withLayout(app);
+  for (const [tile, box] of tiles) {
+    // The photograph, not the tile: the travel is measured from the `<img>` the
+    // user is looking at, and it is that image the client refuses to fly unless it
+    // is loaded and has a box.
+    const image = tile.querySelector('img');
+    layout.place(tile, box);
+    if (image) {
+      layout.place(image, box);
+      layout.loaded(image);
+    }
+  }
+  layout.place(app.$('lightboxStage'), STAGE_BOX);
+  return layout;
+}
+
+/**
+ * Announces that the 2048px preview bitmap has arrived, which is what the client
+ * waits for before handing the screen over from the travelling thumbnail.
+ *
+ * Dispatched rather than stubbed: jsdom has no `HTMLImageElement.decode` at all, so
+ * the client is on its `load`/`error` fallback path, and `load` is the event that path
+ * is waiting for. The preview image is never given pixels or a box — it is genuinely
+ * "not arrived yet" until this is called, which is the state a real fetch is in.
+ */
+function previewArrives(app) {
+  app.$('lightboxImage').dispatchEvent(new app.window.Event('load'));
+}
+
+await check('the photograph flies out of its tile into the preview', async (app) => {
+  const tile = app.window.document.querySelector('#grid .tile');
+  const layout = layoutWith(app, [[tile, TILE_BOX]]);
+  try {
+    tile.dispatchEvent(new app.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    await app.settle(60);
+    const flown = layout.flights();
+    assertEqual(flown.length, 1, 'the preview appeared with nothing travelling — the light change is still sudden');
+    const flight = flown[0];
+    const pose = poseIs(poseOf(flight), STAGE_BOX, TILE_BOX);
+    assert(pose.within, `the travelling copy is not the preview's own box inside the stage (${pose.transform})`);
+    assert(pose.overTile, `the travelling copy does not start over the tile it came from (${pose.transform})`);
+    assert(pose.smaller, 'nothing was scaled: the preview appeared rather than travelled');
+    // The bloom the user asked for, and the travelling copy held invisible until the
+    // release, so a late-decoding thumbnail cannot appear mid-flight.
+    assertEqual(poseOf(flight).filter, 'brightness(1.28)', 'the travelling photograph is not bloomed');
+    assertEqual(poseOf(flight).opacity, '0', 'the travelling photograph starts fully opaque');
+    assert(app.$('lightbox').classList.contains('lightbox-entering'),
+      'the sharp preview is not held back behind the travelling thumbnail');
+    // The preview is still in flight: no bitmap yet, so the travelling copy must hold.
+    await app.settle(400);
+    assert(flight.node.isConnected, 'the travelling thumbnail was handed over before the preview arrived');
+    previewArrives(app);
+    // Long enough for the hand-over's own cross-fade and its removal, which is a
+    // separate, shorter motion after the travel itself has landed.
+    await app.settle(300);
+    assert(!flight.node.isConnected, 'the travelling thumbnail was never handed over');
+    assert(!app.$('lightbox').classList.contains('lightbox-entering'),
+      'the real preview was left invisible after the hand-over');
+    assertEqual(ghost(app), null, 'a travelling photograph was left on screen');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('Space back out plays the travel in reverse', async (app) => {
+  const tile = app.window.document.querySelector('#grid .tile');
+  const layout = layoutWith(app, [[tile, TILE_BOX]]);
+  try {
+    tile.dispatchEvent(new app.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    await app.settle(60);
+    previewArrives(app);
+    await app.settle(200);
+    app.key(' ');
+    await app.settle(60);
+    const back = layout.flights()[1];
+    assert(back, 'the preview vanished instead of travelling back to its tile');
+    // The same destination as the way out, played in reverse, with the overlay still
+    // on screen so the photograph is not cut off where it stood.
+    const pose = poseIs(poseOf(back), STAGE_BOX, TILE_BOX);
+    assert(pose.overTile, `the returning photograph does not end at its tile (${pose.transform})`);
+    assert(pose.smaller, 'the return is not shrinking back towards the tile');
+    assert(back.node.classList.contains('preview-ghost-return'), 'the return is not eased differently');
+    assertEqual(app.$('lightbox').hidden, false, 'the overlay was hidden mid-travel');
+    assertEqual(app.$('lightbox').classList.contains('is-open'), false,
+      'the backdrop did not start fading out');
+    await app.settle(500);
+    assertEqual(app.$('lightbox').hidden, true, 'the preview stayed on screen after the travel landed');
+    assertEqual(ghost(app), null, 'a returning photograph was left on screen');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('a preview with no layout still opens and closes', async (app) => {
+  // jsdom has no layout at all, which is the "nothing to fly from" case: the
+  // animation has to degrade to appearing rather than fail.
+  const tile = app.window.document.querySelector('#grid .tile');
+  tile.dispatchEvent(new app.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+  await app.settle(200);
+  assertEqual(app.$('lightbox').hidden, false, 'the preview did not open without a layout');
+  assertEqual(ghost(app), null, 'a travelling photograph appeared with nothing to travel from');
+  app.key('Escape');
+  await app.settle(200);
+  assertEqual(app.$('lightbox').hidden, true, 'the preview did not close without a layout');
+});
+
+await check('opening a second preview leaves no photograph behind', async (app) => {
+  const tiles = app.window.document.querySelectorAll('#grid .tile');
+  const first = tiles[0];
+  const second = tiles[1];
+  const layout = layoutWith(app, [[first, TILE_BOX], [second, { x: 400, y: 200, width: 200, height: 200 }]]);
+  try {
+    first.dispatchEvent(new app.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    await app.settle(40);
+    assert(layout.flights().length, 'the first preview did not travel at all');
+    // Closed mid-flight, which is the case that strands a half-finished copy of a
+    // photograph over the grid if the two halves do not cancel each other.
+    app.key('Escape');
+    await app.settle(20);
+    assertEqual(app.window.document.querySelectorAll('.preview-ghost').length, 1,
+      'the arriving photograph was not replaced by exactly one returning one');
+    await app.settle(500);
+    assertEqual(ghost(app), null, 'a photograph was left on screen after the interruption');
+    assertEqual(app.$('lightbox').hidden, true, 'the interrupted preview never closed');
+  } finally {
+    layout.restore();
+  }
+});
+
 console.log('similar groups: the same pointer model as the grid');
 
 /**
@@ -312,15 +609,13 @@ function cellAt(app, card, index) {
 await check('one click on a group cell selects instead of previewing', async (app) => {
   const card = await openGroups(app);
   const cell = cellAt(app, card, 2);
-  const id = cell.dataset.id;
   cell.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
   await app.settle(200);
   assertEqual(app.$('lightbox').hidden, true, 'a single click opened the preview');
   assert(cell.classList.contains('selected'), 'the clicked cell is not marked as selected');
   assertEqual(cell.getAttribute('aria-pressed'), 'true', 'the cell was not announced as selected');
-  assert(/1 photo selected/.test(app.$('selectionSummary').textContent),
+  assert(/1 asset selected/.test(app.$('selectionSummary').textContent),
     `the selection bar did not count it: ${app.$('selectionSummary').textContent}`);
-  void id;
 });
 
 await check('double click on a group cell opens the preview', async (app) => {
@@ -491,7 +786,6 @@ await check("Delete in a group cell's menu destroys that member and only that me
   assertEqual(sent[0].ids, [target], 'the strip destroyed something other than the member');
 });
 
-
 console.log('photo menu: only actions on the photo or the library');
 
 /** Opens the context menu on `tile` and returns its items, as plain records. */
@@ -538,6 +832,40 @@ function menuItemNode(app, label) {
   assert(node, `no menu item labelled "${label}"`);
   return node;
 }
+
+await check('favourite protection is not offered as a control', async (app) => {
+  // The guarantee is unconditional, so there is nothing to switch and nothing to
+  // count. Asserted on the ids *and* on the visible text, because a control that
+  // survives under a new id is the failure this is here to catch.
+  assertEqual(app.$('protectFavorites'), null, 'the Protect Favorites switch is still in the panel');
+  assertEqual(app.$('protectFavoritesOption'), null, 'its label is still in the panel');
+  assertEqual(app.$('protectedCount'), null, 'the protected count is still in the panel');
+  assertEqual(app.$('protectedCountWrap'), null, 'its wrapper is still in the panel');
+  const panel = app.window.document.querySelector('.controls-row');
+  assert(!/Protect Favorites/.test(panel.textContent),
+    'the words "Protect Favorites" are still on screen');
+  assert(!/protected from deletion/.test(panel.textContent),
+    'the protected count is still on screen');
+});
+
+await check('a favourite says it is protected, and cannot be told otherwise', async (app) => {
+  // Where the guarantee moved to: onto the photo it is about. The old switch made
+  // this conditional on server state, and the tooltip had a second, contradicting
+  // wording for when it was off — so "protected" had to be checked against a
+  // setting the user could not see from here.
+  const tiles = [...app.window.document.querySelectorAll('#grid .tile')];
+  for (const tile of tiles) {
+    const heart = tile.querySelector('.tile-heart');
+    if (!heart || heart.getAttribute('aria-pressed') !== 'true') continue;
+    assert(/protected from deletion/.test(heart.getAttribute('title') || ''),
+      'a favourite heart does not say it is protected');
+    assert(/protected from deletion/.test(tile.getAttribute('aria-label') || ''),
+      'a favourite tile does not announce that it is protected');
+    return;
+  }
+  // No favourite on this page of somebody's real library: nothing to assert, and
+  // inventing a photo to assert about would be asserting about the fixture.
+});
 
 await check('the menu offers only actions, not selection', async (app) => {
   const items = await openMenuOn(app, app.window.document.querySelector('#grid .tile'));
@@ -609,7 +937,7 @@ await check('the delete item is Delete, and its hint says what it will destroy',
   const items = await openMenuOn(app, app.window.document.querySelector('#grid .tile'));
   const del = items.find((i) => i.label === 'Delete');
   assert(del, 'no Delete item');
-  assertEqual(del.hint, '1 photo', 'the hint does not say what will be covered');
+  assertEqual(del.hint, '1 asset', 'the hint does not say what will be covered');
   assertEqual(del.disabled, false, 'Delete is greyed out');
   assertEqual(labelsOf(items).filter((l) => /delete list/i.test(l)), [],
     'the menu still offers to take photos back out of a delete list');
@@ -625,6 +953,456 @@ await check('Delete in the menu destroys the photo it was opened on', async (app
   await app.settle(600);
   assertEqual(sent.length, 1, `the menu's Delete destroyed nothing (${sent.length} requests)`);
   assertEqual(sent[0].ids, [target], 'the menu destroyed something other than the photo');
+});
+
+console.log('video: the media filter is a real control, and the server owns it');
+
+/**
+ * Puts the media filter on Videos and waits for a page that answers it.
+ *
+ * Polled, like `openGroups`, because a cold start has to load status and start the
+ * album index first and a fixed wait is either a flake or a needless delay on every
+ * other run.
+ *
+ * @return the tiles of that page, which are all videos — the server filtered them,
+ *         so this is also how these checks find a clip without assuming the
+ *         library's default sort happens to put one on screen.
+ */
+async function showVideos(app) {
+  app.click('#mediaChips [data-media="videos"]');
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await app.settle(250);
+    const chips = app.$('mediaChips');
+    if (chips && chips.querySelector('[data-media="videos"]').getAttribute('aria-pressed') === 'true'
+        && app.window.document.querySelector('#grid .tile')) {
+      return [...app.window.document.querySelectorAll('#grid .tile')];
+    }
+  }
+  throw new Error('the grid never showed a videos-filtered page');
+}
+
+/**
+ * Puts the media filter on Photos and waits for a page that answers it.
+ *
+ * @return the tiles of that page — all photographs, because the server filtered
+ *         them.
+ */
+async function showPhotos(app) {
+  app.click('#mediaChips [data-media="images"]');
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await app.settle(250);
+    const chips = app.$('mediaChips');
+    if (chips && chips.querySelector('[data-media="images"]').getAttribute('aria-pressed') === 'true'
+        && app.window.document.querySelector('#grid .tile')) {
+      return [...app.window.document.querySelectorAll('#grid .tile')];
+    }
+  }
+  throw new Error('the grid never showed a photos-filtered page');
+}
+
+/**
+ * Records every `play()` and `pause()` the client makes on `#lightboxVideo`.
+ *
+ * ## Why this exists, and why it is not `video.paused`
+ *
+ * jsdom has no media stack. `HTMLMediaElement.play`, `.pause` and `.load` are
+ * reported as "not implemented" on the virtual console rather than throwing, so
+ * every one of them here is a no-op that does nothing to any state. That gives two
+ * ways for a playback assertion to pass for the wrong reason, and this suite is
+ * built to avoid both:
+ *
+ * - **Asserting `video.paused === true`** proves nothing at all. It is true before
+ *   the client does anything, it is true after `pause()` that did nothing, and it
+ *   is true on a build that never calls `pause()` at all. The assertion would hold
+ *   on the exact regression it is meant to catch.
+ * - **Asserting a `<video>` exists** proves the element was built, which is a real
+ *   invariant — and says nothing about whether it kept playing afterwards. A video
+ *   element that never loads pixels is the other trap WEB-UI-TESTS.md names.
+ *
+ * So the invariant pinned is the one the *client* controls: it calls `pause()`
+ * before it replaces or hides the clip. That is observable in jsdom because it is
+ * the client's own method call, and it is the thing a regression would drop.
+ *
+ * @return the call log: `{play: n, pause: n, reset(): void}`.
+ */
+function watchMedia(app) {
+  const video = app.$('lightboxVideo');
+  const log = { play: 0, pause: 0 };
+  video.play = () => { log.play += 1; };
+  video.pause = () => { log.pause += 1; };
+  log.reset = () => { log.play = 0; log.pause = 0; };
+  return log;
+}
+
+/** Opens the lightbox on a tile with a double-click, the way the grid does. */
+async function openLightboxOn(app, tile) {
+  tile.dispatchEvent(new app.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+  await app.settle(250);
+  assertEqual(app.$('lightbox').hidden, false, 'the lightbox did not open');
+}
+
+await check('the media filter offers All / Photos / Videos, and sends what it says', async (app) => {
+  // The regression this pins. There was a *disabled* checkbox reading "Images only"
+  // whose tooltip claimed video support was planned — a control that could not be
+  // operated and stated a falsehood about what the app does. Asserted on the
+  // absence of the markup and then on the three real options, because a control
+  // replaced by a differently-named one is still a regression.
+  assert(app.$('mediaChips'), 'there is no media control at all');
+  assert(!/Images only/.test(app.$('controlPanel').textContent),
+    'the dead "Images only" checkbox is still on screen');
+  assert(!/video support is planned/i.test(app.$('controlPanel').innerHTML),
+    'the panel still says video support is planned');
+  const chips = [...app.$('mediaChips').querySelectorAll('[data-media]')];
+  assertEqual(chips.map((c) => c.dataset.media), ['all', 'images', 'videos'],
+    'the media control is not All / Photos / Videos');
+
+  // All is the default and the selected one, before anything has been asked for.
+  assertEqual(chips[0].getAttribute('aria-pressed'), 'true', 'All is not the selected filter at boot');
+  assertEqual(chips[0].classList.contains('active'), true, 'the selected chip is not marked active');
+  assertEqual(chips[1].getAttribute('aria-pressed'), 'false', 'more than one chip claims to be selected');
+});
+
+await check('every grid request carries the media filter', async (app) => {
+  // The query the client runs has to be the query the server sees, for the same
+  // reason `album` is always sent: a keyset cursor minted under one media selection
+  // describes a position inside a different result set, and the server refusing it
+  // is the only thing stopping page two from splicing photos and clips together.
+  const asked = [];
+  const real = app.window.fetch;
+  app.window.fetch = async (input, init) => {
+    const path = new URL(typeof input === 'string' ? input : input.url, app.window.location.href).pathname;
+    if (path.endsWith('/api/photos')) {
+      const parsed = new URL(typeof input === 'string' ? input : input.url, app.window.location.href);
+      asked.push(parsed.searchParams.get('media'));
+    }
+    return real(input, init);
+  };
+  await showVideos(app);
+  assert(asked.length > 0, 'no page was requested');
+  assert(asked.every((value) => value === 'videos'),
+    `a page was fetched without the media filter in force: ${JSON.stringify(asked)}`);
+  // And it is sent even when it is `all`: "absent" and "unfiltered" are different
+  // queries, and a client that omitted the default would be relying on the server's
+  // default staying put.
+  app.click('#mediaChips [data-media="all"]');
+  await app.settle(500);
+  assert(asked[asked.length - 1] === 'all',
+    `the default media filter is omitted rather than sent: ${JSON.stringify(asked)}`);
+});
+
+await check('the grid renders what the server applied, not what was asked for', async (app) => {
+  // The echo is the point of `filter.media`: the chips must be able to disagree with
+  // the click that produced the page. A client that painted from its own request
+  // would show "Videos" over a grid of photographs, which is the one state in which
+  // every number on screen is a lie.
+  //
+  // Asserted against the rows the server actually returned — every tile on the page
+  // carries a video's marks — rather than against the click, so this holds however
+  // the server answered.
+  const tiles = await showVideos(app);
+  assert(tiles.length > 0, 'the videos-filtered page is empty');
+  for (const tile of tiles) {
+    assert(/, Video/.test(tile.getAttribute('aria-label') || ''),
+      `a tile on a videos-filtered page is not announced as a video: ${tile.getAttribute('aria-label')}`);
+    assert(tile.querySelector('.tile-play'), 'a tile on a videos-filtered page has no play glyph');
+  }
+});
+
+await check('the chips follow the server\'s echo, not the click that asked', async (app) => {
+  // The echo is the whole reason `filter.media` is on the wire. Painted from the
+  // click instead, a control could say "Videos" over a grid of photographs — the
+  // one state in which every number on screen is a lie — and nothing would say so.
+  //
+  // The skew is injected here rather than waited for, because a real server
+  // answering a real `?media=videos` echoes `videos` and the guarantee would hold
+  // trivially: a client that ignored the echo entirely would pass this. Rewriting
+  // the echoed value is what makes it a test of the client's behaviour rather than
+  // of the server's agreeableness.
+  const real = app.window.fetch;
+  let rewrote = 0;
+  app.window.fetch = async (input, init) => {
+    const response = await real(input, init);
+    const path = new URL(typeof input === 'string' ? input : input.url, app.window.location.href).pathname;
+    if (!path.endsWith('/api/photos') || rewrote) return response;
+    const payload = await response.json();
+    if (!payload.filter || payload.filter.media !== 'videos') return response;
+    rewrote += 1;
+    // The server reports it applied something *other* than what was asked for.
+    return { ...response, async json() { return { ...payload, filter: { ...payload.filter, media: 'all' } }; } };
+  };
+
+  app.click('#mediaChips [data-media="videos"]');
+  await app.settle(700);
+  assert(rewrote > 0, 'the videos-filtered page carrying the echo was never fetched');
+  assertEqual(app.$('mediaChips').querySelector('[data-media="all"]').getAttribute('aria-pressed'), 'true',
+    'the chips still show the click rather than the media the server applied');
+  assertEqual(app.$('mediaChips').querySelector('[data-media="videos"]').getAttribute('aria-pressed'), 'false',
+    'the Videos chip is still marked as the filter in force');
+});
+
+await check('"Select all matching" pins the media dimension in the snapshot', async (app) => {
+  // The load-bearing safety property, and it is on the wire, not in the client's
+  // head. The snapshot is what `/api/selection/preview` resolves and what
+  // `/api/delete` re-resolves, so a snapshot missing `media` resolves to every
+  // photo *and video* in the library — on a grid the reader is looking at with
+  // videos filtered out.
+  await showVideos(app);
+  const sent = [];
+  const real = app.window.fetch;
+  app.window.fetch = async (input, init) => {
+    const path = new URL(typeof input === 'string' ? input : input.url, app.window.location.href).pathname;
+    if (path.endsWith('/api/selection/preview')) sent.push(JSON.parse(init.body || '{}'));
+    return real(input, init);
+  };
+  app.click('selectAllMatching');
+  await app.settle(700);
+
+  assertEqual(sent.length, 1, `the selection was not resolved (${sent.length} requests)`);
+  assertEqual(sent[0].mode, 'matching', 'the snapshot is not a filter');
+  assertEqual(sent[0].filter.media, 'videos',
+    'the snapshot did not pin the media dimension, so it would resolve to the whole library');
+  assert(sent[0].filter.album !== undefined, 'the album dimension stopped being pinned');
+  assert(sent[0].filter.lo !== undefined && sent[0].filter.hi !== undefined,
+    'the score bounds stopped being pinned');
+});
+
+await check('a snapshot taken under one media filter cannot be deleted under another', async (app) => {
+  // The failure this exists to prevent: a selection snapshotted on a
+  // videos-filtered grid, then the reader switches to Photos, and the Delete
+  // button is still live over a set nobody agreed to.
+  const sent = interceptDeletes(app);
+  await showVideos(app);
+  app.click('selectAllMatching');
+  await app.settle(700);
+  assertEqual(app.$('deleteButton').disabled, false, 'the button was dead with a resolvable selection');
+
+  app.click('#mediaChips [data-media="images"]');
+  await app.settle(700);
+  assertEqual(app.$('deleteButton').disabled, true, 'the button was live over a stale selection');
+  app.click('deleteButton');
+  app.key('Backspace');
+  await app.settle(600);
+  assertEqual(sent.length, 0, 'a selection was destroyed under a different media filter');
+});
+
+console.log('video: a tile is never mistaken for a photograph');
+
+await check('a clip\'s tile says what it is, where the tile no longer prints it', async (app) => {
+  const tiles = await showVideos(app);
+  const tile = tiles[0];
+  const label = tile.getAttribute('aria-label') || '';
+  const title = tile.getAttribute('title') || '';
+
+  // The media type is named in both, and the length with it when there is one. This
+  // is where this codebase puts what a tile does not draw — the date, the album and
+  // the favourite protection are all here already — so a clip joins them rather than
+  // getting a parallel mechanism.
+  assert(/Video/.test(label), `the accessible name does not say it is a clip: ${label}`);
+  assert(/Video/.test(title), `the tooltip does not say it is a clip: ${title}`);
+
+  // The badge is in the corner opposite the score, and the score is still where it
+  // was — the media marks are additions to a tile, not a re-layout of one.
+  const badge = tile.querySelector('.tile-duration');
+  const score = tile.querySelector('.tile-score');
+  assert(badge, 'a video tile has no length badge');
+  assert(score, 'a video tile has no score badge');
+  assert(/^\d+:\d{2}(:\d{2})?$/.test(badge.textContent),
+    `the length badge is not m:ss or h:mm:ss: ${badge.textContent}`);
+  // Cross-checked against the tooltip rather than against a literal, because the
+  // number on the badge is the server's value and this suite runs on somebody's real
+  // library: if the tile names a length at all, the badge has to be that same one.
+  const named = title.match(/Video, (\d+:\d{2}(?::\d{2})?)/);
+  if (named) {
+    assertEqual(badge.textContent, named[1],
+      'the badge and the tooltip disagree about how long the clip is');
+  }
+  // The poster frame is the same thumbnail route a photograph uses — there is no
+  // second image path, and the assertion is on the route rather than on pixels
+  // because jsdom never loads an image.
+  assert(/^\/api\/photo\/.+\/thumbnail\?size=\d+$/.test(tile.querySelector('img').getAttribute('src')),
+    `a video tile does not use the existing thumbnail route: ${tile.querySelector('img').getAttribute('src')}`);
+});
+
+await check('a photograph still has neither mark', async (app) => {
+  // The other direction. A play glyph or a length badge on a photograph is a grid
+  // that cannot be trusted, and it is the failure mode that a "show video marks
+  // everywhere" implementation would produce.
+  const tiles = await showPhotos(app);
+  assert(tiles.length > 0, 'the photos-filtered page is empty');
+  for (const tile of tiles) {
+    assertEqual(tile.querySelector('.tile-duration'), null, 'a photograph is showing a length badge');
+    assertEqual(tile.querySelector('.tile-play'), null, 'a photograph is showing a play glyph');
+    assert(!/Video/.test(tile.getAttribute('aria-label') || ''),
+      `a photograph is announced as a clip: ${tile.getAttribute('aria-label')}`);
+  }
+});
+
+console.log('video: the lightbox plays it');
+
+await check('a clip renders as a <video> with the route, the poster and no autoplay', async (app) => {
+  const tiles = await showVideos(app);
+  await openLightboxOn(app, tiles[0]);
+  const id = tiles[0].dataset.id;
+  const encoded = app.window.encodeURIComponent(id);
+  const video = app.$('lightboxVideo');
+
+  assertEqual(video.hidden, false, 'a clip did not put a <video> on the stage');
+  assertEqual(app.$('lightboxImage').hidden, true, 'the <img> is still on the stage as well');
+  assertEqual(video.tagName, 'VIDEO', 'the clip is not rendered as a video element');
+  assertEqual(video.getAttribute('src'), `/api/photo/${encoded}/video`,
+    'the clip is not sourced from the video route');
+  assertEqual(video.getAttribute('poster'), `/api/photo/${encoded}/preview?size=2048`,
+    'the poster is not the existing preview route');
+  assertEqual(video.hasAttribute('autoplay'), false, 'the clip autoplays');
+  assertEqual(video.getAttribute('preload'), 'metadata', 'the clip preloads more than metadata');
+  assertEqual(video.hasAttribute('playsinline'), true, 'playsinline is missing, so iOS would take over');
+  assertEqual(video.controls, true, 'the clip has no transport');
+  // The encoding is load-bearing, and it is asserted on the substring rather than
+  // on a pattern: a `localIdentifier` contains `/`, so the identifier segment of the
+  // src must be the escaped form and must not carry a raw separator. Skipped when
+  // this library's identifiers happen not to contain one — asserting a pattern
+  // about a fixture's shape would be asserting about the fixture.
+  const raw = video.getAttribute('src');
+  if (id.includes('/')) {
+    assert(raw.includes(encoded), `the identifier was not percent-encoded into the src: ${raw}`);
+    assert(!raw.slice('/api/photo/'.length, -'/video'.length).includes('/'),
+      `a raw path separator reached the video route: ${raw}`);
+  }
+});
+
+await check('a clip is never started by this client', async (app) => {
+  // Asserted on the client's own `play()` calls, not on `video.paused` — see
+  // `watchMedia` for why the latter would hold on a build that played nothing at
+  // all, and for why an element that never loads pixels proves nothing either.
+  const tiles = await showVideos(app);
+  const media = watchMedia(app);
+  await openLightboxOn(app, tiles[0]);
+  assertEqual(media.play, 0, 'opening the lightbox started the clip');
+  assertEqual(app.$('lightboxVideo').autoplay, false, 'the element autoplays');
+});
+
+await check('paging away from a clip pauses it and tears it down', async (app) => {
+  // The bug the lightbox queue reindexing comments describe, with sound: a clip that
+  // keeps playing underneath the next photo. The invariant pinned is the client's
+  // own `pause()` call, which is the only part of it jsdom can observe.
+  const tiles = await showVideos(app);
+  await openLightboxOn(app, tiles[0]);
+  const media = watchMedia(app);
+  const first = app.$('lightboxVideo').getAttribute('src');
+
+  app.click('lightboxNext');
+  await app.settle(400);
+  assert(media.pause > 0, 'paging did not pause the clip it was showing');
+  const second = app.$('lightboxVideo').getAttribute('src');
+  assert(second !== first, 'paging did not change what the stage is showing');
+  // Torn down, not merely hidden: a retained `<video>` holds a decoder and its
+  // stream open for the rest of the session.
+  assert(/^https?:|^\/api\//.test(second || ''), 'the player was not re-sourced after the teardown');
+});
+
+await check('closing the lightbox pauses the clip and releases it', async (app) => {
+  // A closed overlay with a paused-but-attached clip still holds that clip's decoder
+  // and its half-open export request, and the next open races a resource the
+  // previous one still owns.
+  const tiles = await showVideos(app);
+  await openLightboxOn(app, tiles[0]);
+  const media = watchMedia(app);
+
+  app.click('lightboxClose');
+  await app.settle(500);
+  assert(media.pause > 0, 'closing did not pause the clip');
+  assertEqual(app.$('lightbox').hidden, true, 'the lightbox stayed open');
+  assertEqual(app.$('lightboxVideo').getAttribute('src'), null,
+    'the player still has a source after the lightbox closed');
+  assertEqual(app.$('lightboxVideo').getAttribute('poster'), null,
+    'the player still holds a poster after the lightbox closed');
+});
+
+await check('a clip in the lightbox keeps the grid\'s context menu', async (app) => {
+  // The menu is anchored to the element the photo is drawn in, and that element is a
+  // `<video>` for a clip. Asserted on the menu *opening* and on an item being
+  // present, because the anchor is the thing that changed: a listener scoped to the
+  // `<img>` alone leaves a clip as the one photo in the app with no menu, and that
+  // is silent — the reader simply right-clicks and gets nothing.
+  const tiles = await showVideos(app);
+  await openLightboxOn(app, tiles[0]);
+  const video = app.$('lightboxVideo');
+  video.dispatchEvent(new app.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  await app.settle(250);
+  assertEqual(app.$('tileMenuLayer').hidden, false, 'right-clicking a clip did not open the menu');
+  const labels = [...app.$('tileMenu').children]
+    .filter((n) => n.getAttribute('role') === 'menuitem')
+    .map((n) => (n.firstChild ? n.firstChild.textContent : ''));
+  assert(labels.includes('Delete'), `the clip's menu is not the photo menu: ${labels.join(' | ')}`);
+  assert(!labels.some((l) => l === ''), 'the clip\'s menu has an unlabelled item');
+});
+
+await check('clicking a clip does not page the overlay out from under it', async (app) => {
+  // A `<video controls>` owns its own clicks: play/pause, the scrub bar, the volume.
+  // A stage handler that advances on any click in the media element would page the
+  // lightbox while the reader is aiming at one of those — arriving at "it kept
+  // playing under the next photo" from the other end, and taking the clip away
+  // mid-seek.
+  const tiles = await showVideos(app);
+  await openLightboxOn(app, tiles[0]);
+  const before = app.$('lightboxVideo').getAttribute('src');
+
+  app.$('lightboxVideo').dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  await app.settle(300);
+  assertEqual(app.$('lightbox').hidden, false, 'clicking the clip closed the lightbox');
+  assertEqual(app.$('lightboxVideo').getAttribute('src'), before, 'clicking the clip paged to another photo');
+
+  // The still still advances on a click — the other direction, and the one a
+  // "never advance on a click" version would break.
+  app.key('Escape');
+  await app.settle(250);
+  const stills = await showPhotos(app);
+  await openLightboxOn(app, stills[0]);
+  if (stills.length > 1) {
+    app.$('lightboxImage').dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await app.settle(300);
+    assertEqual(app.$('lightbox').hidden, false, 'clicking a photograph closed the lightbox');
+    assert(app.$('lightboxImage').getAttribute('src') !== null, 'clicking a photograph left nothing on the stage');
+  }
+});
+
+await check('Space still toggles the preview on a clip tile, and Enter still opens it', async (app) => {
+  // `buildTile`'s keydown contract is unchanged by video support, and this is the
+  // test that says so. Space previews (it does not select) and the same key again
+  // puts it away; Enter opens.
+  const tiles = await showVideos(app);
+  const tile = tiles[0];
+
+  tile.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+  await app.settle(300);
+  assertEqual(app.$('lightbox').hidden, false, 'Space did not open the preview on a clip tile');
+  assert(/Nothing selected/.test(app.$('selectionSummary').textContent),
+    `Space selected the clip instead of previewing it: ${app.$('selectionSummary').textContent}`);
+
+  app.key(' ');
+  await app.settle(300);
+  assertEqual(app.$('lightbox').hidden, true, 'Space did not close the preview on a clip');
+
+  tile.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await app.settle(300);
+  assertEqual(app.$('lightbox').hidden, false, 'Enter did not open the preview on a clip tile');
+});
+
+await check('a photograph in the lightbox is still an <img>', async (app) => {
+  // The other direction again, and the one a "video support" change breaks by
+  // accident: swapping the element for a `<video>` unconditionally leaves every
+  // photograph rendered by the media element, which cannot show a picture at all.
+  const [tile] = await showPhotos(app);
+  assert(tile, 'the photos-filtered grid is empty');
+  await openLightboxOn(app, tile);
+
+  assertEqual(app.$('lightboxImage').hidden, false, 'a photograph is not shown by the <img>');
+  assertEqual(app.$('lightboxVideo').hidden, true, 'a photograph put a <video> on the stage');
+  assertEqual(app.$('lightboxImage').getAttribute('src'),
+    `/api/photo/${app.window.encodeURIComponent(tile.dataset.id)}/preview?size=2048`,
+    'a photograph is not sourced from the preview route');
+  assertEqual(app.$('lightboxDurationRow').hidden, true,
+    'a photograph is showing a length');
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

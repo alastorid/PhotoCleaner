@@ -41,10 +41,12 @@ func registerPaginationTests() {
                    "newer walks that order with every key reversed")
     })
 
-    Registry.shared.add(suite: suite, TestCase(name: "filter bounds are always ?1/?2, with literals after them",
+    Registry.shared.add(suite: suite, TestCase(name: "filter bounds are always ?1/?2, and only an album adds ?3",
         knownBug: nil) {
-        // The keyset clause hard-codes parameter indices 3, 4 and 5 and puts LIMIT
-        // at 6, which is only correct if the filter never binds anything above ?2.
+        // The keyset clause starts at ?4 and the `LIMIT` sits three parameters
+        // further on, which is only correct if the filter never binds anything above
+        // ?3. That is why the album predicate takes ?3 rather than a parameter of its
+        // own choosing.
         checkEqual(PhotoFilter(lower: -1, upper: 1).whereSQLClause(),
                    "aesthetics_score >= ?1 AND aesthetics_score <= ?2", "default filter")
         checkEqual(PhotoFilter(lower: -1, upper: 1, favorites: .exclude).whereSQLClause(),
@@ -57,9 +59,47 @@ func registerPaginationTests() {
                        PhotoFilter(lower: -1, upper: 1, favorites: .only)] {
             let clause = filter.whereSQLClause()
             checkEqual(clause.filter { $0 == "?" }.count, 2,
-                       "only the two score bounds may bind a parameter, got \"\(clause)\"")
+                       "without an album, only the two score bounds may bind a parameter, got \"\(clause)\"")
             check(clause.hasPrefix("aesthetics_score >= ?1"), "and they are ?1 and ?2, got \"\(clause)\"")
         }
+
+        // An album is the one dimension that binds a third parameter, and it must be
+        // ?3: the favourites predicate uses a literal precisely so it cannot shift the
+        // numbering. `.unassigned` binds nothing — it is a `NOT EXISTS`, so a
+        // placeholder for it would be a value with no meaning.
+        checkEqual(PhotoFilter(lower: -1, upper: 1, album: .album("a1")).whereSQLClause(), """
+        aesthetics_score >= ?1 AND aesthetics_score <= ?2 AND EXISTS (SELECT 1 FROM asset_albums aa \
+        WHERE aa.asset_identifier = assets.asset_identifier AND aa.album_identifier = ?3)
+        """, "one album")
+        checkEqual(PhotoFilter(lower: -1, upper: 1, favorites: .only, album: .album("a1")).whereSQLClause(), """
+        aesthetics_score >= ?1 AND aesthetics_score <= ?2 AND favorite = 1 AND EXISTS \
+        (SELECT 1 FROM asset_albums aa WHERE aa.asset_identifier = assets.asset_identifier \
+        AND aa.album_identifier = ?3)
+        """, "an album and a favourites filter")
+        for album in [AlbumSelection.unassigned, .all] {
+            let clause = PhotoFilter(lower: -1, upper: 1, album: album).whereSQLClause()
+            checkEqual(clause.filter { $0 == "?" }.count, 2,
+                       "album \(album) binds no identifier, got \"\(clause)\"")
+        }
+        // And the placeholder the *caller* chooses never leaks into the grid's own
+        // query: the group queries pass ?1/?2 for the album because their other
+        // parameters come first, which is the reason `membershipClause` takes the
+        // placeholder as an argument at all.
+        checkEqual(AlbumSelection.unassigned.membershipClause(asset: "a.asset_identifier", albumParameter: "?7"),
+                   """
+        NOT EXISTS (SELECT 1 FROM asset_albums aa \
+        WHERE aa.asset_identifier = a.asset_identifier)
+        """, "unassigned ignores the placeholder it was handed")
+
+        // The media dimension is a literal too, and for the same reason: one more
+        // placeholder in the `WHERE` renumbers the keyset parameters, and the failure
+        // that follows is silent — score bounds bound against the wrong columns.
+        checkEqual(PhotoFilter(lower: -1, upper: 1, media: .videos).whereSQLClause(),
+                   "aesthetics_score >= ?1 AND aesthetics_score <= ?2 AND media_type = 2",
+                   "videos are selected by a literal, not a bound value")
+        checkEqual(PhotoFilter(lower: -1, upper: 1, favorites: .only, media: .images).whereSQLClause(),
+                   "aesthetics_score >= ?1 AND aesthetics_score <= ?2 AND favorite = 1 AND media_type = 1",
+                   "and it composes with the literal favourites predicate")
     })
 
     // MARK: the walk
@@ -245,7 +285,7 @@ func registerPaginationTests() {
                                                      cursor: PhotoCursor(row: jumped.rows.last!),
                                                      limit: 4, offset: 10)
         checkEqual(afterJump.rows.map(\.id), Array(expected[14..<18]),
-                   "offset is ignored once a cursor is present (CacheStore.page:511)")
+                   "offset is ignored once a cursor is present")
     })
 
     Registry.shared.add(suite: suite, TestCase(name: "a nonsense limit cannot abort the process",

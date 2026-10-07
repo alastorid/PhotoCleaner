@@ -26,6 +26,9 @@ import Foundation
 func registerUpdateTests() {
     registerUpdateVersionTests()
     registerUpdateFeedTests()
+    registerDiskImagePlistTests()
+    registerInstallerReadingTests()
+    registerDownloadPathTests()
     registerUpdateTargetTests()
     registerUpdaterPhaseTests()
     registerUpdateIndicatorTests()
@@ -312,18 +315,167 @@ func registerUpdateFeedTests() {
     })
 }
 
+// MARK: - Reading what was mounted
+
+func registerInstallerReadingTests() {
+    let suite = "update: reading the mounted app"
+
+    Registry.shared.add(suite: suite, TestCase(name: "the version is read out of the bundle's own Info.plist", knownBug: nil) {
+        // The tag, the asset filename and this string are three separate claims
+        // about one release. Reading it from disk rather than from a `Bundle` is
+        // what makes the third one independent of the running process — a second
+        // bundle with the same identifier is not loaded, so it cannot answer with
+        // the running app's own version.
+        let root = try Fixture.makeRoot(label: "update-bundle")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = root.appendingPathComponent("PhotoCleaner.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app.appendingPathComponent("Contents"),
+                                                withIntermediateDirectories: true)
+        try Data(#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.4.2</string></dict></plist>"#.utf8)
+            .write(to: app.appendingPathComponent("Contents/Info.plist"))
+
+        checkEqual(try UpdateInstaller.version(of: app), "1.4.2", "the stamped version")
+        checkEqual(UpdateVersion(try UpdateInstaller.version(of: app)), UpdateVersion("1.4.2"),
+                   "and it is a version the updater can compare")
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "a bundle with no readable version is refused, and says what it is", knownBug: nil) {
+        // Its own error case rather than `installFailed`: "the thing on disk is not
+        // a PhotoCleaner bundle at all" is a different fact from "the install
+        // broke", and collapsing them blames the install for the wrong thing.
+        let root = try Fixture.makeRoot(label: "update-bundle-empty")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = root.appendingPathComponent("PhotoCleaner.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: app.appendingPathComponent("Contents"),
+                                                withIntermediateDirectories: true)
+
+        let error = checkThrows("an app with no Info.plist") { try UpdateInstaller.version(of: app) }
+        guard let refusal = error as? UpdateError, case .unreadableBundle(let name) = refusal else {
+            Harness.record("expected unreadableBundle, got \(String(describing: error))")
+            return
+        }
+        checkEqual(name, "PhotoCleaner.app", "the refusal names the bundle")
+        check(refusal.description.contains("PhotoCleaner.app"),
+              "and the sentence does too: \(refusal.description)")
+        check(refusal.description.contains("not installed"),
+              "and it says nothing was changed: \(refusal.description)")
+    })
+}
+
+// MARK: - The download path
+
+func registerDownloadPathTests() {
+    let suite = "update: download path"
+
+    let scratch = URL(fileURLWithPath: "/Users/someone/Library/Application Support/PhotoCleaner/update",
+                      isDirectory: true)
+
+    Registry.shared.add(suite: suite, TestCase(name: "an asset name is a path component, never a path", knownBug: nil) {
+        // `asset.name` is remote release text and is about to be appended to a
+        // directory. `UpdateCheck` matches it against a name it computed, so
+        // nothing dangerous can arrive today — but this is the function that would
+        // one day hand `..` to `hdiutil`, so it refuses on its own terms rather
+        // than inheriting the guarantee.
+        let good = try Updater.destination(for: "PhotoCleaner-1.3.0-arm64.dmg", in: scratch)
+        checkEqual(good.path, scratch.appendingPathComponent("PhotoCleaner-1.3.0-arm64.dmg").path,
+                   "the ordinary name")
+
+        for name in ["", ".", "..", "../evil.dmg", "a/b.dmg", "/etc/passwd",
+                     "sub/../../escape.dmg", "PhotoCleaner.dmg/"] {
+            let error = checkThrows("the asset name \"\(name)\"") {
+                try Updater.destination(for: name, in: scratch)
+            }
+            guard let refusal = error as? UpdateError, case .downloadFailed = refusal else {
+                Harness.record("expected downloadFailed for \"\(name)\", got \(String(describing: error))")
+                continue
+            }
+            check(!refusal.description.isEmpty, "and it says something: \(refusal.description)")
+        }
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "a redirect must stay on https", knownBug: nil) {
+        // GitHub serves release assets from `objects.githubusercontent.com` through
+        // a redirect, so redirects cannot be refused outright. What must not move
+        // is the scheme: the asset URL is checked for https before the fetch, and
+        // a downgrade to http after that check would fetch the wrong bytes over a
+        // channel the release body never mentions.
+        for good in ["https://objects.githubusercontent.com/x.dmg",
+                     "https://github.com/alastorid/PhotoCleaner/releases/download/v1.3.0/x.dmg"] {
+            check(Redirect.isAcceptable(URL(string: good)), "\(good) may be followed")
+        }
+        for bad in ["http://objects.githubusercontent.com/x.dmg",
+                    "http://127.0.0.1:8765/",
+                    "file:///etc/passwd",
+                    "ftp://example.com/x.dmg"] {
+            check(!Redirect.isAcceptable(URL(string: bad)), "\(bad) must be refused")
+        }
+        check(!Redirect.isAcceptable(nil), "a redirect with no URL is refused")
+    })
+}
+
 // MARK: - Where it may install
+
+/// A `hdiutil attach -plist` document with the given number of mounted volumes.
+private func hdiutilPlist(volumes: Int) -> Data {
+    var entities: [[String: Any]] = [["content-hint": "GUID_partition_scheme"]]
+    for index in 0..<volumes {
+        entities.append(["dev-entry": "/dev/disk\(index + 1)",
+                         "mount-point": "/Volumes/PhotoCleaner \(index + 1)"])
+    }
+    let document: [String: Any] = ["system-entities": entities, "mount-point": "/ignored"]
+    return (try? PropertyListSerialization.data(fromPropertyList: document, format: .xml, options: 0)) ?? Data()
+}
+
+func registerDiskImagePlistTests() {
+    let suite = "update: the disk image mount point"
+
+    Registry.shared.add(suite: suite, TestCase(name: "one mounted volume is the mount point", knownBug: nil) {
+        // The whole point of parsing the plist rather than scraping `-verbose`:
+        // this is the string the installer then reads the new app out of, and a
+        // guess about which volume holds it is a guess about where code runs.
+        checkEqual(try DiskImagePlist.mountPoint(in: hdiutilPlist(volumes: 1)),
+                   "/Volumes/PhotoCleaner 1", "the single mount point, verbatim")
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "no mount point, several, or no plist at all are all errors", knownBug: nil) {
+        // Each of these is a case where returning *something* — an empty string, or
+        // the first of several — would send the installer to a directory it did not
+        // mount. A truncated `hdiutil` plist parses as far as it goes and then
+        // reports a missing mount point, which is exactly the shape of the last case.
+        for (what, data) in [("no volumes", hdiutilPlist(volumes: 0)),
+                             ("two volumes", hdiutilPlist(volumes: 2)),
+                             ("not a property list", Data("<plist>nope".utf8)),
+                             ("empty", Data())] {
+            let error = checkThrows(what) { try DiskImagePlist.mountPoint(in: data) }
+            guard let refusal = error as? UpdateError, case .installFailed = refusal else {
+                Harness.record("expected installFailed for \(what), got \(String(describing: error))")
+                continue
+            }
+            check(!refusal.description.isEmpty, "\(what) says something: \(refusal.description)")
+        }
+        // A document that is a plist but has no `system-entities` at all — which is
+        // what a `hdiutil` that printed a warning *instead of* a document produces.
+        let bare = (try? PropertyListSerialization.data(fromPropertyList: ["count": 1],
+                                                       format: .xml, options: 0)) ?? Data()
+        let error = checkThrows("a plist with no system-entities") {
+            try DiskImagePlist.mountPoint(in: bare)
+        }
+        guard let refusal = error as? UpdateError, case .installFailed = refusal else {
+            Harness.record("expected installFailed, got \(String(describing: error))")
+            return
+        }
+        check(!refusal.description.isEmpty, "and it says something: \(refusal.description)")
+    })
+}
 
 func registerUpdateTargetTests() {
     let suite = "update: install target"
     let app = URL(fileURLWithPath: "/Applications/PhotoCleaner.app", isDirectory: true)
     let scratch = URL(fileURLWithPath: "/Users/someone/Library/Application Support/PhotoCleaner/update",
                       isDirectory: true)
-    let installed = UpdateVersion("1.2.0")!
 
     Registry.shared.add(suite: suite, TestCase(name: "an installed app in Applications has a plan", knownBug: nil) {
-        guard let plan = try? UpdateTarget.plan(bundleURL: app, location: .writable,
-                                                 installed: installed, scratch: scratch) else {
+        guard let plan = try? UpdateTarget.plan(bundleURL: app, location: .writable, scratch: scratch) else {
             Harness.record("expected a plan for /Applications")
             return
         }
@@ -334,12 +486,10 @@ func registerUpdateTargetTests() {
         checkEqual(plan.backupAppURL.path,
                    scratch.appendingPathComponent("previous/PhotoCleaner.app").path,
                    "where the outgoing app goes")
-        checkEqual(plan.installedVersion, installed, "the version being replaced")
     })
 
     Registry.shared.add(suite: suite, TestCase(name: "everything written stays under Application Support", knownBug: nil) {
-        guard let plan = try? UpdateTarget.plan(bundleURL: app, location: .writable,
-                                                 installed: installed, scratch: scratch) else {
+        guard let plan = try? UpdateTarget.plan(bundleURL: app, location: .writable, scratch: scratch) else {
             Harness.record("expected a plan")
             return
         }
@@ -358,8 +508,7 @@ func registerUpdateTargetTests() {
         // go. Writing there edits the image, and the edit vanishes on eject.
         let volume = URL(fileURLWithPath: "/Volumes/PhotoCleaner 1.2.0/PhotoCleaner.app", isDirectory: true)
         let error = checkThrows("a bundle inside /Volumes") {
-            try UpdateTarget.plan(bundleURL: volume, location: .readOnlyVolume,
-                                  installed: installed, scratch: scratch)
+            try UpdateTarget.plan(bundleURL: volume, location: .readOnlyVolume, scratch: scratch)
         }
         guard let refusal = error as? UpdateError, case .notSelfInstallable = refusal else {
             Harness.record("expected notSelfInstallable, got \(String(describing: error))")
@@ -370,8 +519,7 @@ func registerUpdateTargetTests() {
 
     Registry.shared.add(suite: suite, TestCase(name: "an unwritable location is refused, and named", knownBug: nil) {
         let error = checkThrows("an unwritable /Applications") {
-            try UpdateTarget.plan(bundleURL: app, location: .notWritable,
-                                  installed: installed, scratch: scratch)
+            try UpdateTarget.plan(bundleURL: app, location: .notWritable, scratch: scratch)
         }
         guard let refusal = error as? UpdateError, case .notSelfInstallable = refusal else {
             Harness.record("expected notSelfInstallable, got \(String(describing: error))")
@@ -386,11 +534,17 @@ func registerUpdateTargetTests() {
         // that is emphatically not an app. Without the `.app` check the updater
         // would plan to `ditto` over it.
         let bare = URL(fileURLWithPath: "/tmp/photocleaner-tests")
-        let error = checkThrows("a bare executable") {
-            try UpdateTarget.plan(bundleURL: bare, location: .writable,
-                                  installed: installed, scratch: scratch)
+        for location: InstalledLocation in [.writable, .notWritable, .readOnlyVolume] {
+            let error = checkThrows("a bare executable, classified \(location)") {
+                try UpdateTarget.plan(bundleURL: bare, location: location, scratch: scratch)
+            }
+            guard let refusal = error as? UpdateError, case .notSelfInstallable = refusal else {
+                Harness.record("expected notSelfInstallable, got \(String(describing: error))")
+                continue
+            }
+            check(refusal.description.contains("not an application bundle"),
+                  "\(location) still refuses for being the wrong shape: \(refusal.description)")
         }
-        check(error is UpdateError, "the bare binary is refused: \(String(describing: error))")
     })
 
     Registry.shared.add(suite: suite, TestCase(name: "a mounted volume is classified read-only even if it looks writable", knownBug: nil) {
@@ -400,14 +554,33 @@ func registerUpdateTargetTests() {
         checkEqual(UpdateTarget.locate(volume), .readOnlyVolume, "a bundle under /Volumes")
     })
 
+    Registry.shared.add(suite: suite, TestCase(name: "locate classifies real directories, not just paths", knownBug: nil) {
+        // `locate` is the half that touches the filesystem, and the half the pure
+        // `plan` cases above never exercise. A real writable directory has to come
+        // back `.writable` — a false `.notWritable` would disable self-update for
+        // everyone — and the suite's own binary has to come back
+        // `.notAnApplicationBundle`.
+        let root = try Fixture.makeRoot(label: "update-locate")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bundle = root.appendingPathComponent("PhotoCleaner.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+
+        checkEqual(UpdateTarget.locate(bundle), .writable, "a real, writable directory")
+        checkEqual(UpdateTarget.locate(root.appendingPathComponent("PhotoCleaner")),
+                   .notAnApplicationBundle, "a directory that is not a bundle")
+        // The containing folder is gone, so there is nowhere to move the bundle
+        // back to. `isWritableFile` is not asked about it at all: a plan made
+        // here would fail at the swap, after a download.
+        checkEqual(UpdateTarget.locate(root.appendingPathComponent("gone/PhotoCleaner.app")),
+                   .notWritable, "a bundle inside a folder that does not exist")
+    })
+
     Registry.shared.add(suite: suite, TestCase(name: "the scratch path is derived, not hard-coded", knownBug: nil) {
         // Two plans for two scratch directories must not share staging paths, or a
         // second updater would stage into the first one's leftovers.
         let other = URL(fileURLWithPath: "/tmp/other-update", isDirectory: true)
-        guard let first = try? UpdateTarget.plan(bundleURL: app, location: .writable,
-                                                  installed: installed, scratch: scratch),
-              let second = try? UpdateTarget.plan(bundleURL: app, location: .writable,
-                                                   installed: installed, scratch: other) else {
+        guard let first = try? UpdateTarget.plan(bundleURL: app, location: .writable, scratch: scratch),
+              let second = try? UpdateTarget.plan(bundleURL: app, location: .writable, scratch: other) else {
             Harness.record("expected two plans")
             return
         }
@@ -502,17 +675,43 @@ func registerUpdateIndicatorTests() {
         check(failed.contains("again"), "and says a click retries: \(failed)")
     })
 
-    Registry.shared.add(suite: suite, TestCase(name: "the control can be drawn in every phase", knownBug: nil) {
-        // AppKit drawing is only exercisable on a main actor, and the cases above
-        // cover the values that reach it. What is pinned here is that a status
-        // carrying an offer and a version round-trips through the tooltip without
-        // losing either — the shape the window actually renders.
-        for phase: Updater.Phase in [.idle, .checking, .upToDate, .available,
-                                     .downloading(received: 1, expected: 2), .installing, .restarting,
-                                     .failed("nope")] {
+    Registry.shared.add(suite: suite, TestCase(name: "every phase is drawn from a distinct piece of state", knownBug: nil) {
+        // AppKit drawing is only exercisable on a main actor, so what is pinned
+        // here is the value that reaches it: no phase may be reached for by the
+        // same sentence as another, or the glyph and the tooltip would be telling
+        // the user two different things at once.
+        let phases: [Updater.Phase] = [.idle, .checking, .upToDate, .available,
+                                       .downloading(received: 1, expected: 2), .installing, .restarting,
+                                       .failed("nope")]
+        var seen: [String: Updater.Phase] = [:]
+        for phase in phases {
             let text = UpdateIndicatorView.tooltip(for: status(phase, offer))
             check(!text.isEmpty, "phase \(phase) produces a tooltip")
+            if let other = seen[text] {
+                Harness.record("\(phase) and \(other) draw the same tooltip: \(text)")
+            }
+            seen[text] = phase
         }
+
+        // And the whole enum, so a phase added later without a tooltip is caught
+        // rather than silently drawn as whatever the switch's `default` says.
+        checkNoDuplicates(phases.map { "\($0)" }, "every phase appears in this list")
+    })
+
+    Registry.shared.add(suite: suite, TestCase(name: "a phase that carries no offer still says something true", knownBug: nil) {
+        // `available` and `upToDate` are reachable with `offered == nil` — a status
+        // can be constructed that way, and the window will render it. The fallback
+        // must not invent a version, and must not be empty.
+        let bare: @Sendable (Updater.Phase) -> Updater.Status = { phase in
+            Updater.Status(phase: phase, offered: nil, installedVersion: nil, automaticChecks: true)
+        }
+        let available = UpdateIndicatorView.tooltip(for: bare(.available))
+        check(!available.isEmpty, "\(available)")
+        check(!available.contains("nil"), "no interpolation of a missing offer: \(available)")
+
+        let current = UpdateIndicatorView.tooltip(for: bare(.upToDate))
+        check(!current.isEmpty, "\(current)")
+        check(!current.contains("nil"), "and none for a missing installed version: \(current)")
     })
 }
 
@@ -551,7 +750,7 @@ func registerUpdateSettingsTests() {
         // knows about updates must not have every other preference silently
         // reset to its default because one new key was absent.
         let json = """
-        {"downloadFromICloud":true,"protectFavorites":false,"analysisConcurrency":9}
+        {"downloadFromICloud":true,"analysisConcurrency":9,"similarGroups":null}
         """
         let snapshot = try? JSONDecoder().decode(SettingsSnapshot.self, from: Data(json.utf8))
         guard let snapshot else {
@@ -559,8 +758,10 @@ func registerUpdateSettingsTests() {
             return
         }
         checkEqual(snapshot.downloadFromICloud, true, "an existing field survived")
-        checkEqual(snapshot.protectFavorites, false, "another existing field survived")
-        checkEqual(snapshot.analysisConcurrency, 9, "and a third")
+        checkEqual(snapshot.analysisConcurrency, 9, "another existing field survived")
+        checkEqual(snapshot.protectFavorites, true,
+                   "the mandatory one is on whatever the file says — and an absent "
+                   + "or null key is not an error either")
         checkEqual(snapshot.checkForUpdates, true, "the new field took its default")
         checkNil(snapshot.lastUpdateCheck, "and so did the new optional")
     })

@@ -1,0 +1,15 @@
+{
+  "name": "photocleaner-devtools",
+  "private": true,
+  "type": "module",
+  "description": "Developer-only tooling for PhotoCleaner. Nothing here is shipped: the app is built by build.sh with swiftc and embeds web/ directly, and this manifest exists only to resolve the jsdom the web-UI test harness needs.",
+  "scripts": {
+    "test:web": "node tools/web-ui-tests.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "30.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

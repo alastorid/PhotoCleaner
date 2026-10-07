@@ -148,7 +148,6 @@ fi
 
 mv -f "$STAGED" "$BINARY"
 
-echo "==> Writing the bundle"
 # The icon is drawn from code, not copied from a checked-in blob: see
 # tools/make-icon.swift. A failure here is not fatal to the build — an app
 # without an icon still runs, it just shows the generic one — but it is worth
@@ -161,6 +160,8 @@ if ! "$SWIFT" -sdk "$SDK" "$ROOT/tools/make-icon.swift" "$ICON" 2>&1 | tee "$BUI
     echo "build: could not render the icon; it will be the generic macOS one" >&2
     rm -f "$ICON"
 fi
+
+echo "==> Writing Info.plist"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

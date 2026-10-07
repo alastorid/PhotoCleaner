@@ -55,7 +55,7 @@ func registerSimilarGroupTests() {
             return
         }
         check(compressed.count < payload.count,
-              "LZFSE should shrink a FeaturePrint: \(compressed.count) vs \(payload.count)")
+              "zlib should shrink a FeaturePrint: \(compressed.count) vs \(payload.count)")
         guard let restored = SignalCompression.featurePrint(from: compressed) else {
             Harness.record("could not decode the compressed FeaturePrint")
             return
@@ -547,6 +547,154 @@ func registerSimilarGroupTests() {
                    "the foreign key takes the queue row with the asset")
     })
 
+    Registry.shared.add(suite: "similar group cache", TestCase(name: "a vector from an older analyzer version is re-queued", knownBug: nil) {
+        // `analyzerVersion` is the promise that "the meaning of a stored observation
+        // changes when this number changes". A FeaturePrint is an observation like any
+        // other, and a backfill queue that only asked whether a vector *exists* would
+        // keep comparing prints computed under rules the current build no longer
+        // applies — with no symptom except subtly wrong groups, which is the hardest
+        // kind of wrong to notice.
+        let fixture = try await Fixture.make("groups-backfill-version")
+        try await fixture.seed([Fixture.Seed(id: "a1", score: 0.5, date: 100)])
+        try await fixture.cache.recordFeaturePrint(
+            SignalCompression.featurePrintData(try await makeFeaturePrint(.verticalBands))!, for: "a1")
+        try await fixture.cache.beginScan()
+        checkEqual(try await fixture.cache.featurePrintBacklog(), 0,
+                   "a vector written by this build is not re-queued")
+
+        // Stand in for a cache an earlier build wrote: the row is there, but its
+        // recorded version is older than the one this build applies.
+        try RawSQL.exec(fixture.cachePath,
+                        "UPDATE asset_signals SET analyzer_version = 0 WHERE asset_identifier = 'a1';")
+        try await fixture.cache.beginScan()
+        checkEqual(try await fixture.cache.featurePrintBacklog(), 1,
+                   "an older analyzer version puts the asset back in the queue")
+        checkEqual(try await fixture.cache.claimFeaturePrints(limit: 10), ["a1"],
+                   "and it is claimed for regeneration")
+        // And regenerating it settles the question: the fresh row is current again.
+        try await fixture.cache.recordFeaturePrint(
+            SignalCompression.featurePrintData(try await makeFeaturePrint(.checkerboard))!, for: "a1")
+        try await fixture.cache.beginScan()
+        checkEqual(try await fixture.cache.featurePrintBacklog(), 0, "and stays out once rewritten")
+    })
+
+    Registry.shared.add(suite: "similar group cache", TestCase(name: "the face queue is ordered by capture time, oldest first", knownBug: nil) {
+        // The order is a property of the photos, not of which group happened to sort
+        // first. It used to be the smallest group identifier, which is unrelated to
+        // anything a user would recognise — and it made the doc's promise ("oldest
+        // first") false, which is the only reason this asserts a *direction*.
+        let fixture = try await Fixture.make("groups-facequeue-order")
+        // Two groups whose identifiers order *against* their capture times, so an
+        // order that tracked group ids — as this one used to — would answer
+        // differently from the documented one.
+        try await fixture.seed([
+            Fixture.Seed(id: "late-1", score: 0.5, date: 4_000),
+            Fixture.Seed(id: "late-2", score: 0.5, date: 3_000),
+            Fixture.Seed(id: "early-2", score: 0.5, date: 2_000),
+            Fixture.Seed(id: "early-1", score: 0.5, date: 1_000),
+        ])
+        try await fixture.cache.replaceGroups([
+            SimilarGroup(id: "a-late", members: ["late-1", "late-2"]),
+            SimilarGroup(id: "z-early", members: ["early-1", "early-2"]),
+        ], settings: .default, faceMemberCounts: [:], earliestDates: [:])
+
+        checkEqual(try await fixture.cache.groupMembersNeedingFaces(limit: 100),
+                   ["early-1", "early-2", "late-2", "late-1"],
+                   "oldest capture first, whatever the group or the identifier says")
+
+        // Two photos in one second tie-break on the identifier, so two runs cannot
+        // hand out the same work in a different order.
+        try await fixture.cache.recordFaceCaptureQuality(
+            SignalCompression.faceCaptureResultData(FaceCaptureResult(
+                faces: [FaceCapture(score: 0.5, areaFraction: 0.2)]))!, for: "early-1")
+        checkEqual(try await fixture.cache.groupMembersNeedingFaces(limit: 100),
+                   ["early-2", "late-2", "late-1"],
+                   "and the analysed one leaves the front of the queue")
+    })
+
+    Registry.shared.add(suite: "similar group cache", TestCase(name: "a group membership row whose asset is gone is pruned", knownBug: nil) {
+        // The foreign key normally takes a deleted asset's membership with it, so
+        // this is a no-op on a correct database — which is why it has to be called at
+        // all that a rebuild can read members while a scan deletes underneath it.
+        let fixture = try await Fixture.make("groups-orphan-member")
+        try await fixture.seed([
+            Fixture.Seed(id: "a1", score: 0.5, date: 100),
+            Fixture.Seed(id: "a2", score: 0.5, date: 101),
+        ])
+        try await fixture.cache.replaceGroups([SimilarGroup(id: "a1", members: ["a1", "a2"])],
+                                              settings: .default, faceMemberCounts: [:], earliestDates: [:])
+        checkEqual(try await fixture.cache.pruneOrphanGroupMembers(), 0,
+                   "nothing to prune while every member exists")
+
+        // Written through the raw handle, where foreign keys are off, so the orphan
+        // is a real one rather than something the schema would have refused.
+        try RawSQL.exec(fixture.cachePath,
+                        "INSERT INTO similar_group_members (group_id, asset_identifier) VALUES ('a1', 'gone');")
+        checkEqual(try await fixture.cache.groupID(containingAsset: "gone"), "a1",
+                   "the orphan is present, which is the state the sweep exists for")
+        checkEqual(try await fixture.cache.pruneOrphanGroupMembers(), 1, "and the sweep removes it")
+        checkNil(try await fixture.cache.groupID(containingAsset: "gone"), "it is gone")
+        checkEqual(try await fixture.cache.pruneOrphanGroupMembers(), 0, "and the sweep is idempotent")
+    })
+
+    Registry.shared.add(suite: "group pass settings", TestCase(name: "a relaunch still knows which rules built the stored groups", knownBug: nil) {
+        // The engine's own record of what it built is process state. Without the
+        // settings stored on the pass itself, a settings change followed by a quit
+        // would leave groups built under the old rules reported — and served — as
+        // current, and `stale` would read false in the one case where it matters.
+        let fixture = try await Fixture.make("groups-stale")
+        try await fixture.seed([
+            Fixture.Seed(id: "a1", score: 0.5, date: 100),
+            Fixture.Seed(id: "a2", score: 0.5, date: 101),
+        ])
+        try await fixture.cache.recordFeaturePrint(
+            SignalCompression.featurePrintData(try await makeFeaturePrint(.verticalBands))!, for: "a1")
+        try await fixture.cache.replaceGroups([SimilarGroup(id: "a1", members: ["a1", "a2"])],
+                                              settings: .default, faceMemberCounts: [:], earliestDates: [:])
+
+        // A second engine over the same cache stands in for the next launch: it has
+        // no memory of the pass at all.
+        let relaunched = SimilarGroupEngine(cache: fixture.cache, library: PhotoLibrary.shared,
+                                            settings: fixture.settings, bus: fixture.bus)
+        let fresh = await relaunched.status()
+        checkEqual(fresh.stale, false, "groups built under the current settings are not stale")
+        checkEqual(fresh.builtWithSettings, SimilarGroupSettings.default,
+                   "and the rules they were built under are reported")
+        check((fresh.lastBuiltAt ?? 0) > 0, "with the time of the pass")
+
+        // Now move a knob, as `/api/settings` does.
+        fixture.settings.update { $0.groupMaxDistance = 0.9 }
+        let stale = await relaunched.status()
+        checkEqual(stale.stale, true, "a pass built under different rules is reported as stale")
+        checkEqual(await relaunched.shouldRebuild(), true, "and a rebuild is warranted")
+    })
+
+    Registry.shared.add(suite: "group pass settings", TestCase(name: "a relaunch does not throw away a pass that is still fresh", knownBug: nil) {
+        // The other half of the same fact. A pass inside `maxAge` used to be
+        // discarded on every launch, because the only record of it was process state:
+        // a restart cost minutes of grouping to reproduce an answer that was already
+        // on disk and still correct.
+        let fixture = try await Fixture.make("groups-fresh-pass")
+        try await fixture.seed([
+            Fixture.Seed(id: "a1", score: 0.5, date: 100),
+            Fixture.Seed(id: "a2", score: 0.5, date: 101),
+        ])
+        try await fixture.cache.recordFeaturePrint(
+            SignalCompression.featurePrintData(try await makeFeaturePrint(.verticalBands))!, for: "a1")
+        try await fixture.cache.replaceGroups([SimilarGroup(id: "a1", members: ["a1", "a2"])],
+                                              settings: .default, faceMemberCounts: [:], earliestDates: [:])
+        let relaunched = SimilarGroupEngine(cache: fixture.cache, library: PhotoLibrary.shared,
+                                            settings: fixture.settings, bus: fixture.bus)
+        checkEqual(await relaunched.shouldRebuild(), false,
+                   "a pass inside the freshness bound is served rather than redone")
+
+        // And the empty case is still "do the work": no stored pass means no answer.
+        try await fixture.cache.replaceGroups([], settings: .default,
+                                              faceMemberCounts: [:], earliestDates: [:])
+        checkEqual(await relaunched.shouldRebuild(), true,
+                   "with nothing stored, a rebuild is the answer")
+    })
+
     Registry.shared.add(suite: "group routes", TestCase(name: "groups and a single group are served", knownBug: nil) {
         let fixture = try await Fixture.make("groups-routes")
         try await fixture.seed([
@@ -703,7 +851,7 @@ func registerSimilarGroupTests() {
     })
 
     Registry.shared.add(suite: "similar photo lookup", TestCase(name: "favourite protection does not hide a group from its own members", knownBug: nil) {
-        let fixture = try await Fixture.make("similar-lookup-favourites", protectFavorites: true)
+        let fixture = try await Fixture.make("similar-lookup-favourites")
         // Three members, two of them favourites. A cleanup-oriented list has little
         // to offer here — one photo is actionable — but "which photos are similar
         // to this one" is a different question, and it is answered from membership

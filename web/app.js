@@ -74,6 +74,22 @@
   const GROUPS_POLL_MS = 2000;
   /** The two within-group orders, as the server names them. */
   const GROUP_ORDERS = ['aesthetics', 'best_shot'];
+  /**
+   * The three media filters, as the server names them, and the vocabulary the
+   * media chips are built from — the same job `GROUP_ORDERS` does for the
+   * within-group chips.
+   *
+   * Held as a closed set rather than read off the chips because an
+   * unrecognised value is a **400** on the server, not a silent fallback to
+   * `all`: `resolveAlbumSelection` already documents why, and a media filter
+   * that quietly ignored what it was asked would be the same lie in a new place.
+   * Three chips means three clicks a user can make and no more, so the set is
+   * checked here rather than trusted from the DOM.
+   */
+  const MEDIA_CHOICES = ['all', 'images', 'videos'];
+  /** `PHAssetMediaType.video` raw value. Stored raw on the wire so a row and the
+   *  cache's `assets` table cannot disagree about what an asset is. */
+  const MEDIA_TYPE_VIDEO = 2;
   /** How often to re-read the album list *while* an index pass is running. */
   const ALBUM_POLL_MS = 1500;
   const AUTHORIZED_PHASES = ['authorized', 'limited'];
@@ -105,7 +121,23 @@
     filter: null,
     resolved: 0,
     protectedFavorites: 0,
+    /**
+     * Identifiers this client named that the server does not have.
+     *
+     * Non-zero when a photo has left the library since the page that named it was
+     * loaded, which is the one case where the bar's "N photos selected" and the
+     * Delete button's count disagree for a reason protection does not explain.
+     */
     unknownIdentifiers: 0,
+    /**
+     * True when the filter matched more assets than one resolution will return.
+     *
+     * The count is then the ceiling rather than the number of matches, so saying
+     * "all N photos match" would be false and the deletion would cover a subset of
+     * what the reader was shown. A 200,000-photo library is the only way to reach
+     * it, which is exactly why it needs saying rather than assuming.
+     */
+    truncated: false,
     /**
      * The fingerprint of the candidate set the server resolved for *this*
      * selection, taken from `/api/selection/preview` and sent back on the
@@ -130,6 +162,19 @@
     upper: 0,
     
     sort: 'score_asc',
+    /**
+     * Media filter: 'all', 'images' or 'videos' — the three values the server
+     * accepts on `?media=`.
+     *
+     * Written by two things, and read by neither of them blindly:
+     * `selectMedia` sets it from a click, and `adoptAppliedMedia` overwrites it
+     * with the `filter.media` the server echoes back. The second writer is the
+     * load-bearing one: the chips render from *this* field, so a client that
+     * showed its own request rather than the server's answer would draw "Videos"
+     * over a grid of photographs — the one state in which every number on screen
+     * is a lie. Exactly the rule the album filter already follows.
+     */
+    media: 'all',
     /** Album filter: 'all', 'none' (in no album), or an album identifier. */
     album: 'all',
     /** Albums the server has read, plus the indexing state behind them. */
@@ -192,16 +237,6 @@
       loadingNewer: false,
       /** Why there is nothing on screen, when there is nothing. */
       note: '',
-      /**
-       * The window's day buckets, and the row array they were derived from.
-       *
-       * `bucketStamp` is the row array's *identity*, not a version number: the
-       * window is replaced wholesale by every page load and never edited in place,
-       * so identity is an exact cache key and there is no in-place change that
-       * could leave a stale bucket list behind.
-       */
-      buckets: null,
-      bucketStamp: null,
       /** Where the score grid was, so that Back is lossless. See `closeAllPhotos`. */
       returnScrollY: 0,
       returnFocusId: '',
@@ -309,6 +344,13 @@
       if (!width || !height) return '—';
       return `${fmt.count(width)} × ${fmt.count(height)}`;
     },
+    /**
+     * An *estimate of how long a run will take* — the analysis ETA.
+     *
+     * Words and spaces (`1m 30s`), rounded, and it happily says `45s` for a
+     * sub-minute figure. Nothing reads it as a measurement of something real:
+     * it is a guess about the future, so the rounded figure is the honest one.
+     */
     duration(seconds) {
       if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return '';
       const total = Math.max(0, Math.round(seconds));
@@ -316,6 +358,34 @@
       const minutes = Math.floor(total / 60);
       if (minutes < 60) return `${minutes}m ${total % 60}s`;
       return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+    },
+    /**
+     * A clip's *length* — `m:ss`, or `h:mm:ss` past an hour.
+     *
+     * NOT `fmt.duration`, and deliberately a second formatter rather than a mode
+     * flag on the first. The two differ in ways that matter: this one is a
+     * measurement of a thing that exists (the clip is 3:07 long, and truncating
+     * down is what every video player does because rounding *up* would claim a
+     * frame the clip does not contain), and it is zero-padded so every badge in
+     * a grid is the same width and the digits do not shimmer as you scroll. An
+     * ETA that read `0:12` next to a badge that read `12s` for the same twelve
+     * seconds would be the worse outcome.
+     *
+     * Empty string for anything that is not a finite number, so a caller can
+     * skip the badge rather than print `0:00` — which would assert that a
+     * zero-length video exists, the same lie a stored `duration = 0` would be.
+     * Absent is not zero: `duration` is omitted from the row entirely for a
+     * still, and a video scanned before this version has no value at all yet.
+     */
+    mediaDuration(seconds) {
+      const number = Number(seconds);
+      if (seconds === null || seconds === undefined || !Number.isFinite(number) || number <= 0) return '';
+      const total = Math.floor(number);
+      const rest = total % 60;
+      const minutes = Math.floor(total / 60) % 60;
+      const hours = Math.floor(total / 3600);
+      const pad = (n) => String(n).padStart(2, '0');
+      return hours > 0 ? `${hours}:${pad(minutes)}:${pad(rest)}` : `${minutes}:${pad(rest)}`;
     },
     rate(value) {
       const number = Number(value) || 0;
@@ -362,6 +432,48 @@
 
   const thumbURL = (id, size) => `/api/photo/${encodeURIComponent(id)}/thumbnail?size=${size || THUMB_SIZE}`;
   const previewURL = (id) => `/api/photo/${encodeURIComponent(id)}/preview?size=${PREVIEW_SIZE}`;
+  /**
+   * The streamable bytes of a clip.
+   *
+   * `encodeURIComponent`, and it is not optional: a `localIdentifier` contains
+   * `/`, so an unescaped one arrives split across path segments and the router
+   * reassembles it as something else entirely. Same path the thumbnail already
+   * takes, for the same reason — one encoding rule for identifiers, not two.
+   */
+  const videoURL = (id) => `/api/photo/${encodeURIComponent(id)}/video`;
+
+  /**
+   * Whether a row describes a video.
+   *
+   * `mediaType` is *always* on the wire, and this reads it as the closed set it is
+   * — 1 is an image, 2 is a video — rather than as "truthy means video" or as a
+   * `!== 1` test. Both of those are wrong in the same direction: an unknown value
+   * from a future server, or a row whose field the encoder dropped, would be
+   * drawn as a `<video>`, and a video-shaped element over a photograph is a worse
+   * failure than an absent one. So anything that is not exactly 2 is rendered the
+   * way it has always been rendered, and the *duration* is what says whether there
+   * is a length to print — never this predicate.
+   */
+  const isVideoRow = (row) => Boolean(row) && Number(row.mediaType) === MEDIA_TYPE_VIDEO;
+
+  /**
+   * What a row *is*, for the tile's tooltip and its accessible name.
+   *
+   * '' for a still. Naming every photograph "Photo" would put a word in every
+   * tooltip in the grid to say nothing, and the grid's whole design is that a
+   * tile says as little as it can get away with.
+   *
+   * A clip says what it is *and* how long it is, because a poster frame is a
+   * photograph of one moment and nothing on screen distinguishes it from a
+   * still of that moment. When there is no length yet the type is still named
+   * and the length is left out, rather than the two being printed together with
+   * one of them unknown.
+   */
+  function mediaSummaryText(row) {
+    if (!isVideoRow(row)) return '';
+    const duration = fmt.mediaDuration(row.duration);
+    return duration ? `Video, ${duration}` : 'Video';
+  }
 
   /* -------------------------------------------------------------------- toast */
 
@@ -399,11 +511,20 @@
     // out would mean "all matching" taken inside an album view silently widened
     // to the whole library when the user then changed the album — the §4.9
     // failure mode, one level up.
+    //
+    // `media` is here for exactly that reason and it is not optional politeness:
+    // the same snapshot is what `/api/selection/preview` resolves and what
+    // `/api/delete` re-resolves, so a snapshot missing the media dimension
+    // resolves to every photo *and video* in the library. On a grid the user is
+    // looking at with Videos filtered out, "Delete 1,204 assets" would be the
+    // button they press. The selection is only safe if every dimension that
+    // decides membership is one of the things it pins.
     return {
       lo: state.lower,
       hi: state.upper,
       favorites: 'include',
       album: state.album,
+      media: state.media,
     };
   }
 
@@ -413,7 +534,69 @@
     const epsilon = scale * 1e-6;
     return Math.abs(a.lo - b.lo) <= epsilon && Math.abs(a.hi - b.hi) <= epsilon &&
       a.favorites === b.favorites &&
-      (a.album || 'all') === (b.album || 'all');
+      (a.album || 'all') === (b.album || 'all') &&
+      // `(x || 'all')` on both sides, like `album`: a snapshot taken before the
+      // media filter existed has no `media` key at all, and that is `all`, not a
+      // filter that no longer matches. A comparison that read absence as a
+      // mismatch would block deletion for a selection that is in fact current.
+      (a.media || 'all') === (b.media || 'all');
+  }
+
+  /**
+   * The singular noun for what the media filter admits, for the panel read-outs.
+   *
+   * "assets" for `all`, because Photos' assets are now photos *and* videos and
+   * the count beside the slider counts both — a read-out that said "photos" over
+   * a mixed grid would be wrong on the default view rather than only on a
+   * filtered one, which makes it the more important of the three.
+   */
+  function mediaNoun(selection = state.media) {
+    if (selection === 'videos') return 'video';
+    if (selection === 'images') return 'photo';
+    return 'asset';
+  }
+
+  /**
+   * The media selection in force, named the way a sentence names it.
+   *
+   * Beside `albumName`, and for the same reason: the Similar Groups view has
+   * both filters applied but shows neither chip, because the control panel that
+   * holds them is hidden while it is open. A list narrowed by a filter the
+   * reader cannot see is a list they will misread as the whole library.
+   */
+  function mediaScopeLabel(selection = state.media) {
+    if (selection === 'videos') return 'videos only';
+    if (selection === 'images') return 'photos only';
+    return 'all media';
+  }
+
+  /**
+   * Adopts the media filter the server *applied*, from a page response's
+   * `filter.media` echo.
+   *
+   * ## Why the echo and not the request
+   *
+   * The client renders from this field, so if it ever disagreed with the query
+   * that was answered the grid would be describing itself wrongly — the chips
+   * would say "Videos" over a page of photographs. The server is the only side
+   * that knows which set it actually queried, so its answer is what gets shown.
+   *
+   * An unrecognised echo is *ignored* rather than coerced to `all`. Coercing it
+   * would move the control to a filter the server never applied, which is the
+   * same lie arriving from the other direction; ignoring it leaves the control
+   * and the grid consistent with each other and the mismatch visible, which is
+   * the right outcome for what is in practice a version skew between the two.
+   */
+  function adoptAppliedMedia(echoed) {
+    if (typeof echoed !== 'string' || !MEDIA_CHOICES.includes(echoed)) return false;
+    if (state.media === echoed) return false;
+    state.media = echoed;
+    renderMediaBar();
+    // The chips moved, and so did the filter a live "all matching" selection was
+    // snapshotted under, so the bar has to be told — or it would keep printing a
+    // count for a set the server is no longer being asked about.
+    updateSelectionBar();
+    return true;
   }
 
   /** Snap the live bounds back onto the real observed extremes. */
@@ -595,7 +778,16 @@
     // Always sent, including 'all', so the query the client runs is the query the
     // server sees — and so a cursor minted under one album can never be replayed
     // under another (the server binds the token to the filter and refuses).
+    //
+    // `media` rides the same rule for a sharper reason. The pagination fingerprint
+    // folds in every dimension that changes *which rows exist*, and a keyset
+    // token issued under `media=images` describes a position inside the photos;
+    // replayed under `media=videos` it would be a position in a different set, and
+    // the server refusing it (§4.2) is the only thing that keeps page two from
+    // silently splicing images and videos together. The client does not get to
+    // decide that; it just has to not leave the dimension out.
     params.set('album', state.album);
+    params.set('media', state.media);
     if (cursor) params.set('cursor', cursor);
     return params;
   }
@@ -615,6 +807,11 @@
       const data = await api.get('/api/photos?' + pageQuery(cursor).toString());
       if (generation !== state.generation) return; // a newer filter owns the grid now
       adoptObservedBounds(data.bounds?.min, data.bounds?.max, false);
+      // What the server applied, not what was asked for — see `adoptAppliedMedia`.
+      // Read on *every* page rather than only the first, because the echo is
+      // also the cheapest notice this client gets that it and the server are on
+      // different builds; on a later page it would otherwise go unnoticed.
+      adoptAppliedMedia(data.filter && data.filter.media);
       const rows = Array.isArray(data.items) ? data.items : [];
       state.total = Number(data.total) || 0;
       state.nextCursor = data.nextCursor || null;
@@ -827,6 +1024,66 @@
   }
 
   /**
+   * Paints the three media chips: All, Photos, Videos.
+   *
+   * The markup in `index.html` is deliberately this exact row of `.chip`
+   * buttons — the selected state, the hover and the focus ring come free from
+   * the class, which is the point. This function only decides which one carries
+   * `active`, and it reads `state.media` rather than tracking clicks, so the
+   * control cannot disagree with the grid.
+   *
+   * `aria-pressed` rather than `role="radio"`: the group is announced as a group
+   * in the markup and each chip as a toggle button, which is what it is. A radio
+   * group would promise arrow-key navigation between the three, and the arrow
+   * keys in this window mean "previous/next photo" everywhere else.
+   */
+  function renderMediaBar() {
+    const holder = $('mediaChips');
+    if (!holder) return;
+    for (const chip of holder.querySelectorAll('[data-media]')) {
+      const active = chip.dataset.media === state.media;
+      chip.classList.toggle('active', active);
+      chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+  }
+
+  /**
+   * Filters the grid to one media type.
+   *
+   * Three things happen, and each has a reason that the album filter's identical
+   * three reasons do not cover on their own:
+   *
+   * - **The grid resets.** The keyset cursor names a position inside one result
+   *   set, and the media dimension changes which set that is. `scheduleReload` →
+   *   `resetGrid` bumps the generation, so a page still in flight for the
+   *   previous filter is discarded rather than appended to the new grid.
+   * - **The Similar Groups window resets.** Those routes take the media filter
+   *   too, and their offsets are the same kind of "position inside one result
+   *   set" the grid's cursor is.
+   * - **A "matching" selection goes stale.** Handled by `sameFilter` reading
+   *   `media`, not by clearing anything: `updateSelectionBar` reports the
+   *   mismatch and blocks deletion until the user re-snapshots or clears it
+   *   explicitly. An explicit id selection is unaffected by a filter change by
+   *   design — those are photographs the reader pointed at, and a filter that
+   *   silently emptied a hand-picked selection would be worse than the staleness
+   *   it is avoiding.
+   *
+   * Unlike the album chips, clicking the pressed chip does **not** clear the
+   * filter: "All" is a real bucket with its own meaning rather than the absence
+   * of one, so there is no "no filter" state left to fall back to. Clicking All
+   * is how you get back, and it is one of the three buttons.
+   */
+  function selectMedia(value) {
+    const next = MEDIA_CHOICES.includes(value) ? value : 'all';
+    if (state.media === next) return;
+    state.media = next;
+    renderMediaBar();
+    updateSelectionBar();
+    if (state.groups.active) resetGroupsWindow();
+    scheduleReload(0);
+  }
+
+  /**
    * Filters the grid to one album.
    *
    * Always resets the grid: the keyset cursor names a position inside one result
@@ -880,7 +1137,7 @@
     syncGroupsHeading();
     $('groupsList').replaceChildren();
     renderGroups();
-    loadGroups('first');
+    return loadGroups('first');
   }
 
   function sentinelInView() {
@@ -892,7 +1149,8 @@
     // The All Photos window is not the score grid's business: a page that lands
     // while the window is open must not reveal "Load more" behind it.
     if (state.all.active) { $('loadMore').hidden = true; return; }
-    // Nor is it the Similar Groups view's business: it has its own Load-more button.
+    // Nor is it the Similar Groups view's business: that list pages from its own
+    // two sentinels and says so in its own busy row.
     if (state.groups.active) { $('loadMore').hidden = true; return; }
     const more = Boolean(state.nextCursor);
     $('loadMore').hidden = !more;
@@ -932,11 +1190,14 @@
     tile.dataset.index = String(index);
     tile.tabIndex = 0;
     tile.setAttribute('role', 'button');
-    // The tile is a photograph now, with no text under it, so this tooltip is
+    // A tile is a photograph now, with no text under it, so this tooltip is
     // where the date and the album live — along with the score, the one figure
-    // that is actually drawn.
+    // that is actually drawn, and the media type and length, which are drawn but
+    // only as two marks. "Video, 2:07" here and "2:07" on the badge is the
+    // tooltip saying what the badge means.
     tile.title = [
       fmt.score(row.score),
+      mediaSummaryText(row),
       fmt.date(row.date),
       fmt.dimensions(row.width, row.height),
       albumSummaryText(row.id),
@@ -949,6 +1210,13 @@
     const media = document.createElement('div');
     media.className = 'tile-media';
 
+    // The thumbnail is a video's poster frame from the *same* route a still uses.
+    // There is no second image path, and there could not usefully be one:
+    // `requestImage` already answers a video with a decoded frame, so a
+    // `?poster=1` parameter would buy nothing except a second thing that can be
+    // wrong. The tile is also still an `<img>` for the same reason — the lazy
+    // load, the decode, the error placeholder and `previewSourceFor`'s query all
+    // work on it unchanged.
     const image = document.createElement('img');
     image.className = 'tile-image';
     image.loading = 'lazy';
@@ -960,6 +1228,35 @@
     });
     image.src = thumbURL(row.id);
     media.appendChild(image);
+
+    // A clip's two marks. Both on the photograph rather than in the tile's gutter,
+    // because the grid's one rule is that a tile prints as little as it can get
+    // away with, and both of these are about *which medium this is* — which is
+    // the thing a poster frame cannot say about itself.
+    if (isVideoRow(row)) {
+      // The length, in the corner opposite the score so the two never compete and
+      // so a mixed grid has both facts in the same place on every tile.
+      const duration = fmt.mediaDuration(row.duration);
+      if (duration) {
+        const badge = document.createElement('span');
+        badge.className = 'tile-duration';
+        badge.textContent = duration;
+        // Hidden from the accessibility tree because the tile's own accessible
+        // name already says "Video, 2:07" (see `decorateTile`), and a screen
+        // reader would otherwise read the length twice from two elements.
+        badge.setAttribute('aria-hidden', 'true');
+        media.appendChild(badge);
+      }
+      // The play glyph, centred, and *not* hidden from assistive technology even
+      // though it carries no information: it is the one place in the grid where
+      // "this is a video" is legible at a glance without reading, which is what
+      // stops a contact sheet of frames from being read as a sheet of photographs.
+      const play = document.createElement('span');
+      play.className = 'tile-play';
+      play.setAttribute('aria-hidden', 'true');
+      play.textContent = '▶';
+      media.appendChild(play);
+    }
 
     // Hover tools. One container so they fade in together and sit side by side.
     const tools = document.createElement('div');
@@ -1059,7 +1356,7 @@
     // no other way in. It is deliberately a *separate* path: it must not fire
     // for a mouse, and it must cancel the pending synthetic click so holding a
     // finger down does not also toggle the selection.
-    attachTileContextMenu(tile, row, list, view);
+    attachTileContextMenu(tile, row);
     return tile;
   }
 
@@ -1090,8 +1387,7 @@
 
   /**
    * Repaints everything about a tile that depends on shared state: the selection
-   * ring, the bitmap check mark and the heart (a favourite stops being "protected"
-   * the moment the Protect Favorites setting is turned off).
+   * ring, the bitmap check mark and the heart.
    */
   function decorateTile(tile, row) {
     const selected = isSelected(row.id);
@@ -1101,10 +1397,21 @@
     // the favourite state, and the album. A glyph on the photo is a hint, not the
     // fact — so with the heart as the only visible mark, "protected from deletion"
     // is stated here rather than left to the reader of a lock that no longer exists.
+    // It is stated unconditionally because protection is: there is no setting that
+    // can take it away.
     const albumSummary = albumsFor(row.id);
-    const protectedNow = row.favorite && favouritesProtected();
+    const protectedNow = Boolean(row.favorite);
+    // The media type and length go here, in the name, and not only on the marks:
+    // a duration badge is a number in a corner and a play glyph is a shape, and
+    // neither is a *name*. This is where the rest of what the tile no longer
+    // prints already lives — the date, the album, the protection — so it is where
+    // a clip's two facts belong too. Omitted entirely for a still rather than
+    // saying "Photo": "Photo" on a photograph is a word the reader supplied.
+    const media = mediaSummaryText(row);
     tile.setAttribute('aria-label',
-      `Score ${fmt.score(row.score)}, ${fmt.dateShort(row.date)}`
+      `Score ${fmt.score(row.score)}`
+      + `${media ? `, ${media}` : ''}`
+      + `, ${fmt.dateShort(row.date)}`
       + `${row.favorite ? ', favorite' : ''}`
       + `${protectedNow ? ', protected from deletion' : ''}`
       + (albumSummary.length ? `, in ${albumSummary.map((a) => a.title).join(', ')}` : ''));
@@ -1136,10 +1443,8 @@
     heart.setAttribute('aria-pressed', favourite ? 'true' : 'false');
     heart.setAttribute('aria-label', favourite ? 'Remove from Favourites' : 'Make Favourite');
     heart.title = favourite
-      ? (favourite && favouritesProtected()
-        ? 'Favorite — protected from deletion. Click to remove.'
-        : 'Favorite in Photos — not protected from deletion while Protect Favorites is off. Click to remove.')
-      : 'Mark as a favorite in Photos. Favourites are excluded from deletion while Protect Favorites is on.';
+      ? 'Favorite — protected from deletion. Click to remove.'
+      : 'Mark as a favorite in Photos. Favourites are excluded from deletion.';
   }
 
   /**
@@ -1185,10 +1490,6 @@
       ? 'The pixels are stored in iCloud. Enable "Download from iCloud when required" to fetch them.'
       : 'PhotoKit could not produce a thumbnail for this asset.';
     return node;
-  }
-
-  function favouritesProtected() {
-    return !state.serverSettings || state.serverSettings.protectFavorites !== false;
   }
 
   /**
@@ -1271,9 +1572,9 @@
    * A context menu acts *on* something; it does not *change* what is selected.
    * Finder is the model: right-clicking outside a selection leaves the selection
    * alone, and right-clicking inside it keeps it. So `openTileMenu` reads the
-   * selection and never writes it — the only path that writes is an explicit
-   * "Select"/"Deselect" item, which is the user asking for it. It also does not
-   * move the shift-click anchor, since that anchor *is* selection state.
+   * selection and never writes it, and it does not move the shift-click anchor,
+   * since that anchor *is* selection state. Selecting is a gesture on the photo
+   * itself, and it is one gesture away there.
    *
    * ## Why there is one menu, not one per tile
    *
@@ -1304,7 +1605,7 @@
   /** Held between the long-press timer firing and the synthetic click arriving. */
   let suppressNextTileClick = false;
 
-  function attachTileContextMenu(tile, row, list, view) {
+  function attachTileContextMenu(tile, row) {
     tile.addEventListener('contextmenu', (event) => {
       // Suppressing the browser's own menu is the whole point: every item here
       // is one this app can act on. `preventDefault` does that, and the bubbling
@@ -1444,8 +1745,9 @@
    * The score grid, All Photos, a group strip and the lightbox all reach here,
    * and "Show in All Photos" / "Show Similar Photos" / the favourite toggle /
    * Delete mean the same thing in each — so a second menu would be a second set
-   * of rules about favourite protection, free to drift from the first. The caller now supplies only the row and where to anchor the menu.
-   * Nothing below reads a queue or an index, because nothing left needs one.
+   * of rules about favourite protection, free to drift from the first. The caller
+   * supplies only the row and where to anchor the menu; nothing below reads a
+   * queue or an index, because nothing left needs one.
    *
    * ## Enabled state
    *
@@ -1517,7 +1819,7 @@
         // held back to take out again, so there is no second item here: what the
         // server did is reported once, in the toast.
         label: 'Delete',
-        hint: `${fmt.count(targets.length)} ${fmt.plural(targets.length, 'photo', 'photos')}`,
+        hint: `${fmt.count(targets.length)} ${fmt.plural(targets.length, mediaNoun(), `${mediaNoun()}s`)}`,
         disabled: false,
         run: () => deletePhotos({ mode: 'ids', ids: targets }),
       },
@@ -1610,7 +1912,7 @@
         + 'reachable from a tile menu — use the Delete button in the bar for that.';
     }
     if (count > 1) {
-      return `Affects all ${fmt.count(count)} selected ${fmt.plural(count, 'photo', 'photos')}. `
+      return `Affects all ${fmt.count(count)} selected ${fmt.plural(count, mediaNoun(), `${mediaNoun()}s`)}. `
         + 'Open in Photos always opens one photo — the one you clicked.';
     }
     if (selectionHasContent() && !inSelection) {
@@ -1651,10 +1953,10 @@
   /**
    * Adds or removes every photo between the shift-click anchor and `index`.
    *
-   * Extracted from the shift-click handler so the menu's "Select range" item is
-   * the *same* operation rather than a second implementation that could drift.
-   * `list` is the caller's live accessor: the All Photos window prepends pages,
-   * so a captured array would index a window that has moved.
+   * Extracted from the shift-click handler so the grid's ⇧-click and a group
+   * cell's are the *same* operation rather than two that could drift. `list` is
+   * the caller's live accessor: the All Photos window prepends pages, so a
+   * captured array would index a window that has moved.
    */
   function selectRangeTo(index, list, anchor = gridAnchor()) {
     const from = anchor.get();
@@ -1997,6 +2299,15 @@
    * the library resolves to something else by the time Delete is pressed, the
    * server refuses instead of destroying a set nobody was shown.
    */
+  /** Forgets what the server last resolved for a selection, leaving the set itself. */
+  function clearResolved(selection) {
+    selection.resolved = 0;
+    selection.protectedFavorites = 0;
+    selection.unknownIdentifiers = 0;
+    selection.truncated = false;
+    selection.confirmToken = '';
+  }
+
   function refreshSelectionPreview() {
     clearTimeout(state.previewTimer);
     const token = ++state.previewToken;
@@ -2004,19 +2315,28 @@
       const selection = state.selection;
       const spec = selectionSpec();
       if (spec.mode === 'ids' && spec.ids.length === 0) {
-        selection.resolved = 0;
-        selection.protectedFavorites = 0;
-        selection.unknownIdentifiers = 0;
-        selection.confirmToken = '';
+        clearResolved(selection);
         updateSelectionBar();
         return;
       }
       const { ok, payload } = await api.post('/api/selection/preview', spec);
       if (token !== state.previewToken) return; // a newer selection won
-      if (!ok) { toast('Could not resolve the selection — ' + errorText(payload, 'the server refused'), 'error'); return; }
+      if (!ok) {
+        // A failed resolution counts as no resolution. Leaving the previous
+        // selection's numbers in place would leave the Delete button armed over a
+        // set whose count nobody has confirmed, and would carry the old
+        // fingerprint into the next deletion — which the server would refuse, so
+        // the press would fail rather than delete, but with a count on the button
+        // that belonged to a selection the reader has already moved on from.
+        clearResolved(selection);
+        updateSelectionBar();
+        toast('Could not resolve the selection — ' + errorText(payload, 'the server refused'), 'error');
+        return;
+      }
       selection.resolved = Number(payload.resolved) || 0;
       selection.protectedFavorites = Number(payload.protectedFavorites) || 0;
       selection.unknownIdentifiers = Number(payload.unknownIdentifiers) || 0;
+      selection.truncated = payload.truncated === true;
       selection.confirmToken = typeof payload.confirmToken === 'string' ? payload.confirmToken : '';
       updateSelectionBar();
     }, SELECTION_PREVIEW_DEBOUNCE_MS);
@@ -2060,29 +2380,51 @@
       : 'Select all matching';
     $('selectAllMatching').disabled = !boundsUsable();
 
+    // What the selection actually holds, named by the media filter in force.
+    // A set snapshotted under "Photos" can only be photos, so saying "asset"
+    // there would be the safe-but-vague choice; but on the default mixed view it
+    // would be a falsehood in the other direction, so the noun follows the filter.
+    const noun = mediaNoun();
     if (selection.mode === 'matching') {
-      summary.appendChild(document.createTextNode('All '));
+      summary.appendChild(document.createTextNode(selection.truncated ? 'Up to ' : 'All '));
       summary.appendChild(emphasize(selection.resolved));
       summary.appendChild(document.createTextNode(
-        ` ${fmt.plural(selection.resolved, 'photo matches', 'photos match')} the saved filter`));
-      $('selectionHint').textContent = 'Click a photo to exclude it · This covers every match, not just the loaded page';
+        ` ${fmt.plural(selection.resolved, `${noun} matches`, `${noun}s match`)} the saved filter`));
+      // "Up to" rather than "All" when the server capped the resolution: the count
+      // is then a ceiling, and the sentence has to read as one.
+      $('selectionHint').textContent = selection.truncated
+        ? `More ${noun}s match than PhotoCleaner will resolve at once`
+          + ' · Click one to exclude it'
+        : `Click a ${noun} to exclude it · This covers every match, not just the loaded page`;
     } else if (selection.ids.size > 0) {
       summary.appendChild(emphasize(selection.ids.size));
       summary.appendChild(document.createTextNode(
-        ` ${fmt.plural(selection.ids.size, 'photo', 'photos')} selected`));
+        ` ${fmt.plural(selection.ids.size, noun, `${noun}s`)} selected`));
       $('selectionHint').textContent = 'Click to select · Shift-click for a range · ⌫ or Delete deletes the selection';
     } else {
       summary.appendChild(document.createTextNode('Nothing selected'));
       $('selectionHint').textContent = 'Click to select · Shift-click for a range · ⌫ or Delete deletes the selection';
     }
 
+    // The two reasons the button's count can be lower than the bar's, stated where
+    // the bar is: one is a setting the reader can see and turn off, and the other
+    // is a photo that has left the library since the page that named it was
+    // loaded. Neither is left for the reader to reconcile on their own.
+    const shortfalls = [];
     if (selection.protectedFavorites > 0) {
-      const protectedNode = document.createElement('span');
-      protectedNode.className = 'muted';
-      protectedNode.style.marginLeft = '10px';
-      protectedNode.textContent = `· ${fmt.count(selection.protectedFavorites)} protected ` +
-        `${fmt.plural(selection.protectedFavorites, 'favorite', 'favorites')} excluded`;
-      summary.appendChild(protectedNode);
+      shortfalls.push(`${fmt.count(selection.protectedFavorites)} protected `
+        + `${fmt.plural(selection.protectedFavorites, 'favorite', 'favorites')} excluded`);
+    }
+    if (selection.unknownIdentifiers > 0) {
+      shortfalls.push(`${fmt.count(selection.unknownIdentifiers)} no longer in `
+        + 'PhotoCleaner');
+    }
+    if (shortfalls.length) {
+      const note = document.createElement('span');
+      note.className = 'muted';
+      note.style.marginLeft = '10px';
+      note.textContent = `· ${shortfalls.join(' · ')}`;
+      summary.appendChild(note);
     }
 
     // The Delete button destroys whatever is selected, so its state is a function
@@ -2105,10 +2447,7 @@
     selection.filter = currentFilter();
     selection.ids = new Set();
     selection.excluded = new Set();
-    selection.resolved = 0;
-    selection.protectedFavorites = 0;
-    selection.unknownIdentifiers = 0;
-    selection.confirmToken = '';
+    clearResolved(selection);
     state.previewToken += 1; // abandon any preview still in flight for the old selection
     clearTimeout(state.previewTimer);
     refreshAllTiles();
@@ -2143,14 +2482,6 @@
     if (!container.contains(active)) { event.preventDefault(); first.focus(); return; }
     if (event.shiftKey && active === first) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
-  }
-
-  function describeFilter(filter) {
-    const bits = [`score ${fmt.score(filter.lo, 3)} … ${fmt.score(filter.hi, 3)}`];
-    if (filter.favorites && filter.favorites !== 'include') bits.push(`favorites: ${filter.favorites}`);
-    const album = filter.album || 'all';
-    if (album !== 'all') bits.push(`album: ${albumName(album)}`);
-    return bits.join(' · ');
   }
 
   /** The human name for an album wire value: a title, or the bucket's own name. */
@@ -2204,8 +2535,13 @@
     const count = state.selection.resolved;
     const live = canDeleteSelection();
     button.disabled = !live;
+    // The noun follows the media filter, because this button is about to delete
+    // whatever the selection resolved to — and on the default mixed view that can
+    // be clips as well as photos. "Delete 4 photos" over a set that includes two
+    // videos is a miscount of what is about to be destroyed.
+    const noun = mediaNoun();
     button.textContent = live
-      ? `Delete ${fmt.count(count)} ${fmt.plural(count, 'photo', 'photos')}`
+      ? `Delete ${fmt.count(count)} ${fmt.plural(count, noun, `${noun}s`)}`
       : 'Delete';
     button.title = selectionStale()
       ? 'Blocked: the saved filter is no longer the filter on screen.'
@@ -2272,10 +2608,20 @@
       return;
     }
 
-    let message = `Deleted ${fmt.count(deleted)} ${fmt.plural(deleted, 'photo', 'photos')} through Photos.`;
+    // Past tense: this reports what is *gone*, and "assets" reads as bureaucratic in
+    // a sentence about a deletion the user just chose. The singular is the noun the
+    // filter gives us minus its plural, so "photos" → "photo", "assets" → "asset".
+    const past = mediaNoun().replace(/s$/, '');
+    let message = `Deleted ${fmt.count(deleted)} ${fmt.plural(deleted, past, `${past}s`)} through Photos.`;
     if (missing > 0) message += ` ${fmt.count(missing)} ${fmt.plural(missing, 'was', 'were')} already gone.`;
     if (protectedFavorites > 0) {
       message += ` ${fmt.count(protectedFavorites)} protected ${fmt.plural(protectedFavorites, 'favorite', 'favorites')} kept.`;
+    }
+    // The filter matched more than one resolution returns, so the number just
+    // reported is how many were destroyed and not how many there were. Saying so
+    // is the difference between a count and a claim.
+    if (report.truncated === true) {
+      message += ' More photos matched than PhotoCleaner resolves at once, so this was a subset.';
     }
     // One toast, not two: the element holds a single line, and a second call
     // would replace the count with a sentence and lose the count.
@@ -2287,6 +2633,12 @@
     // The window is rebuilt around its anchor, not thrown away: the photos the
     // user just destroyed were part of the series they were looking at.
     if (state.all.active) await reopenAllPhotosAfterDelete(spec);
+    // The group strip is not the grid, so `resetGrid` below never touches it — a
+    // member destroyed from a group's own menu would otherwise stay on screen,
+    // still selectable and still offering a Delete for a photo that is gone. The
+    // whole window is re-read rather than the cell patched out, because a group
+    // whose members have all been deleted is itself gone.
+    if (state.groups.active) await resetGroupsWindow();
     await resetGrid();
     await refreshStatus();
   }
@@ -2746,7 +3098,6 @@
     ghost: null,
     timers: [],
     source: null,
-    target: null,
     aspect: 0,
     travelled: false,
     decoded: false,
@@ -2776,10 +3127,15 @@
     $('lightbox').classList.remove('lightbox-entering');
   }
 
-  /** Forgets where the last travel was, so the next one starts from nothing. */
+  /**
+   * Forgets where the last travel was, so the next one starts from nothing.
+   *
+   * The shape goes with the tile it was measured from: they are one piece of
+   * information, and a shape left behind from a photograph that is no longer the one
+   * on screen would quietly mis-frame the next travel.
+   */
   function previewForget() {
     previewTravel.source = null;
-    previewTravel.target = null;
     previewTravel.aspect = 0;
   }
 
@@ -2942,10 +3298,11 @@
     previewTravel.settled = false;
     const source = previewSourceFor(row.id);
     previewTravel.aspect = previewAspect(row, source);
-    const target = previewTargetRect(previewTravel.aspect);
     previewTravel.source = source;
-    previewTravel.target = target;
-    if (!source || !target || prefersReducedMotion()) return;
+    // Measured and checked before anything else is set up: with no tile and no stage
+    // there is nowhere to fly to, and every caller has to work without the animation.
+    const target = source ? previewTargetRect(previewTravel.aspect) : null;
+    if (!target || prefersReducedMotion()) return;
     const tile = previewTileRect(source);
     if (!tile) return;
     const ghost = previewGhost(target, source.currentSrc || source.src);
@@ -2967,9 +3324,21 @@
 
   /** Resolves once the preview bitmap has decoded, or the grace period runs out. */
   function previewWhenDecoded() {
+    const row = currentLightboxRow();
+    // A clip waits for its *metadata*, not for a bitmap, and that is not a
+    // downgrade: the travelling copy is a still of the poster frame, so the thing
+    // arriving on top of it is a video of the same frame at the same size, and
+    // holding the still until the clip can play would hold a frame that is already
+    // visible for however long the export takes. `loadedmetadata` is also bounded
+    // by `preload="metadata"` rather than by the reader having pressed play, so it
+    // arrives without a byte of the body being downloaded.
+    const video = isVideoRow(row) ? $('lightboxVideo') : null;
     const image = $('lightboxImage');
     const ready = () => { previewTravel.decoded = true; settlePreviewTravel(); };
-    if (typeof image.decode === 'function') image.decode().then(ready, ready);
+    if (video) {
+      video.addEventListener('loadedmetadata', ready, { once: true });
+      video.addEventListener('error', ready, { once: true });
+    } else if (typeof image.decode === 'function') image.decode().then(ready, ready);
     else {
       image.addEventListener('load', ready, { once: true });
       image.addEventListener('error', ready, { once: true });
@@ -3012,16 +3381,22 @@
    */
   function startPreviewReturn() {
     const source = previewTravel.source;
-    // Measured again rather than remembered: the overlay is still on screen here,
-    // so this is the live stage, and the target the travel came from may no longer
-    // be where the stage is.
+    // Measured again rather than remembered: the overlay is still on screen here, so
+    // this is the live stage, and where the travel started from may have moved under
+    // a window that was resized while the preview was open.
     const target = previewTargetRect(previewTravel.aspect);
-    previewTravel.source = null;
-    previewTravel.target = null;
+    // The tile and its shape are read *before* this clear — afterwards there is
+    // nothing left to travel to.
+    previewDropGhost();
+    previewForget();
     if (!source || !target || prefersReducedMotion()) return false;
     const tile = previewTileRect(source);
     if (!tile) return false;
     const image = $('lightboxImage');
+    // The fallback is not only for a missing bitmap: for a clip `#lightboxImage`
+    // is *always* empty, because the stage is showing a `<video>`. So a clip's
+    // return flight flies its poster frame — which is exactly the frame the
+    // travelling copy was showing on the way out, and the one the tile draws.
     const ghost = previewGhost(target, image.naturalWidth
       ? (image.currentSrc || image.src)
       : (source.currentSrc || source.src));
@@ -3120,14 +3495,70 @@
   }
 
   /**
+   * Stops and empties whatever the stage is currently showing.
+   *
+   * Called at the top of every `renderLightbox` and from `hideLightbox`, so it
+   * runs on paging, on repainting for a favourite toggle, and on close — three
+   * separate ways for a clip to be left playing underneath something else, and
+   * all three have to go through here rather than each remembering.
+   *
+   * `pause()` before the source is dropped, because removing `src` from a playing
+   * element does not reliably stop it: the media stack may be mid-buffer, and the
+   * sound continues over whatever replaced the clip. Then the attributes are
+   * *removed* rather than assigned empty strings, so there is no URL left to
+   * resolve and the decoder and the open connection to the export both go.
+   *
+   * `load()` afterwards is what tells the element it has no resource, which is
+   * the step that actually tears the media stack down. Guarded because jsdom does
+   * not implement it — see docs/WEB-UI-TESTS.md, which is the file that names
+   * what the jsdom harness cannot do.
+   */
+  function teardownLightboxMedia() {
+    const video = $('lightboxVideo');
+    if (!video) return;
+    // Nothing to release is the common case, and it is worth saying so: this runs
+    // from `hideLightbox` on every close, and a reader paging photographs never
+    // loads a clip at all. Pausing and reloading an element that was never given a
+    // source is a media-stack round trip for nothing — and on a machine with a few
+    // hundred photos in the queue it is a few hundred wasted ones.
+    //
+    // It is also the case jsdom cannot do at all: `HTMLMediaElement.pause` and
+    // `.load` are reported as "not implemented" rather than throwing, so calling
+    // them unguarded fills a jsdom run with errors about a code path that never had
+    // anything to release. See docs/WEB-UI-TESTS.md.
+    // Read *before* removing, or the test is on the post-removal state and the
+    // guards would never fire.
+    const hadSource = video.hasAttribute('src');
+    const hadPoster = video.hasAttribute('poster');
+    if (hadSource) {
+      try { video.pause(); } catch { /* nothing decoded yet */ }
+    }
+    video.removeAttribute('src');
+    video.removeAttribute('poster');
+    video.onerror = null;
+    // `load()` only when there was something to unload, for the same reason. It is
+    // the step that actually tears down the decoder and the open request to the
+    // export; removing `src` alone does not reliably do it.
+    if (hadSource || hadPoster) {
+      try { video.load(); } catch { /* no media stack */ }
+    }
+  }
+
+  /**
    * Takes the overlay off the screen and drops the decoded preview, so a large
    * JPEG is not held alive by a closed view.
    *
    * On the way in this is the last statement of the travel, not the first: a
    * `display: none` halfway through would cut the photograph off where it stood.
+   *
+   * `teardownLightboxMedia` rather than `hidden = true`: a closed lightbox with
+   * a paused-but-attached clip still holds that clip's decoder and its half-open
+   * export request for the rest of the session, and the next open would race a
+   * resource the previous one still holds.
    */
   function hideLightbox() {
     $('lightbox').hidden = true;
+    teardownLightboxMedia();
     $('lightboxImage').onerror = null;
     $('lightboxImage').src = '';
     restoreFocus();
@@ -3187,18 +3618,91 @@
     const lightbox = state.lightbox;
 
     const image = $('lightboxImage');
+    const video = $('lightboxVideo');
     const fallback = $('lightboxFallback');
     fallback.hidden = true;
-    image.hidden = false;
-    image.onerror = () => { image.hidden = true; fallback.hidden = false; };
-    image.src = previewURL(row.id);
-    image.alt = `Photo scored ${fmt.score(row.score)}`;
+
+    // Exactly one of the two elements is on the stage at a time.
+    //
+    // For a clip the teardown is conditional on the clip being a *different* one,
+    // and that condition is the whole of the pause-on-page requirement. `pause()`
+    // before the source is dropped, because removing `src` from a playing element
+    // does not reliably stop it: the media stack may be mid-buffer and the sound
+    // continues over whatever replaced the clip. Then the attributes are *removed*
+    // rather than assigned empty strings, so there is no URL left to resolve and
+    // the decoder and its open connection to the export both go.
+    //
+    // Conditional rather than unconditional, and deliberately so: `renderLightbox`
+    // is also the repaint path for a favourite toggle applied from the lightbox,
+    // and a version that tore the player down on every render would interrupt
+    // playback because the reader hearted the clip they were watching. Paging is
+    // the event that changes the clip; repainting is not.
+    //
+    // Compared against the element's own `src` rather than a remembered id, so the
+    // check cannot drift from what is actually loaded: there is no second field to
+    // keep in step, and the test is the question that matters — "is this a
+    // different clip from the one this element is playing?"
+    const wantedVideo = videoURL(row.id);
+    const showingAnother = video.getAttribute('src') !== wantedVideo;
+    if (showingAnother) teardownLightboxMedia();
+
+    if (isVideoRow(row)) {
+      image.hidden = true;
+      video.hidden = false;
+      video.controls = true;
+      // `preload="metadata"` and no `autoplay` — set once in the markup and restated
+      // here because this is the only place the element is configured, and an
+      // attribute set from JS is not obviously the same as one set in HTML.
+      // Autoplay is the one thing this client must never do: a grid of clips that
+      // starts talking the moment you page through it is not a photo cleaner, and
+      // nothing about opening a preview is a request to play anything.
+      video.preload = 'metadata';
+      video.autoplay = false;
+      // The poster is the same preview route a still uses, so the first frame is
+      // a decoded PhotoKit rendition rather than the 256px tile, and the clip is
+      // recognisable before it has loaded. `poster` rather than a `<video>` child,
+      // which nothing supports.
+      video.poster = previewURL(row.id);
+      // Reassigned unconditionally, unlike `src` above, and for the same reason as
+      // the still's: a poster is a picture, so setting it again is a no-op for the
+      // clip and repainting the metadata must not leave the frame from the last
+      // clip on screen.
+      if (showingAnother) video.src = wantedVideo;
+      video.setAttribute('aria-label', `Video, scored ${fmt.score(row.score)}`);
+      video.title = `${mediaSummaryText(row)} · ${fmt.date(row.date)}`;
+      // A clip whose export cannot be produced — the original is iCloud-only and
+      // downloads are off, or Photos has no video resource — raises `error`, and
+      // the same fallback line the still uses is the honest answer. Not hidden:
+      // a black rectangle with a broken player in it tells the reader nothing.
+      video.onerror = () => {
+        video.hidden = true;
+        fallback.hidden = false;
+        fallback.textContent = 'This clip could not be loaded — its original may be stored in iCloud only.';
+      };
+    } else {
+      // A still after a clip: the player goes first, or the clip's audio survives
+      // the page change. `teardownLightboxMedia` above has already run for this
+      // case, because a still never equals a clip's `src`.
+      video.hidden = true;
+      image.hidden = false;
+      image.onerror = () => { image.hidden = true; fallback.hidden = false; };
+      image.src = previewURL(row.id);
+      image.alt = `Photo scored ${fmt.score(row.score)}`;
+    }
 
     $('lightboxScore').textContent = fmt.score(row.score);
     $('lightboxDate').textContent = fmt.date(row.date);
     // A group response carries no dimensions, so this renders "—" rather than
     // inventing a size PhotoCleaner has not read for that photo.
     $('lightboxDimensions').textContent = fmt.dimensions(row.width, row.height);
+    // Length, for a clip only. Hidden rather than showing "—" beside a
+    // photograph, because a row that is present and empty reads as a value
+    // PhotoCleaner failed to read rather than as one that does not apply. And a
+    // clip whose length has not been scanned prints nothing at all — the same
+    // reason the tile's badge is conditional.
+    const length = fmt.mediaDuration(row.duration);
+    $('lightboxDurationRow').hidden = !(isVideoRow(row) && length);
+    $('lightboxDuration').textContent = length;
     $('lightboxFavorite').textContent = row.favorite ? 'Yes' : 'No';
     $('lightboxSelect').textContent = isSelected(row.id) ? 'Deselect' : 'Select';
     // One photo and one label, because there is no second state to toggle
@@ -3209,18 +3713,15 @@
     $('lightboxDelete').disabled = state.deleting;
 
     // The favourite toggle. Its label says what a favourite *does*, because that
-    // is the only protection this tool has: with Protect Favorites on, a favourite
-    // is excluded from every bulk deletion.
+    // is the only protection this tool has: a favourite is excluded from every
+    // bulk deletion, always.
     const favoriteButton = $('lightboxFavoriteToggle');
     favoriteButton.textContent = row.favorite ? '♥ Favourite — protected' : '♡ Make favourite';
     favoriteButton.setAttribute('aria-pressed', row.favorite ? 'true' : 'false');
     favoriteButton.classList.toggle('is-favorite', Boolean(row.favorite));
     favoriteButton.title = row.favorite
-      ? (favouritesProtected()
-        ? 'A favourite, so it is excluded from deletion. Click to remove the favourite flag.'
-        : 'A favourite in Photos. Protect Favorites is off, so it is not excluded from deletion. '
-          + 'Click to remove the favourite flag.')
-      : 'Mark as a favourite in Photos. Favourites are excluded from deletion while Protect Favorites is on.';
+      ? 'A favourite, so it is excluded from deletion. Click to remove the favourite flag.'
+      : 'Mark as a favourite in Photos. Favourites are excluded from deletion.';
 
     // Every album this photo is in, as clickable chips. A photo in none says so
     // explicitly rather than showing a dash that reads as "not loaded yet".
@@ -3334,55 +3835,8 @@
     // The protected-favourite count is authoritative from the server, and it moves
     // whenever the favourite flag does — including from the tile menu and the
     // lightbox, without a reload.
-    renderProtectedCount();
-
     renderEmptyState();
     updateSelectionBar();
-  }
-
-  /**
-   * "N photos protected" next to the favourite toggle.
-   *
-   * From `status.library.favorites`, the cache's own count, so it agrees with what
-   * deletion will actually honour rather than with what the loaded page happens to
-   * show. The wording says what protection *means* — "excluded from deletion" —
-   * because "protected" on its own is a promise this tool only keeps while the
-   * setting is on, and the setting is visible right next to it.
-   *
-   * The same sentence is also the *switch's* tooltip, not only the count's: the
-   * question the switch raises is "what does turning this on protect?", and the
-   * answer is a number that lives one span to its right. `aria-describedby` points
-   * the checkbox at the count, so a screen reader hears the figure as the switch's
-   * description rather than as an unrelated run of text beside it.
-   */
-  function renderProtectedCount() {
-    const node = $('protectedCount');
-    if (!node) return;
-    const library = (state.status && state.status.library) || {};
-    const total = Number(library.favorites) || 0;
-    const on = favouritesProtected();
-    // "1 photo" is the only count that is not plural, so the verb has to agree with
-    // it: "1 photo is a favourite in your library" / "107 photos are favourites".
-    const photoIs = fmt.plural(total, 'photo is', 'photos are');
-    const aFavourite = fmt.plural(total, 'photo is a favourite', 'photos are favourites');
-    node.textContent = fmt.count(total);
-    node.parentElement.classList.toggle('is-off', !on);
-    node.parentElement.title = on
-      ? `${fmt.count(total)} ${aFavourite} in your library, excluded from every deletion`
-      : `${fmt.count(total)} ${aFavourite} — but Protect Favorites is off, so they are not excluded from deletion`;
-
-    const checkbox = $('protectFavorites');
-    const option = $('protectFavoritesOption');
-    if (checkbox && node.parentElement.id) {
-      checkbox.setAttribute('aria-describedby', node.parentElement.id);
-    }
-    if (option) {
-      // Same claim as the count's tooltip, phrased from the switch's side and kept
-      // in step with `on` so it never says "protected" for a setting that is off.
-      option.title = on
-        ? `Protect Favorites is on — ${fmt.count(total)} ${photoIs} protected from deletion`
-        : `Protect Favorites is off — ${fmt.count(total)} ${photoIs} not protected from deletion`;
-    }
   }
 
   /** Reflects server-side settings without fighting the user mid-click. */
@@ -3391,12 +3845,10 @@
     const first = state.serverSettings === null;
     const changed = !first && (
       state.serverSettings.downloadFromICloud !== settings.downloadFromICloud ||
-      state.serverSettings.protectFavorites !== settings.protectFavorites ||
       state.serverSettings.concurrency !== settings.concurrency
     );
     state.serverSettings = { ...settings };
     if (first || changed) {
-      if (document.activeElement !== $('protectFavorites')) $('protectFavorites').checked = settings.protectFavorites !== false;
       if (document.activeElement !== $('icloudDownloads')) $('icloudDownloads').checked = settings.downloadFromICloud === true;
       if (!first) {
         // "protected" badges and the authoritative count both depend on this.
@@ -3573,6 +4025,12 @@
 
   function updateCounts() {
     $('matchCount').textContent = fmt.count(state.total);
+    // "matching photos" / "matching videos" / "matching assets", from the filter
+    // in force. The noun has to track `state.media` because the count does: on the
+    // default `all` the number spans both media types, and a read-out that said
+    // "photos" there would be wrong on the view most readers use rather than only
+    // on a filtered one.
+    $('matchCountNoun').textContent = fmt.plural(state.total, mediaNoun(), `${mediaNoun()}s`);
     if (!state.status) return;
     const analysis = state.status.analysis || {};
     const library = state.status.library || {};
@@ -3580,6 +4038,18 @@
     $('totalCount').textContent = fmt.count(analysis.total);
     $('headerTotal').textContent = fmt.count(library.total);
     $('headerAnalyzed').textContent = fmt.count(analysis.analyzed);
+
+    // "assets", not "photos": `library.total` counts clips as well, and this is the
+    // view most readers are on, so a "photos" label here would be wrong by default
+    // rather than only under a filter.
+    $('headerTotalLabel').textContent = 'assets';
+    // Clips broken out, and only when there are any. The count comes from the
+    // server: inferring it as `total - images` could not distinguish "this library
+    // has no videos" from "this build has not scanned them yet", and offering a
+    // Videos filter that quietly returns nothing is worse than not offering it.
+    const videos = Number(library.videos) || 0;
+    $('headerVideosWrap').hidden = videos === 0;
+    if (videos > 0) $('headerVideos').textContent = fmt.count(videos);
 
     const problems = [];
     if (analysis.failed > 0) problems.push(`${fmt.count(analysis.failed)} failed`);
@@ -3611,10 +4081,25 @@
       detail = 'Grant PhotoCleaner access in System Settings › Privacy & Security › Photos, then relaunch.';
     } else if (!boundsUsable()) {
       title = 'Scoring your library';
-      detail = 'PhotoCleaner scores photos with Apple’s on-device aesthetics model. Nothing is shown until the first scores exist — this takes a minute or two for a large library.';
+      detail = 'PhotoCleaner scores every photo and clip with Apple’s on-device aesthetics model — '
+        + 'one frame for a photograph, three for a video. Nothing is shown until the first scores exist, '
+        + 'which takes a minute or two for a large library.';
     } else if (state.total === 0) {
-      title = 'No photos match this score range';
-      detail = 'Widen the range, or press “Reset” to follow the lowest and highest scores in the library.';
+      // The filter, named: "nothing here" has to say *which* nothing, or a Videos
+      // filter that happens to match nothing reads as a library with no videos in
+      // it. Three separate facts produce this one screen — no scores, nothing in
+      // range, or a library of nothing but audio — and only the first is
+      // recoverable by widening.
+      if (state.media === 'videos') {
+        title = 'No videos match this score range';
+        detail = 'Widen the range, or choose “All” or “Photos” — PhotoCleaner can only show videos it has scored.';
+      } else if (state.media === 'images') {
+        title = 'No photos match this score range';
+        detail = 'Widen the range, or choose “All” — PhotoCleaner can only show photos it has scored.';
+      } else {
+        title = 'No photos or videos match this score range';
+        detail = 'Widen the range, or press “Reset” to follow the lowest and highest scores in the library.';
+      }
     }
 
     if (!title) { node.hidden = true; node.replaceChildren(); return; }
@@ -3715,21 +4200,15 @@
       });
     });
 
-    // Favourite protection is enforced server-side; the checkbox only expresses the
-    // preference, so it is re-synced from the returned snapshot whatever happens.
-    $('protectFavorites').addEventListener('change', async (event) => {
-      const protect = event.target.checked;
-      const { ok, payload } = await api.post('/api/settings', { protectFavorites: protect });
-      if (ok && payload && payload.settings) applyStatus(payload);
-      else { event.target.checked = !protect; toast('Could not change the setting — ' + errorText(payload, 'the server refused'), 'error'); return; }
-      // Protection is part of what the selection *resolves to*, so flipping it
-      // changes the count on the button — and the fingerprint Delete would
-      // present. One re-read answers both.
-      refreshSelectionPreview();
-      toast(protect
-        ? 'Favorites are protected — they are excluded from every deletion.'
-        : 'Favorites are no longer protected and can now be deleted.', protect ? 'info' : 'warning');
-    });
+    // The media filter. No clear-on-second-click, unlike the album chips: "All"
+    // is one of the three buckets rather than the absence of a filter, so there
+    // is no fourth state to fall back to and a click on the pressed chip is
+    // simply a click on the chip it already names. The pressed state is painted
+    // from `state.media` and not from the click, because the server's echo writes
+    // that field too — see `adoptAppliedMedia`.
+    for (const chip of document.querySelectorAll('[data-media]')) {
+      chip.addEventListener('click', () => selectMedia(chip.dataset.media));
+    }
 
     $('icloudDownloads').addEventListener('change', async (event) => {
       const enabled = event.target.checked;
@@ -3775,6 +4254,11 @@
     $('lightboxPrev').addEventListener('click', () => navigateLightbox(-1));
     $('lightboxNext').addEventListener('click', () => navigateLightbox(1));
     $('lightboxStage').addEventListener('click', (event) => {
+      // The still, and only the still. Clicking a clip's picture is a click on a
+      // transport — the reader is aiming at the play button, the scrub bar or the
+      // volume, and paging the overlay out from under that would be the exact
+      // "it kept playing under the next photo" bug the queue reindexing comments
+      // describe, arrived at from the other end.
       if (event.target === $('lightboxImage')) navigateLightbox(1);
     });
     $('lightboxSelect').addEventListener('click', () => {
@@ -3796,18 +4280,33 @@
       if (row) showSimilarPhotos(row.id);
     });
     // Right-click on the inspected photo. Suppressing the browser's own menu is
-    // scoped to the image — the chrome around it keeps the native menu, because
-    // "Copy Image Address" on a PhotoCleaner thumbnail is a reasonable thing for
-    // someone to want and this app has nothing to do with it. What replaces it is
-    // the same PhotoCleaner menu a grid tile gets.
-    $('lightboxImage').addEventListener('contextmenu', (event) => {
+    // scoped to the two elements the photo is actually drawn in — the chrome
+    // around them keeps the native menu, because "Copy Image Address" on a
+    // PhotoCleaner thumbnail is a reasonable thing for someone to want and this
+    // app has nothing to do with it. What replaces it is the same PhotoCleaner
+    // menu a grid tile gets.
+    //
+    // One listener on the stage rather than one per element, because the element
+    // changes: a clip is a `<video>` and a still is an `<img>`, and a pair of
+    // listeners would be a pair of places for the menu to stop working when the
+    // media type does. `event.target` is the check that keeps the scoping, and it
+    // is the *same* check the still has always had — the menu has to keep working
+    // when the photo is a `<video>`, so the filter is "is this the media
+    // element", not "is this an image".
+    $('lightboxStage').addEventListener('contextmenu', (event) => {
+      const stage = $('lightboxStage');
+      if (event.target !== $('lightboxImage') && event.target !== $('lightboxVideo')) return;
       const row = currentLightboxRow();
       if (!row) return;
       event.preventDefault();
       event.stopPropagation();
-      openTileMenu($('lightboxImage'), row, { x: event.clientX, y: event.clientY },
-                   // The photo is an `<img>` and cannot hold focus, so the menu
-                   // hands it back to the button that closes the lightbox.
+      openTileMenu(event.target, row, { x: event.clientX, y: event.clientY },
+                   // The media element is not a control the menu should hand focus
+                   // back to — a `<video>` with `controls` can hold focus, and
+                   // returning it there would leave focus on an element that is
+                   // about to be hidden or torn down. So the menu names the button
+                   // that closes the lightbox, as it did when the photo could not
+                   // hold focus at all.
                    $('lightboxClose'));
     });
     // Favouriting from the lightbox goes through the same code path as the tile
@@ -3942,6 +4441,14 @@
       if (event.key !== 'Escape' && event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== ' ') return;
       const target = event.target;
       if (target instanceof HTMLElement && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) return;
+      // A clip's own transport keeps the keys it owns, or paging with → would seek
+      // the clip and move the overlay at the same time. Escape still closes from
+      // anywhere, because it is the one key with no meaning inside a `<video>`.
+      // `buildTile`'s keydown is untouched: this is the *document* handler, and a
+      // tile's Space/Enter contract is unchanged by either line.
+      const onClipControls = state.lightbox.open
+        && target instanceof HTMLElement
+        && target.closest('#lightboxVideo') !== null;
       if (event.key === 'Escape') {
         // Lightbox first, then whichever secondary view is open: the same "one level
         // back per press" rule the rest of the interface already follows.
@@ -3950,6 +4457,7 @@
         if (state.groups.active) closeGroups();
         return;
       }
+      if (onClipControls) return;
       if (!state.lightbox.open) return;
       if (event.key === 'ArrowLeft') { event.preventDefault(); navigateLightbox(-1); }
       else if (event.key === 'ArrowRight') { event.preventDefault(); navigateLightbox(1); }
@@ -3958,7 +4466,10 @@
         // Space is the preview toggle, so inside the preview it quits. Opening
         // and closing on the same key is what makes it a toggle rather than two
         // shortcuts: the key does the same thing wherever you press it, which is
-        // the whole point of a toggle.
+        // the whole point of a toggle. (Unless the key went to the clip's own
+        // transport, which is what `onClipControls` above is about — Space is
+        // play/pause on a `<video>`, and closing the window under it would be
+        // paging away from a clip the reader is trying to watch.)
         closeLightbox();
       }
     });
@@ -4026,11 +4537,13 @@
     const generation = state.groups.generation;
     updateGroupsBusy();
     try {
-      // `album` is sent even though the rows are discarded: the status has to come
-      // from the same result set the list is showing, and an album this instance
-      // has not read is a 400 rather than a silently unfiltered answer.
+      // `album` and `media` are sent even though the rows are discarded: the status has
+      // to come from the same result set the list is showing, and both an album
+      // this instance has not read and a media value it does not recognise are a
+      // 400 rather than a silently unfiltered answer.
       const params = new URLSearchParams({
-        order: state.groups.order, limit: '1', offset: '0', album: state.album,
+        order: state.groups.order, limit: '1', offset: '0',
+        album: state.album, media: state.media,
       });
       const data = await api.get('/api/groups?' + params.toString());
       if (generation !== state.groups.generation || !state.groups.active) return;
@@ -4327,15 +4840,17 @@
   function syncGroupsHeading() {
     const focused = state.groups.focused;
     $('groupsTitle').textContent = focused ? 'Similar Photos' : 'Similar Groups';
-    // The album filter is stated here because it silently narrows the list: without
+    // Both filters are named here because they silently narrow the list: without
     // this line a user who filtered the grid to one album and then opened Similar
     // Groups would see fewer groups and have no way to tell that from a library
-    // that simply has fewer duplicates.
-    const scope = state.album === 'all' ? '' : ` · in ${albumName(state.album)}`;
+    // that simply has fewer duplicates. And both chips live in the control panel,
+    // which this view hides — so the heading is the only place either is visible.
+    const albumScope = state.album === 'all' ? '' : ` · in ${albumName(state.album)}`;
+    const mediaScope = state.media === 'all' ? '' : ` · ${mediaScopeLabel()}`;
     $('groupsSub').textContent = (focused
       ? 'The photos PhotoCleaner groups with the one you came from'
       : 'Photos that look like alternate captures of the same shot · sorted within each group')
-      + scope;
+      + albumScope + mediaScope;
   }
 
   /** The album in force, named the way a sentence would name it. */
@@ -4353,6 +4868,15 @@
    * something false.
    */
   function groupsEmptyNote() {
+    // Videos are never grouped — see ARCHITECTURE §9 for the reasoning — so this
+    // filter has nothing to show by construction. Saying "No similar groups
+    // found" would be a claim about the library that happens to be false, and the
+    // kind of false claim that convinces a reader their clips are duplicates of
+    // nothing. It says what is true instead, and names the filter to change.
+    if (state.media === 'videos') {
+      return 'Videos are never grouped. A clip is scored and browsed like any other asset, '
+        + 'but PhotoCleaner does not put it in a Similar Group — choose “All” or “Photos” to see groups.';
+    }
     if (state.album === 'all') {
       return 'No similar groups found. Photos captured seconds apart that look alike will appear here.';
     }
@@ -4401,9 +4925,14 @@
         if (groups.focusId) {
           // One group, through the route the group browser already reads. A focused
           // group is a closed set that arrived whole, so there is nothing to grow.
-          const params = new URLSearchParams({
-            id: groups.focusId, order: groups.order, album: state.album,
-          });
+          // The same two dimensions the grid is filtered by, for the same reason: a group
+            // list narrowed by filters the reader cannot see is a list they will
+            // misread as the whole library. The group view hides the control
+            // panel that holds both chips, so `syncGroupsHeading` has to name them.
+            const params = new URLSearchParams({
+              id: groups.focusId, order: groups.order,
+              album: state.album, media: state.media,
+            });
           const group = await api.get('/api/group?' + params.toString());
           if (generation !== groups.generation || !groups.active) return;
           // A group can exist and still hold nothing from the album in view — the
@@ -4443,6 +4972,7 @@
           limit: String(GROUPS_PAGE),
           offset: String(offset),
           album: state.album,
+          media: state.media,
         });
         const data = await api.get('/api/groups?' + params.toString());
         // A page for a superseded order must not splice itself into the view.
@@ -4508,18 +5038,14 @@
    */
   function groupsEdges() {
     const groups = state.groups;
-    if (groups.focused) return { top: false, bottom: false, loaded: 0, total: 0, complete: true };
-    const loaded = groups.rows.length;
+    if (groups.focused) return { top: false, bottom: false };
     const total = Math.max(0, Number(groups.total) || 0);
     // `total` is 0 before the first response, which means *unknown*, not *none* —
     // so neither end claims to be finished while the answer is still unknown.
     const known = total > 0 || groups.status !== null;
     return {
       top: groups.startOffset > 0,
-      bottom: !known || loaded < total,
-      loaded,
-      total,
-      complete: known && loaded >= total,
+      bottom: !known || groups.rows.length < total,
     };
   }
 
@@ -4548,12 +5074,10 @@
         : (groups.loadingAt === 'bottom' ? 'Loading more groups…' : 'Loading groups…');
     } else if (building) {
       message = 'Grouping your library — groups appear here as they are found…';
-    } else if (groups.rows.length === 0) {
-      // A first load that has finished with nothing on screen. The "all loaded"
-      // case never reaches here with a message, so this is only the genuine
-      // empty-and-finished case.
-      message = '';
     }
+    // An empty list with nothing loading is the genuine empty-and-finished case,
+    // and it has no message here: `renderGroups` says so in the empty area, which
+    // is where a reader looks for an answer rather than at a spinner over nothing.
     busy.hidden = message === '';
     $('groupsBusyText').textContent = message;
     // `is-pending` is the slow, non-urgent variant: a grouping pass is minutes of
@@ -4577,8 +5101,10 @@
         parts.push(`${fmt.count(count)} ${fmt.plural(count, 'photo', 'photos')}`);
       }
     }
-    // In list mode the position is the busy line's business — it sits with the
-    // thing being loaded, which is where a reader looks for "is there more".
+    // Only the settled counts live here. Work still outstanding is the progress
+    // line's business, and "grouping is running" is the busy row's — three places
+    // claiming one fact is three places to keep in step, and only one of them is
+    // the one that must never be absent when the list is empty.
     if (status) {
       if (Number(status.featurePrints) > 0) {
         parts.push(`${fmt.count(status.featurePrints)} photos compared`);
@@ -4586,17 +5112,10 @@
       if (Number(status.facesAnalyzed) > 0) {
         parts.push(`${fmt.count(status.facesAnalyzed)} face quality reads`);
       }
-      if (Number(status.facesPending) > 0) {
-        parts.push(`${fmt.count(status.facesPending)} still reading faces`);
-      }
-      if (status.stale) parts.push('settings changed — rebuilding');
     }
     $('groupsMeta').textContent = parts.join(' · ') || '—';
 
-    // Progress is the *detail*; "grouping is running" itself is the busy line's job
-    // now, so it is not repeated here. Two places claiming the same fact is two
-    // places to keep in step, and the one that must never be absent is the one
-    // standing in for an empty list.
+    // What is still outstanding, stated once and in full.
     const progress = [];
     if (status && Number(status.facesPending) > 0) {
       progress.push(`${fmt.count(status.facesPending)} photos still being checked for faces`);
@@ -4624,8 +5143,8 @@
       // *process*, never a conclusion: "No similar groups found" printed over a
       // half-finished pass is a false negative for every photo in the library, and
       // it is the kind of false negative that convinces a user their photos are
-      // unique. `updateGroupsBusy` says the same thing above the list; this is the
-      // in-place copy, so the empty area is never a bare void either.
+      // unique. `updateGroupsBusy` says the same thing in the row below the list;
+      // this is the in-place copy, so the empty area is never a bare void either.
       //
       // `note` outranks both, because in focused mode it is the specific reason
       // *this* photo has no group — a different fact again.
@@ -4874,7 +5393,9 @@
         event.stopPropagation();
         return;
       }
-      // Shift-Arrow walks the strip. Space and Enter are the preview toggle here,
+      // ← and → walk the strip, which is what they do in every list the app owns. The
+      // preview's own arrow keys are only live while the preview is open, so there
+      // is nothing to shadow here. Space and Enter are the preview toggle instead,
       // the same two keys that open a tile, rather than the selection a button
       // would activate itself with.
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -4917,10 +5438,10 @@
     toggleSelection(row.id);
   }
 
-  /** Moves focus along the strip. */
+  /** Moves focus along the strip, and stops at either end rather than wrapping. */
   function focusGroupCell(group, from, step) {
     const items = groupItems(group);
-    const index = from;
+    const index = from + step;
     if (index < 0 || index >= items.length) return;
     const card = groupCard(group.id);
     const cell = card && card.querySelector(`.group-cell[data-index="${index}"]`);
@@ -5118,6 +5639,10 @@
   async function boot() {
     // Reflect the default sort in the markup before the first paint of the chips.
     document.querySelector('.chip[data-sort="score_asc"]').classList.add('active');
+    // The same for the media chips, and from `state.media` rather than by marking
+    // one in the markup: `selectMedia` and `adoptAppliedMedia` both write that
+    // field, so the first paint has to come from the one place they agree on.
+    renderMediaBar();
     wireControls();
     // One call: `updateSelectionBar` ends by repainting the Delete button, and it
     // is the only writer of that button's state.

@@ -421,9 +421,15 @@ struct UpdateInstaller: Sendable {
         // The pid and the path are passed as positional parameters and never
         // interpolated into the script. A path containing a quote, a space or a
         // `$(...)` must not be able to become shell syntax.
+        //
+        // `open`'s absolute path comes from `Tool` like every other one, so the
+        // "resolved by absolute path or not at all" rule has exactly one list.
+        // `sleep` is the one tool left to the shell's `PATH`: it is a shell
+        // builtin on every macOS `/bin/sh`, and a process whose only job is to
+        // wait cannot be made safer by naming it.
         let script = """
         while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
-        exec /usr/bin/open -a "$2"
+        exec \(Tool.open.rawValue) -a "$2"
         """
         let process = Process()
         process.executableURL = Tool.shell.url

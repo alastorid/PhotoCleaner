@@ -115,7 +115,7 @@ func registerSelectionTests() {
         // reach `PhotoLibrary.delete` from this case.
         let deletion = await fixture.router.reply(Req.post("/api/delete", json: #"{"mode":"ids"}"#))
         checkEqual(deletion.status, 400, "and the deletion route refuses it too")
-        checkEqual(deletion.has("deleted") == false, true, "rather than reporting a deletion report at all")
+        check(!deletion.has("deleted"), "rather than reporting a deletion report at all")
         checkEqual((try? await fixture.cache.stats(maxAge: 0))?.total, 1, "the cache is untouched")
         // `null` is as absent as omitted, and `exclude` is not a substitute for the
         // argument the mode actually names.
@@ -169,12 +169,13 @@ func registerSelectionTests() {
         }
     })
 
-    // The utility filter is gone. A client predating that removal still sends the
-    // parameter, so what matters now is that it is *ignored* — neither an error,
-    // nor a filter, and above all not a silently narrowed selection.
-    Registry.shared.add(suite: suite, TestCase(name: "a stale utility filter is ignored, not refused and not applied",
+    // A filter key this server does not know is not a filter, not an error, and
+    // above all not a silently narrowed selection. A client that predates the
+    // removal of one still sends it, so what has to hold is that an unrecognised
+    // key is ignored rather than honoured or refused.
+    Registry.shared.add(suite: suite, TestCase(name: "an unknown filter key is ignored, not refused and not applied",
         knownBug: nil) {
-        let fixture = try await Fixture.make("selection-staleutil")
+        let fixture = try await Fixture.make("selection-unknownkey")
         try await fixture.seed([
             .init(id: "a", score: 0.1, date: 1),
             .init(id: "b", score: 0.2, date: 2),
@@ -182,14 +183,16 @@ func registerSelectionTests() {
         ])
         let plain = await fixture.router.reply(Req.post("/api/selection/preview",
             json: #"{"mode":"matching","filter":{"lo":-1,"hi":1}}"#))
-        for value in ["only", "hide", "include", "nonsense", ""] {
-            let stale = await fixture.router.reply(Req.post("/api/selection/preview",
-                json: #"{"mode":"matching","filter":{"lo":-1,"hi":1,"utility":"\#(value)"}}"#))
-            checkEqual(stale.status, 200, "utility=\"\(value)\" must not fail a request")
-            checkEqual(stale.int("requested"), plain.int("requested"),
-                       "utility=\"\(value)\" must not narrow the selection")
-            checkEqual(stale.int("resolved"), plain.int("resolved"),
-                       "utility=\"\(value)\" must not change what is deletable")
+        for key in ["utility", "futureKnob", "scoreRange"] {
+            for value in ["only", "hide", "include", "nonsense", ""] {
+                let stale = await fixture.router.reply(Req.post("/api/selection/preview",
+                    json: #"{"mode":"matching","filter":{"lo":-1,"hi":1,"\#(key)":"\#(value)"}}"#))
+                checkEqual(stale.status, 200, "\(key)=\"\(value)\" must not fail a request")
+                checkEqual(stale.int("requested"), plain.int("requested"),
+                           "\(key)=\"\(value)\" must not narrow the selection")
+                checkEqual(stale.int("resolved"), plain.int("resolved"),
+                           "\(key)=\"\(value)\" must not change what is deletable")
+            }
         }
     })
 
@@ -358,7 +361,7 @@ func registerSelectionTests() {
     Registry.shared.add(suite: suite, TestCase(name: "a deletion whose identifiers are all unknown changes nothing",
         knownBug: nil) {
         // Safe to send: `resolveSelection` returns no candidates, so
-        // `Router.delete` never calls `PhotoLibrary.delete` (Router.swift:671).
+        // `Router.delete` never calls `PhotoLibrary.delete` with a non-empty set.
         let fixture = try await Fixture.make("selection-delete-unknown")
         try await fixture.seed([.init(id: "real", score: 0.1, date: 1)])
         let reply = await fixture.router.reply(Req.post("/api/delete",

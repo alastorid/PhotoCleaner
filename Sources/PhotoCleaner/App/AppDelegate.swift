@@ -72,6 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     /// half-released observer graph at that moment is a crash on the way out.
     private var updater: Updater?
     private var updateObservation: UUID?
+    /// The most recent updater state, whether or not there is a window to draw it
+    /// in. See `render`.
+    private var latestUpdateStatus = Updater.Status()
 
     init(options: LaunchOptions) {
         self.options = options
@@ -144,7 +147,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     }
 
     /// Draw one updater state, on the main actor, wherever the window is.
+    ///
+    /// Retained as well as forwarded, because the window does not exist for the
+    /// first part of the updater's life — it is created when the server is
+    /// listening, and the updater is built before that — and the title bar's
+    /// first painted state has to be the real one rather than a default the arc
+    /// would sit on until the next thing that happened to update it.
     private func render(_ status: Updater.Status) {
+        latestUpdateStatus = status
         window?.showUpdateStatus(status)
         MainMenu.updateItem(for: status)
     }
@@ -171,16 +181,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     ///
     /// Flipping it *on* runs a check immediately rather than waiting for the next
     /// launch. Turning it on and then waiting is how an opt-in setting feels broken.
+    ///
+    /// The new value is derived and handed to the updater rather than written to
+    /// the item here: `MainMenu.updateItem(for:)` is the only thing that writes
+    /// that checkmark, and it writes the value the updater is about to act on, so
+    /// the two cannot disagree while a check is in flight.
     @objc func toggleAutomaticUpdateChecks(_ sender: Any?) {
         guard let updater else { return }
-        let enabled: Bool
-        if let item = sender as? NSMenuItem {
-            enabled = item.state != .on
-            item.state = enabled ? .on : .off
-        } else {
-            enabled = false
+        // Read the item before the hop rather than capturing `sender`: `Any` is
+        // not `Sendable`, and the checkmark is the thing being toggled anyway.
+        let fromMenu = (sender as? NSMenuItem).map { $0.state == .on }
+        Task { [weak self] in
+            guard self != nil else { return }
+            // With no item to read — the responder chain invoked the action
+            // directly — the updater's own value is the only honest source, and
+            // defaulting to `false` would quietly turn a user's setting off.
+            // Spelled out rather than `??` because `??` takes an autoclosure, and
+            // an autoclosure cannot be `await`ed.
+            var wasOn: Bool
+            if let fromMenu {
+                wasOn = fromMenu
+            } else {
+                wasOn = await updater.current.automaticChecks
+            }
+            await updater.setAutomaticChecks(!wasOn)
         }
-        Task { await updater.setAutomaticChecks(enabled) }
     }
 
     /// One entry point for both the menu item and the arc.
@@ -191,7 +216,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     /// that silently stays on the old version after being asked to update is the
     /// one failure mode worth being loud about.
     private func runUpdateFlow() {
-        guard let updater else { return }
+        guard let updater else {
+            // The window is up before the updater is built, so a click in that
+            // window is possible. Saying nothing would leave an arc that looks
+            // clickable and does nothing at all.
+            Log.info("an update was asked for before the updater existed")
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             switch await updater.start() {
@@ -234,6 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
         }
         let created = AppWindow(url: url)
         window = created
+        created.showUpdateStatus(latestUpdateStatus)
         created.show()
     }
 

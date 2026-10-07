@@ -40,7 +40,7 @@ func registerPresentationTests() {
         checkEqual(options.port, 8799, "--port is read")
         checkEqual(options.presentation, .headless, "--no-browser is read")
         checkEqual(options.presentation.opensBrowser, false, "headless does not open a browser")
-        checkEqual(options.presentation.showsWindow, false, "headless shows no window")
+        check(!Presentation.needsAppKit(options.presentation), "headless shows no window")
 
         // Last one wins, which is the least surprising reading of a repeated flag.
         checkEqual(LaunchOptions.parse(["photo-cleaner", "--no-browser", "--browser"]).presentation, .browser,

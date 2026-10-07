@@ -30,9 +30,18 @@ enum Log {
         if !FileManager.default.fileExists(atPath: url.path) {
             FileManager.default.createFile(atPath: url.path, contents: nil)
         }
+        // Every step above is best effort and every one of them can fail: a
+        // sandboxed launch, a home directory the process cannot write, a log
+        // path that is a directory. A `nil` handle is the whole answer — `write`
+        // skips the file and carries on — rather than a reason to refuse to
+        // start, because a missing log must not be a missing app.
         let handle = try? FileHandle(forWritingTo: url)
         _ = try? handle?.seekToEnd()
-        state.withLock { $0.handle = handle }
+        let opened = handle != nil
+        state.withLock { current in
+            current.handle = handle
+            if !opened { current.failed = true }
+        }
     }
 
     private static func rotateIfNeeded(_ url: URL) {

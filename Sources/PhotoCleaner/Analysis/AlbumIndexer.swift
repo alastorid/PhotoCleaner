@@ -22,11 +22,9 @@ import Foundation
 /// ## Ordering: smallest first
 ///
 /// Albums arrive from `PhotoLibrary.userAlbums()` sorted by
-/// `estimatedAssetCount` ascending, which is a deliberate approximation of cost.
-/// It is not exact — Photos' estimate is the whole library, while the write is
-/// only over assets this instance has scanned — but it is the right ordering for
-/// the same reason it is an approximation: the albums that cost least to read
-/// are the ones most likely to be small and useful.
+/// `estimatedAssetCount` ascending, which is a deliberate approximation of cost —
+/// see that method for why the approximation is the right ordering rather than an
+/// exact one.
 ///
 /// ## Reconciling
 ///
@@ -68,16 +66,20 @@ actor AlbumIndexer {
         /// Album currently being read, for the progress line. Never a photo
         /// count: that would imply the pass is a fraction of the library.
         var current: String?
-        /// True once every album Photos reports has been read at least once.
-        var complete = false
         var lastError: String?
-        var lastFinishedAt: Double?
     }
 
+    /// The pass progress, for `/api/albums`.
+    ///
+    /// No "complete" flag here on purpose: whether the index can be trusted is a
+    /// question about *this library as Photos currently reports it*, not about this
+    /// process's count of what it has read, so it is answered by
+    /// `CacheStore.albumIndexComplete` against the same number Photos reports
+    /// now. A process-local `indexed >= total` would say "complete" while a
+    /// deleted-but-not-yet-pruned album was still in the table.
     func status() -> AlbumIndexStatus {
         AlbumIndexStatus(indexing: running, indexed: indexed, total: total,
-                          current: currentAlbum, complete: indexed > 0 && indexed >= total,
-                          lastError: lastError, lastFinishedAt: lastPassFinished?.timeIntervalSince1970)
+                          current: currentAlbum, lastError: lastError)
     }
 
     /// Whether a new pass is worth starting. Deliberately conservative: a

@@ -432,18 +432,27 @@ func registerStateMachineTests() {
         checkEqual((try await fixture.cache.stats(maxAge: 0)).total, 0, "removing nothing is a no-op")
     })
 
-    Registry.shared.add(suite: suite, TestCase(name: "claimJobs ignores non-image rows", knownBug: nil) {
+    Registry.shared.add(suite: suite, TestCase(name: "claimJobs claims only the media types analysis understands",
+        knownBug: nil) {
+        // The queue is bounded by media type, not open to everything the walk can
+        // produce: `PHAssetMediaType` has values this pipeline has no work for, and a
+        // row in one of them must sit in `pending` rather than be handed to a worker
+        // that cannot do anything with it — and must not be parked `failed` either,
+        // which would be a claim about the asset that nothing observed.
         let fixture = try await Fixture.make("sm-mediatype")
-        try await fixture.cache.upsert(batch: [
-            ScanRecord(identifier: "video", mediaType: 2, creationDate: 1, modificationDate: 1, width: 1,
-                       height: 1, favorite: false, mediaSubtype: 0, isScreenshot: false),
-        ], marker: 1)
-        try await fixture.cache.upsert(batch: [
-            ScanRecord(identifier: "still", mediaType: 1, creationDate: 2, modificationDate: 2, width: 1,
-                       height: 1, favorite: false, mediaSubtype: 0, isScreenshot: false),
-        ], marker: 1)
-        checkEqual(try await fixture.cache.claimJobs(limit: 10).map(\.identifier), ["still"],
-                   "only stills are ever scored")
-        checkEqual(try await fixture.analysisState(of: "video"), .pending, "and a video is left pending, not failed")
+        let records = ["still", "clip", "audio"].enumerated().map { offset, id in
+            ScanRecord(identifier: id, mediaType: offset + 1, creationDate: Double(offset + 1),
+                       modificationDate: Double(offset + 1), width: 1, height: 1,
+                       favorite: false, mediaSubtype: 0, isScreenshot: false)
+        }
+        try await fixture.cache.upsert(batch: records, marker: 1)
+
+        // Newest first, which is the order the walk found them in.
+        checkEqual(try await fixture.cache.claimJobs(limit: 10).map(\.identifier), ["clip", "still"],
+                   "a still and a clip are both claimed")
+        checkEqual(try await fixture.analysisState(of: "audio"), .pending,
+                   "and a media type this pipeline does not handle is left pending, not failed")
+        checkEqual(try await fixture.cache.claimJobs(limit: 10).map(\.identifier), [],
+                   "nothing else is offered, so the unhandled row is not a poison pill")
     })
 }

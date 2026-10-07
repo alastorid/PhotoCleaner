@@ -7,7 +7,7 @@ import os
 /// browser" and "show something native" are now different things: the default is
 /// an `NSWindow` hosting a `WKWebView`, and the browser is an escape hatch for
 /// anyone who prefers their own.
-enum Presentation: String, Sendable, CaseIterable {
+enum Presentation: String, Sendable {
     /// A native window. The default, and the only mode that touches AppKit.
     case window
     /// Hand the URL to the default browser and let it own the UI.
@@ -15,7 +15,6 @@ enum Presentation: String, Sendable, CaseIterable {
     /// Nothing on screen at all: a plain background server.
     case headless
 
-    var showsWindow: Bool { self == .window }
     var opensBrowser: Bool { self == .browser }
 
     /// True for the mode that cannot survive a machine with no window server.

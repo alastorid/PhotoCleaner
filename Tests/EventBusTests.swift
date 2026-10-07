@@ -169,22 +169,20 @@ func registerSettingsTests() {
         let url = root.appendingPathComponent("settings.json")
         let settings = Settings(url: url)
 
-        checkEqual(settings.snapshot().protectFavorites, true, "favourite protection defaults to on")
+        checkEqual(settings.snapshot().protectFavorites, true, "favourite protection is on")
         checkEqual(settings.snapshot().downloadFromICloud, false, "iCloud downloads default to off")
 
         let updated = settings.update { current in
-            current.protectFavorites = false
             current.downloadFromICloud = true
             current.analysisConcurrency = 7
         }
-        checkEqual(updated.protectFavorites, false, "update returns the new snapshot")
-        checkEqual(settings.snapshot().protectFavorites, false,
+        checkEqual(updated.downloadFromICloud, true, "update returns the new snapshot")
+        checkEqual(settings.snapshot().downloadFromICloud, true,
                    "and the in-memory state agrees with it immediately")
-        checkEqual(settings.snapshot().downloadFromICloud, true, "every field, not just one")
         checkEqual(settings.snapshot().analysisConcurrency, 7, "including concurrency")
 
         let reloaded = Settings(url: url)
-        checkEqual(reloaded.snapshot().protectFavorites, false, "the file was written too")
+        checkEqual(reloaded.snapshot().downloadFromICloud, true, "the file was written too")
         checkEqual(reloaded.snapshot().analysisConcurrency, 7, "with every field")
     })
 
@@ -201,10 +199,9 @@ func registerSettingsTests() {
             settings.update { $0.analysisPixelSize = requested }
             checkEqual(settings.snapshot().analysisPixelSize, expected, "analysisPixelSize \(requested)")
         }
-        settings.update { $0.protectFavorites = false }
         settings.update { $0.analysisConcurrency = 99 }
-        checkEqual(settings.snapshot().protectFavorites, false, "clamping one field leaves the others alone")
-        checkEqual(settings.snapshot().analysisPixelSize, 4096, "including analysisPixelSize, at its clamped value")
+        checkEqual(settings.snapshot().analysisPixelSize, 4096,
+                   "clamping one field leaves analysisPixelSize alone, at its clamped value")
     })
 
     Registry.shared.add(suite: suite, TestCase(name: "a corrupt settings file falls back to the defaults",
@@ -226,16 +223,13 @@ func registerSettingsTests() {
         // preference rather than just adding the new one. `SettingsSnapshot` now
         // decodes through `decodeIfPresent`, so what the file states is kept and only
         // what it never mentioned takes a default.
-        //
-        // `protectFavorites: false` here is the check that matters: with the old
-        // behaviour this read as `true`, i.e. a user's deliberate choice was
-        // discarded and reverted on upgrade. Honouring it is the point.
-        try Data(#"{"protectFavorites": false}"#.utf8).write(to: url)
+        try Data(#"{"analysisConcurrency": 9}"#.utf8).write(to: url)
         let partial = Settings(url: url)
-        checkEqual(partial.snapshot().protectFavorites, false,
+        checkEqual(partial.snapshot().analysisConcurrency, 9,
                    "a partial file keeps what it states rather than discarding it")
-        checkEqual(partial.snapshot().analysisConcurrency, 4, "and defaults only what it omits")
-        checkEqual(partial.snapshot().checkForUpdates, true, "including a field this build added later")
+        checkEqual(partial.snapshot().checkForUpdates, true, "and defaults only what it omits")
+        checkEqual(partial.snapshot().protectFavorites, true,
+                   "and favourite protection is on whichever way the file is written")
     })
 
     Registry.shared.add(suite: suite, TestCase(name: "POST /api/settings updates state without a restart", knownBug: nil) {

@@ -17,9 +17,6 @@ struct UpdatePlan: Sendable, Equatable {
     /// what keeps "PhotoCleaner writes nothing outside Application Support and
     /// Logs" true for the updater too — `smoke-test.sh` checks it.
     let scratchDirectory: URL
-    /// The version the bundle being replaced reports. Recorded so the swap can be
-    /// told from "already updated" without re-reading a plist on disk.
-    let installedVersion: UpdateVersion
 }
 
 /// Why a location cannot be replaced, or that it can.
@@ -69,21 +66,37 @@ enum UpdateTarget {
         // covers the mounted-image case as well as a folder the user cannot write
         // to. The path check above is the extra part: `hdiutil attach -rw` makes a
         // writable-looking volume out of one that still must not be written to.
+        //
+        // Existence is checked first because `isWritableFile` answers `true` for a
+        // path that is not there — it asks about the containing directory's
+        // permission bits, and for a missing leaf that is a question about the
+        // nearest directory that does exist. A parent that does not exist cannot
+        // be swapped into, so it is not writable in any sense that matters here,
+        // and reporting otherwise would let the plan be made and the swap fail
+        // eleven seconds later, after a download.
+        guard FileManager.default.fileExists(atPath: parent.path) else { return .notWritable }
         return FileManager.default.isWritableFile(atPath: parent.path) ? .writable : .notWritable
     }
 
     /// The plan, or the reason there isn't one.
-    static func plan(bundleURL: URL, location: InstalledLocation,
-                     installed: UpdateVersion, scratch: URL) throws -> UpdatePlan {
+    ///
+    /// The version being replaced is not a parameter because nothing in the
+    /// install reads it: the bundle's own `CFBundleShortVersionString` is the only
+    /// statement of what is installed, and it is re-read from disk after the swap
+    /// rather than carried here.
+    static func plan(bundleURL: URL, location: InstalledLocation, scratch: URL) throws -> UpdatePlan {
         // First, and independent of `location`: see `isApplicationBundle`.
         guard isApplicationBundle(bundleURL) else {
             throw UpdateError.notSelfInstallable(
                 "\(bundleURL.path) is not an application bundle, so there is nothing to replace")
         }
+        // `.notAnApplicationBundle` cannot reach here — the guard above has
+        // already refused it — but it is a case of the enum this function takes,
+        // and leaving it out would be a `default` that silently accepted
+        // whatever was added next.
         switch location {
-        case .notAnApplicationBundle:
-            throw UpdateError.notSelfInstallable(
-                "\(bundleURL.path) is not an application bundle, so there is nothing to replace")
+        case .notAnApplicationBundle, .writable:
+            break
         case .readOnlyVolume:
             throw UpdateError.notSelfInstallable(
                 "it is running from a disk image (\(bundleURL.deletingLastPathComponent().path)). "
@@ -92,8 +105,6 @@ enum UpdateTarget {
             throw UpdateError.notSelfInstallable(
                 "\(bundleURL.deletingLastPathComponent().path) is not writable. "
                 + "Replacing PhotoCleaner in place needs write access to that folder")
-        case .writable:
-            break
         }
 
         let staged = scratch
@@ -104,13 +115,12 @@ enum UpdateTarget {
             stagedAppURL: staged,
             backupAppURL: scratch.appendingPathComponent("previous", isDirectory: true)
                 .appendingPathComponent(bundleURL.lastPathComponent, isDirectory: true),
-            scratchDirectory: scratch,
-            installedVersion: installed
+            scratchDirectory: scratch
         )
     }
 
     /// Locate, then plan. The form production uses.
-    static func plan(bundleURL: URL, installed: UpdateVersion, scratch: URL) throws -> UpdatePlan {
-        try plan(bundleURL: bundleURL, location: locate(bundleURL), installed: installed, scratch: scratch)
+    static func plan(bundleURL: URL, scratch: URL) throws -> UpdatePlan {
+        try plan(bundleURL: bundleURL, location: locate(bundleURL), scratch: scratch)
     }
 }
