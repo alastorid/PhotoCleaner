@@ -250,10 +250,13 @@ dependency-free local build can do.)
    PhotoCleaner never assumes they are. Drag either handle; **Reset** puts both
    back on the observed bounds.
 4. **Inspects** any photo in a large preview with keyboard navigation
-   (`←` / `→`, `Space` to toggle the preview, `Esc` to close), **zoom** (scroll or
-   pinch to magnify the photo itself — the panel does not move with it — drag to
-   pan, `+`/`-` and `0` from the keyboard), and a hand-off to Photos
-   (**Open in Photos**) when what you want next is Photos' own tools.
+   (`←` / `→`, `Space` to toggle the preview, `Esc` to close), **zoom** (pinch — or
+   ⌘-scroll on a mouse — to magnify the photo itself, the panel does not move with
+   it; scroll or drag to move around it; `+`/`-` and `0` from the keyboard), and a
+   hand-off to Photos (**Open in Photos**) when what you want next is Photos' own
+   tools. **Scrolling down at fit leaves the preview** — the same gesture in the same
+   direction as scrolling down a magnified photo, which is what keeps the two
+   readings apart.
 5. **Shows any photo in All Photos** — the whole library in date order, grouped by
    day, with the photo you came from highlighted in the middle of its series.
 6. **Deletes** the photos you select, straight through PhotoKit, from the

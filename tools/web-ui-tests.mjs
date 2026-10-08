@@ -797,28 +797,51 @@ function zoomLands(app, box, point) {
 }
 
 /**
- * The first landscape photograph on the page, with the row the server reports for it.
+ * The first photograph on the page the server reports a shape for, matching `want`.
  *
- * A zoom anchor has to be a point *on* the photograph, and the checks below give
- * the stage a square box: for any landscape shape the band across the stage's
- * middle is on the pixels (a landscape still is fitted to the stage's full width and
- * is centred vertically), while for a portrait one the middle band is partly the
- * empty letterbox beside it. Skipped rather than faked when this page holds none —
- * asserting a zoom about a point over nothing would be asserting about the fixture.
+ * The zoom checks need to know what shape they are working with: an anchor has to be
+ * a point *on* the photograph, and a pan needs the magnification to have left the
+ * axis somewhere to go, both of which depend on the row's own width and height rather
+ * than on anything the grid holds. Skipped rather than faked when this page has none
+ * of the shape asked for — asserting about a fixture is not asserting about the app.
  */
-async function landscapeStill(app) {
+async function stillOfShape(app, want) {
   for (const tile of stillTiles(app).slice(0, 8)) {
     const response = await fetch(`${base}/api/photo/${encodeURIComponent(tile.dataset.id)}`);
     const row = (await response.json()).photo || {};
-    if (row.width > row.height) return { tile, row };
+    if (row.width > 0 && row.height > 0 && want(row)) return { tile, row };
   }
-  return null;
+  return undefined;
 }
+
+/** A landscape photograph: the band across a square stage's middle is on its pixels. */
+const landscapeStill = (app) => stillOfShape(app, (row) => row.width > row.height);
+
+/**
+ * A portrait photograph that is not a sliver.
+ *
+ * `STAGE_BOX` is square, so a portrait photo's fitted width is well under the stage's
+ * and its height is exactly it: the vertical axis can pan as soon as it is magnified,
+ * and the horizontal one only once the magnification has carried that fitted width
+ * past the stage's. The three steps the check takes get there for anything taller
+ * than about 1:2.7, and 1:2.5 is the bound here so the assertion cannot come down to
+ * which photograph the page happened to start with.
+ */
+const portraitStill = (app) => stillOfShape(app,
+  (row) => row.height > row.width && row.width / row.height > 0.4);
 
 /** A pinch (a wheel with `ctrlKey`) at a point of the stage. */
 function pinch(app, point, deltaY = -240) {
   app.$('lightboxStage').dispatchEvent(new app.window.WheelEvent('wheel', {
     deltaY, ctrlKey: true, clientX: point.x, clientY: point.y, bubbles: true, cancelable: true,
+  }));
+}
+
+/** A two-finger scroll, or a mouse wheel: no modifier, and both deltas are meaningful. */
+function scrollStage(app, { deltaX = 0, deltaY = 0 } = {}) {
+  app.$('lightboxStage').dispatchEvent(new app.window.WheelEvent('wheel', {
+    deltaX, deltaY, clientX: STAGE_BOX.x + STAGE_BOX.width / 2, clientY: STAGE_BOX.y + STAGE_BOX.height / 2,
+    bubbles: true, cancelable: true,
   }));
 }
 
@@ -955,6 +978,71 @@ await check('paging puts the next photograph back at fit', async (app) => {
     // magnified rect carried onto it would show a corner with nothing to explain it.
     assertEqual(zoomOf(app).scale, 1, 'the magnification was carried onto the next photograph');
     assertEqual(zoomOf(app).x, 0, 'the magnification was carried onto the next photograph');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('a scroll moves a magnified photograph, in the direction it names', async (app) => {
+  // The other half of the wheel: once there is somewhere to go, a two-finger scroll
+  // is a pan rather than a magnifier — down the photograph for a scroll down, right
+  // along it for a scroll right, which is the same direction word the drag and the
+  // pan cursor use.
+  const subject = await portraitStill(app);
+  if (!subject) return; // this page happens to hold no portrait photograph
+  const layout = layoutWith(app, []);
+  try {
+    await openLightboxOn(app, subject.tile);
+    // Three steps, not one: a portrait photo needs its fitted width magnified past
+    // the square stage's before that axis has anywhere to pan to (see `portraitStill`).
+    app.key('=');
+    app.key('=');
+    app.key('=');
+    await app.settle(30);
+    const zoomed = zoomOf(app);
+    const position = app.$('lightboxPosition').textContent;
+
+    scrollStage(app, { deltaY: 60 });
+    assertEqual(zoomOf(app).scale, zoomed.scale, 'a scroll changed the magnification');
+    assert(Math.abs(zoomOf(app).y - (zoomed.y - 60)) < 0.01,
+      `a scroll down did not move down the photograph (${zoomOf(app).y} vs ${zoomed.y - 60})`);
+    assert(Math.abs(zoomOf(app).x - zoomed.x) < 0.01, 'a vertical scroll moved the photograph sideways');
+
+    scrollStage(app, { deltaX: 60 });
+    assert(Math.abs(zoomOf(app).x - (zoomed.x - 60)) < 0.01,
+      `a scroll right did not move right along the photograph (${zoomOf(app).x} vs ${zoomed.x - 60})`);
+    assertEqual(app.$('lightboxPosition').textContent, position, 'scrolling paged the overlay');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('a scroll down at fit leaves the preview, and a nudge does not', async (app) => {
+  // At fit there is nothing left to move, so the scroll down is the gesture that puts
+  // the preview away — accumulated over one gesture, because a trackpad reports a
+  // deliberate swipe as a stream of small deltas and a preview that closed on any one
+  // of them would close on an accident.
+  const [tile] = stillTiles(app);
+  assert(tile, 'the first page has no photograph on it');
+  const layout = layoutWith(app, []);
+  try {
+    await openLightboxOn(app, tile);
+    scrollStage(app, { deltaY: 20 });
+    await app.settle(60);
+    assertEqual(app.$('lightbox').hidden, false, 'a nudge down closed the preview');
+    assertEqual(zoomOf(app).scale, 1, 'a plain scroll magnified the photograph');
+
+    // A gesture that ends restarts the swipe: the nudge above must not be sitting in
+    // wait for the next one to complete it.
+    await app.settle(250);
+    scrollStage(app, { deltaY: 60 });
+    await app.settle(60);
+    assertEqual(app.$('lightbox').hidden, false, 'a short scroll closed the preview');
+
+    scrollStage(app, { deltaY: 60 });
+    scrollStage(app, { deltaY: 60 });
+    await app.settle(500);
+    assertEqual(app.$('lightbox').hidden, true, 'a swipe down did not leave the preview');
   } finally {
     layout.restore();
   }

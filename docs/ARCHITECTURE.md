@@ -800,6 +800,21 @@ bug, not a cleanup.
   tick trails the fingers by its own duration, so the wheel/pinch path forces
   `transition: none` and re-arms the settle once the gesture goes quiet, while `+`, `-`
   and `0` animate — one change, with no gesture behind it.
+- **One wheel event, three readings, and the direction word decides between them.** A
+  pinch arrives as a wheel with `ctrlKey` (⌘-scroll on a mouse, which has no pinch), and
+  that — and only that — magnifies. A wheel with neither modifier *moves* the photograph
+  in the direction it names, which means something only once there is somewhere to go; at
+  fit it is the swipe that leaves the preview, and a scroll *up* at fit deliberately does
+  nothing. Reading the same gesture as a zoom at fit and a pan when magnified would make
+  "scroll down" mean two different things one keystroke apart; reading it as a scroll
+  throughout makes "down" mean "further down the thing on screen" in both, and the exit is
+  what is left when there is no further down to go.
+- **The swipe that leaves is accumulated over one gesture, never read from one event.**
+  A trackpad reports a deliberate swipe as a stream of small deltas, so
+  `lightboxZoom.leaving` adds them up (taking upward deltas back off rather than resetting,
+  so a wandering gesture counts what it kept) and is zeroed when the gesture goes quiet —
+  a slow drift of separate scrolls must never add up to one exit. It applies to whatever
+  the preview holds, so a clip leaves on the same gesture a photograph does.
 - **Zoom belongs to the photograph, not to the view.** Paging resets it instantly (the
   reader did not ask for that change), closing resets it *before* the return travel starts
   (a shrinking photo underneath the copy flying the other way is two motions at once),

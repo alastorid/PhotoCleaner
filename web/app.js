@@ -4029,7 +4029,16 @@
   const ZOOM_SETTLE_MS = 160;
   /** How long after the last wheel event a gesture is considered over. */
   const ZOOM_GESTURE_MS = 140;
-  const lightboxZoom = { rowId: null, scale: 1, x: 0, y: 0, pan: null, dragged: false, timer: 0 };
+  /**
+   * How far down one gesture has to scroll, at fit, to put the preview away.
+   *
+   * Accumulated over a gesture rather than read from one event, because a trackpad
+   * reports a deliberate swipe as a stream of small deltas and a preview that closed
+   * on any one of them would close on an accident. 120 px is past a nudge and well
+   * inside a swipe.
+   */
+  const ZOOM_LEAVE_PX = 120;
+  const lightboxZoom = { rowId: null, scale: 1, x: 0, y: 0, pan: null, dragged: false, leaving: 0, timer: 0 };
 
   /** The stage's untransformed box, or null where there is no layout to measure. */
   function zoomBox() {
@@ -4152,6 +4161,7 @@
     lightboxZoom.y = 0;
     lightboxZoom.pan = null;
     lightboxZoom.dragged = false;
+    lightboxZoom.leaving = 0;
     zoomTransition(animated && !prefersReducedMotion() ? ZOOM_SETTLE_MS : 0);
     $('lightboxImage').style.transform = 'translate(0px, 0px) scale(1)';
     $('lightboxStage').classList.toggle('is-zoomed', false);
@@ -4164,26 +4174,80 @@
   }
 
   /**
-   * The wheel gesture: a trackpad pinch or a mouse wheel over the stage.
+   * The wheel over the stage: a pinch magnifies, a scroll moves, and a scroll down
+   * that has nothing to move puts the preview away.
    *
-   * `preventDefault` is not politeness here. A pinch arrives as a wheel with
-   * `ctrlKey` set, and a page that does not claim it gets the *browser's* page zoom
-   * instead — the whole interface magnified, which is the one outcome "zoom only
-   * the photo" is asking against. The two deltas are scaled differently because
-   * they are different instruments: a pinch reports a stream of small precise
-   * deltas, a wheel reports coarse notches, and one factor for both makes one of
-   * them unusable.
+   * Three gestures, and one wheel event to tell them apart.
+   *
+   * - **A pinch** arrives as a wheel with `ctrlKey` — that is the platform's own
+   *   encoding of the gesture, and a mouse, which has no pinch at all, gets the same
+   *   modifier from ⌘-scroll. Either spelling means one thing: magnify, about the
+   *   pointer.
+   * - **A two-finger scroll** (or a mouse wheel) is a wheel with neither modifier,
+   *   and it *moves* the photograph in the direction it names: scrolling down looks
+   *   further down the photo, scrolling right looks further right. That only means
+   *   anything once the photograph is magnified, because at fit there is nowhere to
+   *   go — which is what makes the third reading possible.
+   * - **A scroll down at fit** has no photograph left to move, so it is the one
+   *   gesture left for it to mean: leave the preview. Scroll *up* at fit does
+   *   nothing; the magnifying gesture is the pinch, and a scroll that silently zoomed
+   *   would be a second meaning for the same motion.
+   *
+   * `preventDefault` is not politeness in any of the three: without it a scroll over
+   * the preview scrolls the *grid* behind the overlay, and a pinch zooms the browser
+   * rather than the photograph.
    */
   function zoomWheel(event) {
-    if (!zoomHasPhotograph()) return;
+    if (!currentLightboxRow()) return;
     event.preventDefault();
-    const factor = event.ctrlKey ? Math.exp(-event.deltaY / 100) : Math.exp(-event.deltaY / 400);
+
+    if (event.ctrlKey || event.metaKey) {
+      // A clip's transport owns its own gestures, and there is nothing on it to
+      // magnify.
+      if (!zoomHasPhotograph()) return;
+      const factor = Math.exp(-event.deltaY / 100);
+      zoomTransition(0);
+      zoomTo(lightboxZoom.scale * factor, { x: event.clientX, y: event.clientY });
+      zoomGestureOver();
+      return;
+    }
+
+    if (!zoomHasPhotograph() || lightboxZoom.scale <= 1) {
+      // Nowhere to pan to, so a downward scroll is a swipe to leave. Upward deltas
+      // are taken back off the total rather than resetting it, so a gesture that
+      // wanders down and up again counts what it kept.
+      lightboxZoom.leaving = Math.max(0, lightboxZoom.leaving + event.deltaY);
+      zoomGestureOver();
+      if (lightboxZoom.leaving >= ZOOM_LEAVE_PX) {
+        lightboxZoom.leaving = 0;
+        closeLightbox();
+      }
+      return;
+    }
+
+    // Magnified: the scroll moves the photograph, by the same direction word the pan
+    // cursor promises. The clamp keeps it on the stage.
     zoomTransition(0);
-    zoomTo(lightboxZoom.scale * factor, { x: event.clientX, y: event.clientY });
-    // The settle, not the gesture: once the fingers are off, a key step or a return
-    // to fit is one motion again and may animate.
+    lightboxZoom.x -= event.deltaX;
+    lightboxZoom.y -= event.deltaY;
+    zoomApply();
+    zoomGestureOver();
+  }
+
+  /**
+   * The end of a wheel gesture, once the deltas stop.
+   *
+   * Two things were suspended for the duration: the transition (a gesture tracks the
+   * fingers rather than trailing them by its own duration) and the swipe that leaves
+   * the preview (a slow drift of separate scrolls must never add up to one gesture's
+   * worth of exit).
+   */
+  function zoomGestureOver() {
     clearTimeout(lightboxZoom.timer);
-    lightboxZoom.timer = setTimeout(() => zoomTransition(ZOOM_SETTLE_MS), ZOOM_GESTURE_MS);
+    lightboxZoom.timer = setTimeout(() => {
+      zoomTransition(ZOOM_SETTLE_MS);
+      lightboxZoom.leaving = 0;
+    }, ZOOM_GESTURE_MS);
   }
 
   /** `+`/`-` about the centre, `0` back to fit. */
