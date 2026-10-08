@@ -950,15 +950,13 @@ await check('a drag pans a magnified photograph instead of paging to the next on
       assertEqual(panned.y, zoomed.y, 'an axis with no slack was panned anyway');
     }
 
-    // The click that ends a drag is the end of the drag, not a request for the next
-    // photograph — and it is the drag that is swallowed, not every click after it.
+    // Letting go of a drag is not a request for the next photograph — and neither is
+    // any other click on the picture, which is the other half of "only the arrows
+    // navigate" (`zoomPanEnd` has nothing to suppress, because nothing on the stage
+    // pages on a click).
     image.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
     await app.settle(60);
     assertEqual(app.$('lightboxPosition').textContent, before, 'letting go of a pan paged the overlay');
-    image.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
-    await app.settle(60);
-    assert(app.$('lightboxPosition').textContent !== before,
-      'the photograph stopped paging on a click from then on');
   } finally {
     layout.restore();
   }
@@ -1874,33 +1872,51 @@ await check('a clip in the lightbox keeps the grid\'s context menu', async (app)
   assert(!labels.some((l) => l === ''), 'the clip\'s menu has an unlabelled item');
 });
 
-await check('clicking a clip does not page the overlay out from under it', async (app) => {
+await check('only the arrows navigate: a click on the photograph does not', async (app) => {
+  // There used to be a click-to-advance on the photograph itself, and it stopped
+  // being honest the moment the still became a stage-sized `object-fit: contain`
+  // box: the element that received the click covered the whole stage, including the
+  // letterbox beside a portrait photograph, so most of the hit area was not the
+  // photograph it claimed to be. What navigates now is what looks like navigation.
+  const [tile] = stillTiles(app);
+  assert(tile, 'the first page has no photograph on it');
+  await openLightboxOn(app, tile);
+  const position = app.$('lightboxPosition').textContent;
+
+  app.$('lightboxImage').dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  await app.settle(300);
+  assertEqual(app.$('lightbox').hidden, false, 'clicking a photograph closed the lightbox');
+  assertEqual(app.$('lightboxPosition').textContent, position,
+    'clicking a photograph paged to the next one');
+  // …including the letterbox: the stage's own box is not the photograph either.
+  app.$('lightboxStage').dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  await app.settle(300);
+  assertEqual(app.$('lightboxPosition').textContent, position,
+    'clicking the stage beside the photograph paged to the next one');
+
+  // And the arrow still does, which is the half that a "never navigate" version
+  // would break.
+  app.click('lightboxNext');
+  await app.settle(300);
+  assert(app.$('lightboxPosition').textContent !== position,
+    'the › button did not page to the next photograph');
+});
+
+await check('a clip keeps every click on its own transport', async (app) => {
   // A `<video controls>` owns its own clicks: play/pause, the scrub bar, the volume.
-  // A stage handler that advances on any click in the media element would page the
-  // lightbox while the reader is aiming at one of those — arriving at "it kept
-  // playing under the next photo" from the other end, and taking the clip away
-  // mid-seek.
+  // Anything on the stage that paged on a click in that region would take the clip
+  // away mid-seek, arriving at "it kept playing under the next photo" from the other
+  // end.
   const tiles = await showVideos(app);
   await openLightboxOn(app, tiles[0]);
   const before = app.$('lightboxVideo').getAttribute('src');
+  const position = app.$('lightboxPosition').textContent;
 
   app.$('lightboxVideo').dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
   await app.settle(300);
   assertEqual(app.$('lightbox').hidden, false, 'clicking the clip closed the lightbox');
   assertEqual(app.$('lightboxVideo').getAttribute('src'), before, 'clicking the clip paged to another photo');
-
-  // The still still advances on a click — the other direction, and the one a
-  // "never advance on a click" version would break.
-  app.key('Escape');
-  await app.settle(250);
-  const stills = await showPhotos(app);
-  await openLightboxOn(app, stills[0]);
-  if (stills.length > 1) {
-    app.$('lightboxImage').dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
-    await app.settle(300);
-    assertEqual(app.$('lightbox').hidden, false, 'clicking a photograph closed the lightbox');
-    assert(app.$('lightboxImage').getAttribute('src') !== null, 'clicking a photograph left nothing on the stage');
-  }
+  assertEqual(app.$('lightboxPosition').textContent, position, 'clicking the clip paged to another photo');
 });
 
 await check('Space still toggles the preview on a clip tile, and Enter still opens it', async (app) => {

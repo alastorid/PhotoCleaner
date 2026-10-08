@@ -4017,10 +4017,6 @@
    * and the keyboard model do not move with it, because the point of zooming is to
    * look at the photograph and not at a magnified interface. `scale` is bounded
    * below at 1, which is *fit*: the whole frame inside the stage's pinned box (§8).
-   *
-   * `dragged` is the one piece of this the click handler needs: the stage's click
-   * pages to the next photograph, and a drag of a zoomed photo that ended in a
-   * click must not be read as "show me the next one".
    */
   const ZOOM_MAX = 8;
   /** The keys that magnify the photograph: `+` and `=` (the same physical key), `-`, and `0` for fit. */
@@ -4038,7 +4034,7 @@
    * inside a swipe.
    */
   const ZOOM_LEAVE_PX = 120;
-  const lightboxZoom = { rowId: null, scale: 1, x: 0, y: 0, pan: null, dragged: false, leaving: 0, timer: 0 };
+  const lightboxZoom = { rowId: null, scale: 1, x: 0, y: 0, pan: null, leaving: 0, timer: 0 };
 
   /** The stage's untransformed box, or null where there is no layout to measure. */
   function zoomBox() {
@@ -4160,7 +4156,6 @@
     lightboxZoom.x = 0;
     lightboxZoom.y = 0;
     lightboxZoom.pan = null;
-    lightboxZoom.dragged = false;
     lightboxZoom.leaving = 0;
     zoomTransition(animated && !prefersReducedMotion() ? ZOOM_SETTLE_MS : 0);
     $('lightboxImage').style.transform = 'translate(0px, 0px) scale(1)';
@@ -4271,8 +4266,7 @@
   function zoomPanStart(event) {
     if (!zoomHasPhotograph() || lightboxZoom.scale <= 1) return;
     if (event.button !== 0 || event.target !== $('lightboxImage')) return;
-    lightboxZoom.pan = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: 0 };
-    lightboxZoom.dragged = false;
+    lightboxZoom.pan = { id: event.pointerId, x: event.clientX, y: event.clientY };
     zoomTransition(0);
     // Claimed so the drag survives the pointer leaving the stage, and so the
     // photograph does not start the browser's own image drag instead.
@@ -4283,7 +4277,6 @@
   function zoomPanMove(event) {
     const pan = lightboxZoom.pan;
     if (!pan || pan.id !== event.pointerId) return;
-    pan.moved += Math.abs(event.clientX - pan.x) + Math.abs(event.clientY - pan.y);
     lightboxZoom.x += event.clientX - pan.x;
     lightboxZoom.y += event.clientY - pan.y;
     pan.x = event.clientX;
@@ -4295,9 +4288,6 @@
   function zoomPanEnd(event) {
     const pan = lightboxZoom.pan;
     if (!pan || pan.id !== event.pointerId) return;
-    // A hand that moved is a hand that panned, and the click that follows it is the
-    // end of the drag rather than a request for the next photograph.
-    lightboxZoom.dragged = pan.moved > 3;
     lightboxZoom.pan = null;
     if (event.target.releasePointerCapture && event.target.hasPointerCapture?.(event.pointerId)) {
       event.target.releasePointerCapture(event.pointerId);
@@ -4794,23 +4784,16 @@
     $('lightboxClose').addEventListener('click', () => closeLightbox());
     $('lightboxPrev').addEventListener('click', () => navigateLightbox(-1));
     $('lightboxNext').addEventListener('click', () => navigateLightbox(1));
-    $('lightboxStage').addEventListener('click', (event) => {
-      // The end of a drag, not a click on the photograph: a reader who panned a
-      // magnified photo would otherwise be paged to the next one by letting go.
-      const dragged = lightboxZoom.dragged;
-      lightboxZoom.dragged = false;
-      if (dragged) return;
-      // The still, and only the still. Clicking a clip's picture is a click on a
-      // transport — the reader is aiming at the play button, the scrub bar or the
-      // volume, and paging the overlay out from under that would be the exact
-      // "it kept playing under the next photo" bug the queue reindexing comments
-      // describe, arrived at from the other end.
-      if (event.target === $('lightboxImage')) navigateLightbox(1);
-    });
-    // Zoom lives on the stage rather than on the photograph, because the still is
-    // `object-fit: contain` inside a stage-sized box (see the stylesheet): a gesture
-    // that lands on the letterbox beside a panorama is still a gesture on the
-    // photograph, and the events that bubble from either element arrive here.
+    // Nothing else on the stage navigates, and there used to be: a click on the
+    // photograph itself advanced to the next one. It cannot be kept, because the
+    // still is `object-fit: contain` inside a stage-sized box (see the stylesheet) —
+    // the element that would receive that click covers the whole stage, letterbox
+    // and all, so the hit area was mostly *not* the photograph it claimed to be. A
+    // shortcut whose target is larger than the thing it names is worse than no
+    // shortcut; the ‹ and › buttons and ← and → are the navigation, and they are the
+    // only things on screen that look like it. (It also cannot come back as a zone
+    // at the edges: a reader aiming at the volume or the scrub bar of a clip is
+    // clicking in exactly that region.)
     $('lightboxStage').addEventListener('wheel', zoomWheel, { passive: false });
     $('lightboxStage').addEventListener('pointerdown', zoomPanStart);
     $('lightboxStage').addEventListener('pointermove', zoomPanMove);

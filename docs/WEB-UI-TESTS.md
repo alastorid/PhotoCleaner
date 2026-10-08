@@ -85,6 +85,14 @@ layout.loaded(tile.querySelector('img'));   // jsdom never fetches images
 layout.restore();
 ```
 
+There is no painting order and no hit-testing either, which is the sharper edge of the
+same absence: `dispatchEvent` delivers a click to the element named, whatever is drawn
+over it. So a check can pass with the control underneath the thing it controls — as the
+lightbox's ‹ › buttons were, once the still gained a `transform` (which puts an element
+in the positioned painting layer, where DOM order decided and the photograph won). Only
+`document.elementFromPoint` in a real browser, or an actual pointer, catches that class
+of bug; see ARCHITECTURE §8 on the arrows.
+
 Stub `getBoundingClientRect` **per element**, never on `Element.prototype`. jsdom
 resolves it per concrete element class, and those wrappers delegate back up — patch the
 prototype and the stub calls itself until the stack runs out. For the same reason

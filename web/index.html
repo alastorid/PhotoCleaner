@@ -294,8 +294,9 @@
            never calls `play()`: paging through a grid of clips and having each one
            start making noise is not a photo cleaner, and a clip the user is only
            *looking* at should not pull a whole export off the disk. `controls` so
-           playback and seeking are the platform's, which is why a click on the
-           scrub bar must not page the overlay — see the stage's click handler. -->
+           playback and seeking are the platform's — nothing on the stage navigates
+           but the ‹ and › buttons, so the scrub bar keeps every click that lands on
+           it. -->
       <video id="lightboxVideo" controls preload="metadata" playsinline hidden></video>
       <div class="lightbox-fallback" id="lightboxFallback" hidden>Preview unavailable — Photos could not produce this photo.</div>
     </div>

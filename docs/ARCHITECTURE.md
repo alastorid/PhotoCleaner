@@ -815,6 +815,16 @@ bug, not a cleanup.
   so a wandering gesture counts what it kept) and is zeroed when the gesture goes quiet —
   a slow drift of separate scrolls must never add up to one exit. It applies to whatever
   the preview holds, so a clip leaves on the same gesture a photograph does.
+- **Only the arrows navigate.** There used to be a click-to-advance on the photograph
+  itself, and it stopped being honest the moment the still became a stage-sized
+  `object-fit: contain` box (§8): the element that received that click covered the whole
+  stage — the letterbox beside a portrait photograph included — so most of its hit area
+  was not the photograph it claimed to be. What navigates is what looks like navigation:
+  the ‹ and › buttons, and `←` / `→`. A click on the picture does nothing, which is also
+  what makes a drag safe to start there; a click on a clip's transport belongs to the
+  transport, because nothing on the stage has a handler that could take it. The edge of
+  the stage is not a navigation zone either — for a clip that is exactly where the
+  volume and the scrub bar are.
 - **Zoom belongs to the photograph, not to the view.** Paging resets it instantly (the
   reader did not ask for that change), closing resets it *before* the return travel starts
   (a shrinking photo underneath the copy flying the other way is two motions at once),

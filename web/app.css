@@ -1196,8 +1196,15 @@ button { font: inherit; cursor: pointer; }
 .lightbox-stage.is-zoomed:active { cursor: grabbing; }
 .lightbox-fallback { color: #fff; opacity: 0.85; padding: 24px; text-align: center; }
 
+/* The buttons are positioned, and so, now, is the still: a `transform` puts an
+   element in the positioned painting layer, and within that layer DOM order decides —
+   and the photograph comes *after* these two in the markup. Without an explicit
+   z-index the photograph therefore paints over its own controls and takes every click
+   aimed at them, which is invisible in jsdom and in any test that dispatches the click
+   rather than pointing at it. */
 .lightbox-close, .lightbox-nav {
   position: absolute;
+  z-index: 1;
   border: none;
   background: rgba(255, 255, 255, 0.16);
   color: #fff;
