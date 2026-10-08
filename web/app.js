@@ -2296,16 +2296,53 @@
       event.stopPropagation();
       return;
     }
-    if (event.shiftKey && state.anchorIndex >= 0 && index !== state.anchorIndex) {
-      // Delegated to the same helper the menu's "Select range" item calls, so the
-      // keyboard path and the menu cannot drift apart. In matching mode the range
-      // is a range of *exclusions*; in ids mode a range of additions. Either way
-      // it never silently grows "all matching".
-      selectRangeTo(index, list);
+    onPhotoClick(row, index, event, list, gridAnchor());
+  }
+
+  /**
+   * What a click on a photo means, on every surface a photo can be pointed at.
+   *
+   * Two modifiers, and they are the two ways of *adding* to a selection; a click with
+   * nothing held down replaces it. One function, because the score grid, the All
+   * Photos window and the group strips all reach here — and a second copy of this
+   * rule would be a second answer to the one question that matters about a selection
+   * in this tool: what will Delete destroy.
+   *
+   * - **⇧** extends the selection to here from the anchor and does not move it, so a
+   *   reader can extend in either direction from where they started. The work is
+   *   `selectRangeTo`'s, which the menu's own "Select range" calls.
+   * - **⌘** toggles this one photo in or out: how a selection of several that are not
+   *   neighbours is built. ⌘ and not ⌃ — on this platform ⌃-click is the system's own
+   *   secondary click, and this client needs that for the context menu.
+   * - **Nothing held down** makes this photo the whole selection. That is the safe
+   *   reading for a tool whose selection is a list of things about to be destroyed:
+   *   a mis-click cannot leave an unnoticed photo inside the set the count names.
+   */
+  function onPhotoClick(row, index, event, list, anchor) {
+    if (event.shiftKey && anchor.get() >= 0 && index !== anchor.get()) {
+      selectRangeTo(index, list, anchor);
       return;
     }
-    state.anchorIndex = index;
-    toggleSelection(row.id);
+    anchor.set(index);
+    if (event.metaKey) toggleSelection(row.id);
+    else selectOnly(row.id);
+  }
+
+  /**
+   * Makes one photo the whole selection.
+   *
+   * The plain reading of a click with no modifier, and the only way out of a "select
+   * all matching" snapshot by clicking: the set *is* the snapshot, so "select only
+   * this one" replaces it — mode, filter and exclusions all go. A click that left a
+   * five-thousand-photo snapshot underneath a one-photo mark would leave the bar
+   * counting a set the reader is no longer looking at, which is the failure the count
+   * exists to prevent.
+   */
+  function selectOnly(id) {
+    state.selection = emptySelection();
+    state.selection.ids.add(id);
+    refreshAllTiles();
+    refreshSelectionPreview();
   }
 
   function toggleSelection(id) {
@@ -2455,16 +2492,16 @@
       // is then a ceiling, and the sentence has to read as one.
       $('selectionHint').textContent = selection.truncated
         ? `More ${noun}s match than PhotoCleaner will resolve at once`
-          + ' · Click one to exclude it'
-        : `Click a ${noun} to exclude it · This covers every match, not just the loaded page`;
+          + ' · ⌘-click one to exclude it'
+        : `⌘-click a ${noun} to exclude it · This covers every match, not just the loaded page`;
     } else if (selection.ids.size > 0) {
       summary.appendChild(emphasize(selection.ids.size));
       summary.appendChild(document.createTextNode(
         ` ${fmt.plural(selection.ids.size, noun, `${noun}s`)} selected`));
-      $('selectionHint').textContent = 'Click to select · Shift-click for a range · ⌫ or Delete deletes the selection';
+      $('selectionHint').textContent = 'Click to select · ⌘-click to add · Shift-click for a range · ⌫ or Delete deletes the selection';
     } else {
       summary.appendChild(document.createTextNode('Nothing selected'));
-      $('selectionHint').textContent = 'Click to select · Shift-click for a range · ⌫ or Delete deletes the selection';
+      $('selectionHint').textContent = 'Click to select · ⌘-click to add · Shift-click for a range · ⌫ or Delete deletes the selection';
     }
 
     // The two reasons the button's count can be lower than the bar's, stated where
@@ -2766,7 +2803,7 @@
     $('allPhotosView').hidden = false;
     $('allPhotosDays').replaceChildren();
     $('selectionHint').textContent =
-      'Same selection as the grid · Shift-click for a range · ⌫ deletes the selection · Esc goes back';
+      'Same selection as the grid · ⌘-click to add · Shift-click for a range · ⌫ deletes the selection · Esc goes back';
     window.scrollTo(0, 0);
     renderAllPhotosBar();
     renderAllPhotosStatus();
@@ -5968,12 +6005,10 @@
     // because a stale index here would select the wrong photo silently, which is
     // the one failure a selection gesture cannot recover from.
     if (items[index] !== row) return;
-    if (event.shiftKey) {
-      selectRangeTo(index, () => items, groupAnchor());
-      return;
-    }
-    state.groups.anchorIndex = index;
-    toggleSelection(row.id);
+    // The same rule the grid tiles use, with this strip's own anchor: a range in one
+    // strip must not be anchored on a cell the reader last clicked in another, and
+    // "what a click means" must not depend on which surface the photo is in.
+    onPhotoClick(row, index, event, () => items, groupAnchor());
   }
 
   /** Moves focus along the strip, and stops at either end rather than wrapping. */

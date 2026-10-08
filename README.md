@@ -340,15 +340,22 @@ failures** re-queues what failed.
 
 ### Selection, and what "all" means
 
-- **Click** a photo to select it, **shift-click** for a range, **double-click**
-  to inspect. **Space** inspects the focused photo and inspects it again to put it
-  away — the same toggle everywhere, including on a group's member thumbnails.
+- **Click** a photo to select *only* it — a click with nothing held down is a fresh
+  selection, so a mis-click can never leave an unnoticed photo inside the set the
+  Delete button counts. **⌘-click** adds or removes one photo (a selection of
+  several that are not neighbours), **shift-click** selects the range from where you
+  last clicked, and **double-click** inspects. **Space** inspects the focused photo
+  and inspects it again to put it away — the same toggle everywhere, including on a
+  group's member thumbnails. All four work the same in the grid, in All Photos and
+  on a group's members.
 - **Select all matching** selects *every* photo matching the current filter — not
   just the page you have scrolled to. The filter is *saved* at that moment, and
   the interface says so: moving the sliders afterwards does **not** change what
   will be deleted. If you change the filter while an "all matching" selection is
   live, deletion is blocked until you either update the selection to the current
-  filter or clear it.
+  filter or clear it. Inside that selection, **⌘-click** takes a single photo out
+  (and puts it back) without leaving the mode — which is why a plain click, the
+  gesture that replaces the selection, is not the one that narrows it.
 - The saved filter is a **snapshot**. Once the selection exists, the live sliders
   cannot change what it covers — "all" can never quietly grow under you.
 

@@ -48,6 +48,18 @@ function clickTile(app, id) {
   tile.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
 }
 
+/**
+ * Clicks the tile whose data-id is `id` with ⌘ held, which is how a second photo is
+ * added to a selection — a plain click replaces it.
+ */
+function cmdClickTile(app, id, init = {}) {
+  const tile = app.window.document.querySelector(`#grid .tile[data-id="${id}"]`);
+  assert(tile, `no tile for ${id}`);
+  tile.dispatchEvent(new app.window.MouseEvent('click', {
+    bubbles: true, cancelable: true, metaKey: true, ...init,
+  }));
+}
+
 console.log('delete flow: one step');
 
 /**
@@ -137,7 +149,7 @@ await check('there is no delete list, and no second control beside Delete', asyn
 await check('Delete is armed with the count the server resolved', async (app) => {
   const [first, second] = app.tileIds();
   clickTile(app, first);
-  clickTile(app, second);
+  cmdClickTile(app, second); // ⌘ adds the second: a plain click would replace the first
   await app.settle(500);
   const button = app.$('deleteButton');
   assertEqual(button.disabled, false, 'the button was disabled with a selection present');
@@ -146,6 +158,60 @@ await check('Delete is armed with the count the server resolved', async (app) =>
   // asserting the inaccuracy.
   assertEqual(button.textContent, 'Delete 2 assets',
     'the button does not carry the count the server resolved');
+});
+
+await check('a plain click replaces the selection, and ⌘-click adds to it', async (app) => {
+  // The two modifiers are the two ways of *adding* to a selection; nothing held down
+  // is a fresh one. Asserted on the bar's own count and on the marks in the grid,
+  // because the count is what a deletion is authorised against.
+  const [first, second, third] = app.tileIds();
+  assert(third, 'this page has fewer than three photos on it');
+  const summary = () => app.$('selectionSummary').textContent;
+  const marked = () => [...app.window.document.querySelectorAll('#grid .tile.selected')]
+    .map((tile) => tile.dataset.id);
+
+  clickTile(app, first);
+  await app.settle(400);
+  assert(/1 asset selected/.test(summary()), `a click did not select exactly one: ${summary()}`);
+
+  // ⌘ adds a photo that is not a neighbour — the whole point of the modifier.
+  cmdClickTile(app, second);
+  await app.settle(400);
+  assert(/2 assets selected/.test(summary()), `⌘-click did not add: ${summary()}`);
+  assertEqual(marked().sort(), [first, second].sort(), 'the marks do not agree with the count');
+
+  // …and takes it away again, which is the same modifier meaning the same thing.
+  cmdClickTile(app, second);
+  await app.settle(400);
+  assert(/1 asset selected/.test(summary()), `⌘-click did not remove: ${summary()}`);
+
+  // A plain click is a fresh selection, not another addition: what is left selected
+  // is the photo that was clicked and nothing else.
+  cmdClickTile(app, second);
+  await app.settle(400);
+  clickTile(app, third);
+  await app.settle(400);
+  assert(/1 asset selected/.test(summary()), `a plain click kept the old selection: ${summary()}`);
+  assertEqual(marked(), [third], 'the wrong photo was left selected');
+});
+
+await check('a plain click replaces a "select all matching" snapshot', async (app) => {
+  // The risky reading of the same rule, and the one worth pinning: the set *is* a
+  // filter here, so "select only this one" has to take the filter, the exclusions and
+  // the resolved count with it — a click that left the snapshot underneath would have
+  // the bar counting a set the reader is no longer looking at.
+  app.click('selectAllMatching');
+  await app.settle(700);
+  const snapshot = app.$('selectionSummary').textContent;
+  assert(!/^1 asset/.test(snapshot), `"select all matching" selected one asset: ${snapshot}`);
+
+  const [tile] = app.tileIds();
+  clickTile(app, tile);
+  await app.settle(700);
+  assert(/1 asset selected/.test(app.$('selectionSummary').textContent),
+    `a click did not replace the snapshot with one photo: ${app.$('selectionSummary').textContent}`);
+  assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 1,
+    'the grid still marks more than the one photo that was clicked');
 });
 
 await check('the count is the resolved one, and it is singular for one photo', async (app) => {
@@ -164,7 +230,7 @@ await check('clicking Delete sends the selection to /api/delete, with a fingerpr
   const sent = interceptDeletes(app);
   const [first, second] = app.tileIds();
   clickTile(app, first);
-  clickTile(app, second);
+  cmdClickTile(app, second);
   await app.settle(500);
 
   app.click('deleteButton');

@@ -825,6 +825,22 @@ bug, not a cleanup.
   transport, because nothing on the stage has a handler that could take it. The edge of
   the stage is not a navigation zone either — for a clip that is exactly where the
   volume and the scrub bar are.
+- **A click on a photo is one rule, on every surface a photo can be pointed at.**
+  `onPhotoClick` is the only reader of the modifiers: ⇧ extends the selection to the
+  clicked photo from that surface's anchor and does *not* move it (so a reader can extend
+  in either direction from where they started), ⌘ toggles that one photo, and nothing
+  held down replaces the selection with it. The two modifiers are the two ways of
+  *adding*, which is why the plain click is the one that cannot surprise: in a tool whose
+  selection is a list of photographs about to be destroyed, a mis-click must not leave a
+  photo inside the set the bar counts. ⌘ and not ⌃ — ⌃-click is the platform's own
+  secondary click, and this client needs that for the context menu. The grid, All Photos
+  and the group strips share the function and pass their own anchor accessors, because a
+  second copy of this rule is a second answer to "what will Delete destroy".
+- **A plain click replaces a "select all matching" snapshot outright.** The snapshot sets
+  `mode: 'matching'`; a click sets a fresh `emptySelection()` with one id, which drops the
+  mode, the saved filter, the exclusions and the resolved count together. Leaving the
+  snapshot underneath would have the bar counting a set the reader is no longer looking
+  at — and the count is the thing a deletion is authorised against.
 - **Zoom belongs to the photograph, not to the view.** Paging resets it instantly (the
   reader did not ask for that change), closing resets it *before* the return travel starts
   (a shrinking photo underneath the copy flying the other way is two motions at once),
