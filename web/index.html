@@ -282,7 +282,7 @@
     <div class="lightbox-stage" id="lightboxStage">
       <button class="lightbox-nav prev" id="lightboxPrev" title="Previous (←)">‹</button>
       <button class="lightbox-nav next" id="lightboxNext" title="Next (→)">›</button>
-      <img id="lightboxImage" alt="">
+      <img id="lightboxImage" alt="" draggable="false" title="Scroll or pinch to zoom · drag to pan · 0 to fit">
       <!-- The clip. A `<video>` rather than a second `<img>` because a clip is not a
            photograph of one of its moments: it has to be *played*, and the only way
            to play it in a window that has no business spawning QuickTime is to put
@@ -297,7 +297,7 @@
            playback and seeking are the platform's, which is why a click on the
            scrub bar must not page the overlay — see the stage's click handler. -->
       <video id="lightboxVideo" controls preload="metadata" playsinline hidden></video>
-      <div class="lightbox-fallback" id="lightboxFallback" hidden>Preview unavailable — the original is not on this Mac.</div>
+      <div class="lightbox-fallback" id="lightboxFallback" hidden>Preview unavailable — Photos could not produce this photo.</div>
     </div>
     <div class="lightbox-meta">
       <div class="meta-score" id="lightboxScore">—</div>
@@ -317,13 +317,13 @@
         <div class="meta-albums"><dt>Albums</dt><dd id="lightboxAlbums">—</dd></div>
       </dl>
       <div class="lightbox-actions">
-        <button class="chip" id="lightboxAllPhotos">Show in All Photos</button>
-        <!-- The same action as the tile menu's "Show Similar Photos", offered here
-             as a chip for the same reason "Show in All Photos" is: right-click is
-             not reachable from a trackpad or a keyboard. One handler, one
-             implementation — see `showSimilarPhotos`. -->
-        <button class="chip" id="lightboxSimilarPhotos">Show Similar Photos</button>
-        <button class="chip" id="lightboxSelect">Select (Space)</button>
+        <!-- The one panel action that leaves this app, and the only one the surface
+             was missing. What the three chips here used to do is reachable without
+             them: "Show in All Photos" is the tile's own hover tool and a menu item,
+             "Show Similar Photos" is the menu item — greyed out for a photo that
+             has none — and selecting is a click on the tile in the grid, which is
+             where a selection is made. The preview's own actions are per-photo. -->
+        <button class="chip" id="lightboxOpenInPhotos" title="Open this photo in Photos. Leaves this app.">Open in Photos</button>
         <!-- The favourite toggle, in the same heart the tiles use: one glyph for one
              flag, everywhere. Favourite *means* "excluded from bulk deletion" —
              that is the one protection this tool has, and it is unconditional — so

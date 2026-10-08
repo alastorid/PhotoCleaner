@@ -102,6 +102,36 @@ func registerStateMachineTests() {
         check((try await fixture.lastError(of: "a"))?.contains("boom") == true, "the error is kept for diagnosis")
     })
 
+    Registry.shared.add(suite: suite, TestCase(name: "an unanswered request is parked without a retry, and stays retryable",
+        knownBug: nil) {
+        // The retry exists so a transient failure does not park an asset forever.
+        // It is what a *deadline* must not have: the retried row returns to
+        // `pending` with its original `creation_date`, and `claimJobs` drains
+        // `pending` newest-first, so the next worker to claim a batch finds it at
+        // the front and waits out the whole deadline again. Measured on a real
+        // library: eleven such assets held four workers for eighteen minutes and
+        // moved the pass by two assets.
+        let fixture = try await Fixture.make("sm-timeout")
+        try await fixture.seed([.init(id: "stuck", score: nil, date: 1, state: .pending)])
+        _ = try await fixture.cache.claimJobs(limit: 1)
+
+        try await fixture.cache.recordFailure(for: "stuck", error: "no answer after 120 s", retry: false)
+        checkEqual(try await fixture.analysisState(of: "stuck"), .failed,
+                   "a timed-out request is terminal on its first record")
+        checkEqual(try await fixture.attempts(of: "stuck"), 1, "the attempt is still counted")
+        checkEqual(try await fixture.cache.claimJobs(limit: 10).count, 0,
+                   "and it is never re-claimed, which is what keeps the queue moving")
+
+        // Retry is the escape hatch, and it must reach these rows: `requeueFailures`
+        // re-queues `failed` unconditionally, so a timeout is retryable whether or
+        // not iCloud downloads are on — the difference from `unavailable`, which is
+        // only re-queued when they are.
+        let requeued = try await fixture.cache.requeueFailures(includeUnavailable: false)
+        checkEqual(requeued, 1, "Retry re-queues a timed-out asset with downloads off")
+        checkEqual(try await fixture.analysisState(of: "stuck"), .pending, "back in the queue")
+        checkEqual(try await fixture.attempts(of: "stuck"), 0, "with its attempt counter reset")
+    })
+
     Registry.shared.add(suite: suite, TestCase(name: "a very long error message is truncated, not stored whole",
         knownBug: nil) {
         let fixture = try await Fixture.make("sm-longerror")

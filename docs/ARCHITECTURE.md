@@ -341,6 +341,14 @@ just as when it is scored. So `rate` and `etaSeconds` overstate throughput and
 understate remaining time by roughly the cloud-only share. They must never be quoted
 as inference throughput.
 
+The window also has to *expire*. Throughput is measured over the completions of the
+last 15 s, and when none of them are that recent the answer is **zero**, not the
+average of the window that preceded the silence. Measured before the fix, on a pass
+that had made no progress for four minutes: `rate` 0.54, `etaSeconds` 31,190. The
+window was pruned only when a *new* sample arrived, so a stall had no new samples and
+reported the last window forever. A client draws a countdown from that number, which
+means a stopped pass looked healthy — the one read-out that exists to say otherwise.
+
 ### 5.3 The FeaturePrint backfill
 
 `upsert` deliberately keeps a `done` asset `done` when its modification date and
@@ -358,6 +366,54 @@ empty, so a first run spends its time on unscored photos first.
 That queue deliberately skips the state machine. `recordFailure` would park an asset
 whose analysis is already complete, and `releaseClaims` would look for an `analyzing`
 row that does not exist.
+
+### 5.4 No framework callback may hold a worker forever
+
+Every wait on PhotoKit or AVFoundation in the analysis path is bounded by a
+`CallbackDeadline`, and a request that goes unanswered is cancelled and reported as
+`PhotoLibraryError.requestTimedOut` — a failure, with **no automatic retry**, re-queued
+only by the user's **Retry**. Three waits, and they are the whole set: the image
+request (`PhotoLibrary.requestImage`, 120 s), a clip's `AVAsset`
+(`VideoLibrary.videoAsset`, 300 s, which may be a whole cloud download), and one
+generated frame (`VideoLibrary.generateOneFrame`, 120 s).
+
+The failure this prevents is not a slow asset, it is a stopped pass. Measured on a
+54,614-asset library: with iCloud downloads on, `requestImage` left its handler
+uncalled for **minutes** for one asset while the same asset answered in **3 ms** when
+the request was not allowed to reach the network. An `await` on a handler that never
+runs suspends its task with **no thread behind it** — nothing times out, nothing
+logs, nothing recovers — and `analyze()` waits for all four workers. One such asset
+parks a worker for the life of the process, the phase stays `analyzing`, and
+`percent` (terminal rows over total) stops at whatever it had reached. A relaunch
+reproduces it exactly, because `claimJobs` drains the queue by `creation_date DESC`
+and claims the same assets at the same point. **A stall that a restart reproduces is
+not a slow pass**, and it must never be diagnosed as one.
+
+No automatic retry, and that is about *where* the retry lands. `recordFailure`'s
+retry returns the row to `pending` with its original `creation_date`, and `claimJobs`
+drains `pending` newest-first — so a timed-out asset comes back at the **front** of
+the queue and the next worker to claim a batch waits out the whole deadline again.
+Measured on the same library, with the retry in place: **eleven** such assets held
+four workers for eighteen minutes and advanced the pass by two assets. Without it,
+each costs one deadline, once, and the row is a visible failure with a Retry that
+does not re-block anything. `recordFailure(retry: false)` is that switch, and
+`framesForAnalysis` applies the same reasoning to a clip's three samples: an
+unanswered `AVAsset` aborts the clip's remaining frames instead of waiting out the
+same silence three times.
+
+Two things are deliberately *not* done here. Apple's `AVAssetImageGenerator.image(at:)`
+is not used, because a continuation the caller does not own cannot be cancelled or
+resumed by anyone else; `VideoLibrary.generateOneFrame` drives
+`generateCGImagesAsynchronously` so it can cancel with
+`cancelAllCGImageGeneration()`. And the deadline answers *before* it cancels: `finish`
+is the single-shot gate, so cancelling first would let the framework's own cancelled
+callback win the race with `imageUnavailable` — and `unavailable` is the state that
+is never retried, which is the wrong fate for an asset nothing was learned about.
+
+`VideoStreamer.videoAsset` carries the same hazard — it is the same `requestAVAsset`
+call, duplicated for fMP4 playback — and is *not* bounded. A clip whose request goes
+unanswered parks an HTTP handler rather than an analysis worker, which is a stalled
+player instead of a stalled pass.
 
 ---
 
@@ -629,6 +685,12 @@ bug, not a cleanup.
   PhotoKit can invoke the handler more than once (degraded then final, or image then
   error) and a second `resume` traps. That is what `ResumeBox` is for; the same guard
   protects `performChanges`.
+- **Every wait on a PhotoKit or AVFoundation callback in the analysis path stays
+  bounded**, and the deadline answers before it cancels the request. PhotoKit is
+  allowed to never call a handler, and an unbounded `await` on one suspends its task
+  with no thread behind it — no timeout, no log, no recovery — which stops the whole
+  pass at a percentage a relaunch reproduces. Four workers, one poison asset each.
+  See §5.4.
 - **`OSAllocatedUnfairLock.withLock` passes an `inout` reference — mutate it in
   place.** Mutating a copy writes the right value to disk while in-memory state stays
   stale for the life of the process.
@@ -673,26 +735,95 @@ bug, not a cleanup.
   it must not resize itself on arrival and move its own destination out from under the
   animation. Anything that lets the stage grow with its content reintroduces a jump
   halfway through every open.
+- **Whatever rendition is loaded, the still fills the stage's fitted box.**
+  `#lightboxImage` is `width/height: 100%` with `object-fit: contain` — the geometry the
+  travelling copy uses — and it is not cosmetic. The photograph on the stage starts as
+  the *local* rendition (256px of it, §8) and sharpens in place, so an element sized by
+  `max-width` alone draws that rendition at its own pixel size: paging to the next
+  photograph reads as a small picture expanding, the frame is mostly the stage's dark
+  panel until the original lands — which for a cloud-only photo can be minutes or
+  never — and the hand-over from the travelling copy (identical bitmap, identical box)
+  is a resize instead of a change of sharpness. Nothing in jsdom can see any of that:
+  CSS layout does not exist there, so this one is a rule to keep, not a test to pass.
+- **The still is held and revealed instantly; only a clip cross-fades.** Both edges of
+  `lightbox-entering` matter for a photograph. Fading in leaves the destination-sized
+  still half-visible underneath the copy still flying towards it, which is the two-copies
+  failure the hold exists to prevent; fading out leaves the still and the copy both
+  semi-transparent over the dark backdrop, and the frame measurably dims for the ~80ms
+  they take to sum back to opaque (0.81 of the photograph at the darkest). A clip keeps
+  the fade, because what arrives on top of its poster still is the video's own frame.
 - **What travels is the thumbnail, never the preview.** The preview is a 2048px JPEG
   that has not been requested when Space is pressed; animating toward it would mean
   animating the absence of a bitmap. A copy of the already-decoded thumbnail makes the
   trip, positioned `fixed` in viewport coordinates so a resizing stage cannot drag it,
-  and the two cross-fade once the real bitmap has decoded.
-- **The hand-over waits for the travel *and* the decode.** Crossing over while the
+  and it is taken away once there is a picture underneath it — a still simply reveals
+  one; only a clip cross-fades.
+- **The hand-over waits for the travel *and* for a picture.** Crossing over while the
   thumbnail is still in flight puts the sharp photograph at full size with a blurred
-  copy of itself sliding into the grid on top of it. The decode wait is bounded
-  (`PREVIEW_DECODE_GRACE_MS`) because a photo whose preview cannot be read raises
-  `error` rather than `load`, and the travelling copy has to be taken away either way.
+  copy of itself sliding into the grid on top of it. A still reports that it has a
+  picture from its own walk through the renditions of it (`renderLightboxStill`); a
+  clip waits for `loadedmetadata`, bounded by `preload="metadata"` and therefore free
+  of the body's bytes. The wait is not on a timer: a preview still coming down from
+  iCloud leaves the local rendition the grid was already drawing on the stage, holding
+  the travelling copy — which is a copy of that same bitmap — over a picture rather
+  than over an absence.
+- **The preview is filled from what this Mac already has, then from the original, and
+  only then from a sentence.** `/api/photo/{id}/preview` asks PhotoKit for the
+  *original*, which with "Download from iCloud when required" on is a request that
+  waits for pixels to come down — seconds for a photo this Mac once held, and longer
+  for one it never has. The grid tile beside it has been drawing a local rendition the
+  whole time, so `renderLightboxStill` paints that first (the tile's own bitmap, free
+  out of the browser's cache, or the largest local thumbnail — the thumbnail route
+  always passes `allowNetwork: false`), asks for the original behind it, and falls
+  back to the local rendition it had when the original cannot be produced. Two failures
+  came from the missing step: a preview that arrived late was preceded by an empty
+  stage, and one that never arrived left the stage empty for good — with the arrows
+  looking dead because every page was the same blank rectangle.
 - **The animation is optional to every caller.** It is skipped when there is no tile to
   fly from (a failed or not-yet-loaded thumbnail), no layout to measure, or under
   `prefers-reduced-motion`. A preview has to work identically without it.
-- **The preview travels; a clip's poster frame is what travels.** For a still the
-  hand-over waits for `decode()`. For a clip it waits for `loadedmetadata`, which is
-  bounded by `preload="metadata"` and therefore costs no bytes of the body — and the
-  waiting element still gets the `lightbox-entering` opacity hold, because the frame
-  on screen behind the travelling copy *is* that clip's poster. Holding it until the
-  clip could play would hold a frame that is already visible for however long the
-  export takes.
+- **Zoom magnifies the photograph, and only the photograph.** The transform is on
+  `#lightboxImage`: the panel, the overlay and the stage the reader is pointing at do not
+  move with it, because magnifying the interface along with the photo is the failure
+  this rules out. `transform-origin: 0 0` with an explicitly computed `translate`/`scale`
+  is what lets the anchor arithmetic be stated in one coordinate space — the point under
+  the fingers stays under them (`zoomTo`), which is also what makes a corner of a photo
+  reachable without panning.
+- **A magnified photograph can never be panned off the stage, and an axis with no slack
+  is centred instead.** The clamp is on the photograph's own fitted rect, not on the
+  element that holds it (`zoomClamp`): a photo narrower than the stage stays centred
+  horizontally however far it is zoomed, and one that overflows an axis pans only as far
+  as its edge. That is why an off-centre pinch does not always hold its anchor — at the
+  bound there is nothing to hold it with — and why a check for the anchor has to pick a
+  point that is on the photographed pixels with the clamp's slack to spare.
+- **A gesture does not animate; a step the reader took does.** A transition on every wheel
+  tick trails the fingers by its own duration, so the wheel/pinch path forces
+  `transition: none` and re-arms the settle once the gesture goes quiet, while `+`, `-`
+  and `0` animate — one change, with no gesture behind it.
+- **Zoom belongs to the photograph, not to the view.** Paging resets it instantly (the
+  reader did not ask for that change), closing resets it *before* the return travel starts
+  (a shrinking photo underneath the copy flying the other way is two motions at once),
+  and a repaint of the same photo — hearting it from the preview — keeps whatever the
+  reader set. A clip is never zoomed at all: a wheel over a clip is next to its scrub bar
+  and its volume, and its transport owns its own gestures.
+- **The preview panel carries the actions that have no other doorway.** "Open in Photos"
+  is the one action here that leaves this app, and it had no control on this surface;
+  "Show in All Photos" (the tile's hover tool, and the menu), "Show Similar Photos" (the
+  menu) and selecting (a click on the tile) each already have theirs, so the chips that
+  duplicated them were removed rather than kept in step by hand.
+- **A menu item that cannot act is greyed out from an answer, never from a guess.**
+  "Show Similar Photos" is the one item whose enabled state is not on the row — whether a
+  photo has a group is a fact about a grouping pass that ran in the background — so it is
+  built live and corrected from `GET /api/photo/{id}/similar` under the token
+  `tileMenu.lookup` guards, and only a *definite* "analysed, no group" greys it out:
+  "not analysed yet" keeps a live item, because its page says something different and
+  true.
+- **The preview travels; a clip's poster frame is what travels.** For a clip the
+  hand-over waits for `loadedmetadata`, which is bounded by `preload="metadata"` and
+  therefore costs no bytes of the body — and the waiting element still gets the
+  `lightbox-entering` opacity hold, because the frame on screen behind the travelling
+  copy *is* that clip's poster. Holding it until the clip could play would hold a
+  frame that is already visible for however long the export takes.
 - **`/api/photo/{id}/video` must stream a range, and it must not buffer the file.**
   Every other route answers from `Data` because a 2048 px JPEG is a `Data`. A clip is
   not: `AVAssetExportPresetPassthrough` keeps the original codec and the original
@@ -888,6 +1019,17 @@ within-group ordering? If neither, it does not belong.
   exists only while the file is being written. The general lesson, now the reason the
   suite includes `VideoRouteTests`: cover the seam where a file is *produced*, not
   only the code that consumes one that already exists.
+- **The analysis deadlines are bounds, not repairs, and the numbers are judgements.**
+  When PhotoKit never answers a request (§5.4) the asset is now recorded as `failed`
+  with no automatic retry — the retry would return it to the front of the queue and
+  re-block the pass for another whole deadline — which means the *pass* finishes and
+  the *asset* waits for an explicit **Retry**. Nothing here makes PhotoKit answer; it
+  makes the run survive the silence. 120 s for an image and a frame, 300 s for a
+  clip's `AVAsset` (which may be a whole cloud download) were chosen to sit far beyond
+  every healthy request measured on a 54,614-asset library and far short of "never",
+  not from a distribution of real latencies. `VideoStreamer.videoAsset` — the same
+  `requestAVAsset` call, duplicated for fMP4 playback — is left unbounded on purpose,
+  because a stall there costs a player, not the pass.
 - A scan is not a consistent snapshot: the library can mutate mid-enumeration. That is
   handled, but not prevented.
 - **Self-update cannot install everything.** `UpdateTarget.plan` refuses a bundle that

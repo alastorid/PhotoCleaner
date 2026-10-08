@@ -94,7 +94,9 @@ final class VideoLibrary: @unchecked Sendable {
     /// and could not fetch it. That is not a courtesy to the caller — it is what
     /// lets `AnalysisEngine.recordOutcome` route an iCloud-only clip to
     /// `unavailable` instead of counting a scoring failure, exactly as it does for
-    /// a photo.
+    /// a photo. `.requestTimedOut` is the third outcome and is the only one that
+    /// says "the framework never answered", which `recordOutcome` counts as a
+    /// failure to be retried rather than as a fact about the clip.
     func frame(identifier: String,
                at seconds: Double,
                maxPixelSize: Int,
@@ -130,12 +132,18 @@ final class VideoLibrary: @unchecked Sendable {
         generator.maximumSize = CGSize(width: max(1, maxPixelSize), height: max(1, maxPixelSize))
 
         do {
-            // The `async` form rather than `copyCGImage(at:actualTime:)`: the
-            // synchronous one blocks a thread, and a blocked cooperative-pool
-            // thread is one the analysis workers cannot have — the argument
-            // `WalkHandoff` exists to make about the library walk.
-            let (image, _) = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600))
-            return image
+            // The callback form rather than either asynchronous `image(at:)`
+            // wrapper: generation is asynchronous either way, but only this form
+            // gives the caller something to cancel, and only a request the caller
+            // can give up on can be given a deadline. See `generateOneFrame` and
+            // `CallbackDeadline`.
+            return try await generateOneFrame(generator, at: seconds)
+        } catch let error as PhotoLibraryError {
+            // Our own timeout, passed through: `recordOutcome` routes it to a
+            // failure that is retried, where `imageUnavailable` is the state that
+            // is never retried. Nothing here learned anything about the clip.
+            if Task.isCancelled { throw CancellationError() }
+            throw error
         } catch {
             // A decode failure is reported as `.imageUnavailable`, not as the
             // raw `AVError`: `recordOutcome` matches on the PhotoKit-facing
@@ -143,6 +151,68 @@ final class VideoLibrary: @unchecked Sendable {
             // failure and retried forever against a clip that will never decode.
             if Task.isCancelled { throw CancellationError() }
             throw PhotoLibraryError.imageUnavailable
+        }
+    }
+
+    /// How long one frame of a clip may take to generate.
+    ///
+    /// The clip's bytes are already in hand by the time this runs — `frame` asks
+    /// for the `AVAsset` first — so this bounds a seek and a decode, not a
+    /// download. Two minutes is already generous for that; the frame sizes are
+    /// bounded by `maxPixelSize`, and the generator's cache bounds long samples.
+    private static let frameDeadline: TimeInterval = 120
+
+    /// One decoded frame from `generator`, or a failure it reported.
+    ///
+    /// `generateCGImagesAsynchronously` rather than `AVAssetImageGenerator.image(at:)`
+    /// for one reason: a generation that never completes must be abandonable, and
+    /// the only way to abandon it is to own the continuation and cancel the
+    /// generator. An `await` on Apple's own wrapper cannot be cancelled and cannot
+    /// be resumed by anyone else, so a clip whose samples are not where
+    /// AVFoundation expects would suspend its worker — and the whole pass — for
+    /// the life of the process. See `CallbackDeadline`.
+    ///
+    /// The synchronous `copyCGImage(at:actualTime:)` is out for the reason it has
+    /// always been: it blocks a thread, and a blocked cooperative-pool thread is
+    /// one the analysis workers cannot have — the argument `WalkHandoff` exists to
+    /// make about the library walk.
+    private func generateOneFrame(_ generator: AVAssetImageGenerator,
+                                  at seconds: Double) async throws -> CGImage {
+        let box = VideoRequestBox()
+        let deadline = CallbackDeadline()
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let finish: @Sendable (Result<CGImage, Error>) -> Void = { result in
+                    guard box.beginResume() else { return }
+                    deadline.disarm()
+                    continuation.resume(with: result)
+                }
+                generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) {
+                    _, image, _, result, error in
+                    switch result {
+                    case .succeeded where image != nil:
+                        finish(.success(image!))
+                    case .cancelled:
+                        // The *task* was cancelled, which is not the clip's fault:
+                        // `recordOutcome` checks `Task.isCancelled` before routing
+                        // anything, so this must not look like a broken frame.
+                        finish(.failure(CancellationError()))
+                    default:
+                        finish(.failure(error ?? PhotoLibraryError.imageUnavailable))
+                    }
+                }
+                box.set(cancel: { generator.cancelAllCGImageGeneration() })
+                deadline.arm(after: Self.frameDeadline) {
+                    // Answer first, then cancel — see `PhotoLibrary.requestImage`
+                    // for why the order is load-bearing.
+                    finish(.failure(PhotoLibraryError.requestTimedOut(
+                        "no frame at \(seconds)s after \(Int(Self.frameDeadline)) s")))
+                    box.cancel()
+                }
+            }
+        } onCancel: {
+            box.cancel()
         }
     }
 
@@ -460,6 +530,16 @@ final class VideoLibrary: @unchecked Sendable {
 
     // MARK: - PhotoKit plumbing
 
+    /// How long PhotoKit may go unanswered for a clip's `AVAsset`.
+    ///
+    /// Longer than the image deadline because this request is allowed to fetch the
+    /// clip itself: with iCloud downloads on, a `requestAVAsset` that is going to
+    /// answer at all answers after a whole file — potentially a long one — has
+    /// arrived. Five minutes is beyond any healthy fetch this tool has measured,
+    /// and it is a bound rather than a target: the phase this exists to prevent is
+    /// the one where the answer never comes. See `CallbackDeadline`.
+    private static let videoAssetDeadline: TimeInterval = 300
+
     /// The `AVAsset` for a video, from Photos, honouring `allowNetwork`.
     ///
     /// `requestAVAsset` rather than `PHAssetResourceManager.writeData(for:toFile:)`:
@@ -485,24 +565,29 @@ final class VideoLibrary: @unchecked Sendable {
         // report, an abort that takes the whole app down mid-scan. The guard costs
         // one atomic flag.
         let box = VideoRequestBox()
+        let deadline = CallbackDeadline()
         let wrapper: HandedOff<AVAsset> = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                let finish: @Sendable (Result<HandedOff<AVAsset>, Error>) -> Void = { result in
+                    guard box.beginResume() else { return }
+                    deadline.disarm()
+                    continuation.resume(with: result)
+                }
                 let options = PHVideoRequestOptions()
                 options.deliveryMode = .highQualityFormat
                 options.version = .current
                 options.isNetworkAccessAllowed = allowNetwork
                 let requestID = PHImageManager.default().requestAVAsset(forVideo: asset, options: options) {
                     avAsset, _, info in
-                    guard box.beginResume() else { return }
                     if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled {
                         // The *task* was cancelled, which is not the asset's fault.
                         // `AnalysisEngine` checks `Task.isCancelled` before it routes
                         // anything, so this must not look like a broken image.
-                        continuation.resume(throwing: CancellationError())
+                        finish(.failure(CancellationError()))
                         return
                     }
                     if let avAsset {
-                        continuation.resume(returning: HandedOff(avAsset))
+                        finish(.success(HandedOff(avAsset)))
                         return
                     }
                     if let error = info?[PHImageErrorKey] as? Error {
@@ -510,18 +595,25 @@ final class VideoLibrary: @unchecked Sendable {
                         let isCloud = nsError.domain == PHPhotosErrorDomain
                             && (nsError.code == PHPhotosError.networkAccessRequired.rawValue
                                 || nsError.code == PHPhotosError.networkError.rawValue)
-                        continuation.resume(throwing: isCloud
+                        finish(.failure(isCloud
                             ? PhotoLibraryError.imageNotLocal
-                            : PhotoLibraryError.imageRequestFailed(error.localizedDescription))
+                            : PhotoLibraryError.imageRequestFailed(error.localizedDescription)))
                         return
                     }
                     if info?[PHImageResultIsInCloudKey] as? Bool == true, !allowNetwork {
-                        continuation.resume(throwing: PhotoLibraryError.imageNotLocal)
+                        finish(.failure(PhotoLibraryError.imageNotLocal))
                         return
                     }
-                    continuation.resume(throwing: PhotoLibraryError.imageUnavailable)
+                    finish(.failure(PhotoLibraryError.imageUnavailable))
                 }
-                box.set(requestID: requestID)
+                box.set(cancel: { PHImageManager.default().cancelImageRequest(requestID) })
+                deadline.arm(after: Self.videoAssetDeadline) {
+                    // Answer first, then cancel — see `PhotoLibrary.requestImage`
+                    // for why the order is load-bearing.
+                    finish(.failure(PhotoLibraryError.requestTimedOut(
+                        "no AVAsset after \(Int(Self.videoAssetDeadline)) s")))
+                    box.cancel()
+                }
             }
         } onCancel: {
             box.cancel()
@@ -652,20 +744,25 @@ private struct HandedOff<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
-/// Single-shot resume guard for one `requestAVAsset`, shared between PhotoKit's
-/// handler and the task-cancellation handler.
+/// Single-shot resume guard for one outstanding request — a `requestAVAsset` or a
+/// frame generation — shared between the framework's handler and the
+/// task-cancellation handler and the deadline.
 ///
 /// The same hazard as `PhotoLibrary.ResumeBox`, and for the same reason: resuming
 /// a checked continuation twice aborts the process. `set`/`cancel` re-check the
 /// flag under the lock and act immediately if the request has already been
-/// resolved, because a cancellation that arrives *before* `requestAVAsset` has
-/// returned its identifier is the case a naive `if let id { cancel(id) }` drops —
-/// and then the request runs to completion, does a cloud download nobody wanted,
-/// and resumes a continuation whose task is already gone.
+/// resolved, because a cancellation that arrives *before* the request has an
+/// identifier to cancel is the case a naive `if let id { cancel(id) }` drops — and
+/// then the request runs to completion, does a cloud download nobody wanted, and
+/// resumes a continuation whose task is already gone. That ordering is not exotic:
+/// `withTaskCancellationHandler` fires `onCancel` immediately when the task is
+/// already cancelled, so a worker cancelled by a rescan reaches `cancel()` first
+/// every time.
 private final class VideoRequestBox: @unchecked Sendable {
     private let lock = NSLock()
     private var resumed = false
-    private var requestID: PHImageRequestID?
+    private var cancelled = false
+    private var cancelRequest: (() -> Void)?
 
     func beginResume() -> Bool {
         lock.lock()
@@ -675,19 +772,29 @@ private final class VideoRequestBox: @unchecked Sendable {
         return true
     }
 
-    func set(requestID: PHImageRequestID) {
+    /// Registers how to cancel the request this guard belongs to.
+    ///
+    /// A plain closure rather than a `@Sendable` one because what it captures is
+    /// the thing being cancelled — an `AVAssetImageGenerator`, which is not
+    /// `Sendable`. That is the assertion this whole type already rests on, and
+    /// `AVFoundation` documents both cancellations as callable from any thread:
+    /// the generator is created per call and never shared, and
+    /// `cancelAllCGImageGeneration()` is the documented way to stop one from
+    /// outside the callback.
+    func set(cancel: @escaping () -> Void) {
         lock.lock()
-        let alreadyResolved = resumed
-        self.requestID = requestID
+        let alreadyCancelled = cancelled
+        cancelRequest = cancel
         lock.unlock()
-        if alreadyResolved { PHImageManager.default().cancelImageRequest(requestID) }
+        if alreadyCancelled { cancel() }
     }
 
     func cancel() {
         lock.lock()
-        let id = requestID
+        cancelled = true
+        let request = cancelRequest
         lock.unlock()
-        if let id { PHImageManager.default().cancelImageRequest(id) }
+        request?()
     }
 }
 

@@ -1399,20 +1399,38 @@ struct Router: Sendable {
         }
 
         let allowNetwork = settings.snapshot().downloadFromICloud
+
+        // Check for Range header. For initial playback (no Range or bytes=0-),
+        // check if there's a cached export first. If cached, serve from file
+        // (supports precise byte ranges). If not cached, use fMP4 streaming for
+        // instant start without waiting for full export. For seeking (other ranges),
+        // always use cached export file.
+        let rangeHeader = request.header("range")
+        let isInitialPlayback = rangeHeader == nil || rangeHeader == "bytes=0-"
+
+        // Check if there's already a cached export (fast path for cached videos)
+        let cachedSize = videos.cachedByteCount(identifier: identifier)
+        let hasCachedFile = cachedSize != nil && cachedSize! > 0
+
+        if isInitialPlayback && !hasCachedFile {
+            // No cached export — stream via fMP4 for instant start
+            let videoStream = HTTPVideoStream(
+                status: 200,
+                headers: ["Content-Type": "video/mp4", "Accept-Ranges": "bytes"],
+                identifier: identifier,
+                allowNetwork: allowNetwork,
+                rangeStart: nil,
+                rangeLength: nil
+            )
+            return .videoStream(videoStream)
+        }
+
+        // Either cached file exists, or this is a seeking request (Range other than bytes=0-)
+        // Use cached export file which supports precise byte-range serving
         let url: URL
         do {
             url = try await videos.exportedFile(identifier: identifier, allowNetwork: allowNetwork)
         } catch PhotoLibraryError.imageNotLocal {
-            // A 409, naming the setting, and not a 404.
-            //
-            // This is the one place in the API where "the thing you asked for exists
-            // and you can have it" and "the thing you asked for does not exist" are
-            // both plausible answers, and the client can only act on one of them. A
-            // 404 here reads as "this video is gone" — the lightbox would show a
-            // missing-asset message and the user would go looking for a file that is
-            // sitting in iCloud. A 409 that names the preference says "turn this on
-            // and press play again", which is the actual remedy, and the setting is
-            // already on the settings screen.
             return .response(.error(
                 "this clip is stored in iCloud only; turn on \"Download from iCloud\" in Settings "
                 + "and try again", status: 409))
@@ -1423,15 +1441,9 @@ struct Router: Sendable {
         }
 
         let size = Self.byteLength(of: url)
-        // The header is read from the request, not from a query parameter, and it is
-        // optional: absent means the whole file, which is what a `<video>` element
-        // asks for on its first request anyway.
-        let range = HTTPRange.resolve(header: request.header("range"), fileSize: size)
+        let range = HTTPRange.resolve(header: rangeHeader, fileSize: size)
         switch range {
         case .unsatisfiable:
-            // `416` with `Content-Range: bytes */size`, per the table in the contract.
-            // The client learns the real length from it, which is the one case where
-            // the error carries more information than the success would have.
             var response = HTTPResponse.error(
                 "that byte range is past the end of this clip (\(size) bytes)", status: 416)
             if let value = range.contentRangeHeader(fileSize: size) {

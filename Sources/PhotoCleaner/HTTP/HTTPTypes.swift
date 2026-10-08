@@ -163,6 +163,12 @@ enum RouteResult: Sendable {
     /// then feeds the file to `connection.send` in chunks, chained off each write's
     /// completion.
     case file(HTTPFile)
+    /// A live fMP4 video stream generated on-the-fly from the AVAsset.
+    ///
+    /// This is the fourth response type, for true streaming without full export.
+    /// The streamer reads samples via AVAssetReader and writes fMP4 fragments via
+    /// AVAssetWriter, yielding bytes as they're produced.
+    case videoStream(HTTPVideoStream)
 }
 
 /// A response body that is a byte range of a file on local disk.
@@ -188,6 +194,33 @@ struct HTTPFile: Sendable {
     /// `b - a + 1`, and getting that wrong desynchronises the client's parser
     /// rather than producing a merely wrong picture.
     let length: Int64
+}
+
+/// A live fMP4 video stream.
+///
+/// Unlike `HTTPFile` which serves from a complete file on disk, this generates
+/// fragmented MP4 on-the-fly from the `AVAsset` and streams fragments as they're
+/// produced. The client receives an init segment (ftyp+moov) followed by moof+mdat
+/// fragments.
+///
+/// Seeking is handled by the client requesting byte ranges. We translate the byte
+/// offset to a presentation timestamp using a fragment index, then restart the
+/// stream from the nearest preceding keyframe.
+struct HTTPVideoStream: Sendable {
+    /// `200` for initial request, `206` for Range requests.
+    var status: Int = 200
+    /// Headers to send: `Content-Type: video/mp4`, `Accept-Ranges: bytes`.
+    /// `Content-Length` is NOT set — we use chunked transfer encoding for the
+    /// live stream, or Content-Length for Range requests against a known fragment index.
+    var headers: [String: String] = [:]
+    /// The asset identifier to stream.
+    let identifier: String
+    /// Whether to allow iCloud download.
+    let allowNetwork: Bool
+    /// For Range requests: the byte offset to start from.
+    let rangeStart: Int64?
+    /// For Range requests: the byte length to serve.
+    let rangeLength: Int64?
 }
 
 /// One `Range` header, resolved against a known file size.

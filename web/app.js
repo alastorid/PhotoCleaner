@@ -1481,12 +1481,23 @@
     return tag;
   }
 
+  /**
+   * True when this Mac can only offer what it already holds.
+   *
+   * The one setting that decides whether a missing rendition is "in iCloud,
+   * downloads are off" or "Photos could not make a picture of this": with downloads
+   * on, PhotoKit is allowed to reach for the pixels, and a photo that still cannot
+   * be drawn is a different failure from one that was never fetched.
+   */
+  function localOnly() {
+    return Boolean(state.status && state.status.settings && !state.status.settings.downloadFromICloud);
+  }
+
   function buildPlaceholder() {
     const node = document.createElement('div');
     node.className = 'tile-placeholder';
-    const inCloud = Boolean(state.status && state.status.settings && !state.status.settings.downloadFromICloud);
-    node.textContent = inCloud ? 'In iCloud' : 'Unavailable';
-    node.title = inCloud
+    node.textContent = localOnly() ? 'In iCloud' : 'Unavailable';
+    node.title = localOnly()
       ? 'The pixels are stored in iCloud. Enable "Download from iCloud when required" to fetch them.'
       : 'PhotoKit could not produce a thumbnail for this asset.';
     return node;
@@ -1600,6 +1611,9 @@
      *  never have to query the DOM and risk disagreeing with it. Separators are
      *  in here too and are filtered out by role where it matters. */
     items: [],
+    /** Token for the one lookup a menu makes about its photo — see
+     *  `resolveSimilarItem`. Bumped by every open and every close. */
+    lookup: 0,
   };
 
   /** Held between the long-press timer firing and the synthetic click arriving. */
@@ -1686,10 +1700,52 @@
     $('tileMenuHint').textContent = tileMenuHintText();
     $('tileMenuLayer').hidden = false;
     placeTileMenu(tile, point);
+    // The one item whose enabled state the row cannot answer — see
+    // `resolveSimilarItem`. Started after the menu is on screen so a slow lookup
+    // never delays the menu itself.
+    const similar = plan.find((spec) => spec.key === 'similar');
+    if (similar) resolveSimilarItem(similar);
     // Focus the menu itself rather than the first item: a menu that takes focus
     // on its first item reads as "an item is already running", and every
     // keystroke would have to start at item two.
     menu.focus({ preventScroll: true });
+  }
+
+  /**
+   * Greys out "Show Similar Photos" for a photograph that has none.
+   *
+   * Whether a photo has a similar group is a fact about the grouping pass, not
+   * about the row: the grid's rows carry a score, a date and a size, and nothing
+   * that names a group. So the item is built live and corrected the moment
+   * `GET /api/photo/{id}/similar` answers — two indexed reads, the same lookup the
+   * item itself performs when it is chosen, which is why asking early costs nothing
+   * that choosing it would not have cost anyway.
+   *
+   * `tileMenu.lookup` is the token, and it is the rule everything else in this
+   * client follows: the menu can be closed and reopened on another photo while this
+   * is in flight, and a late answer must not correct the wrong item. A lookup that
+   * *fails* leaves the item live rather than grey — an unreachable server is not the
+   * same answer as "no similar photos", and the item reports the failure itself.
+   */
+  async function resolveSimilarItem(spec) {
+    const row = tileMenu.row;
+    if (!row) return;
+    const token = ++tileMenu.lookup;
+    let answer;
+    try {
+      answer = await api.get(`/api/photo/${encodeURIComponent(row.id)}/similar`);
+    } catch {
+      return;
+    }
+    if (token !== tileMenu.lookup || !spec.node) return;
+    // A definite answer only: no group *and* the analysis has seen this photo.
+    if (!answer || answer.analyzed !== true || answer.groupId) return;
+    spec.disabled = true;
+    spec.node.setAttribute('aria-disabled', 'true');
+    const hint = document.createElement('span');
+    hint.className = 'menu-hint';
+    hint.textContent = 'none found';
+    spec.node.appendChild(hint);
   }
 
   /**
@@ -1780,11 +1836,12 @@
       },
       {
         label: 'Show Similar Photos',
-        // Never disabled, on purpose. Whether this photo has a group, and whether
-        // similarity analysis has reached it yet, are both things the user is
-        // better told by a result page than by an item that has decided for them
-        // that they may not ask. Both answers open in the same place and say
-        // which of the two they are, so there is nothing to be warned off.
+        // Enabled when the menu opens, and greyed out by `resolveSimilarItem` if the
+        // photo turns out to have none. The answer is not on the row — it is a fact
+        // about a grouping pass that ran in the background — so it is asked for
+        // rather than guessed, and only a *definite* "none" greys the item: "analysis
+        // has not reached this photo yet" is a different fact, and its page says so.
+        key: 'similar',
         disabled: false,
         run: () => showSimilarPhotos(row.id),
       },
@@ -2004,6 +2061,10 @@
     tileMenu.row = null;
     tileMenu.focusReturn = null;
     tileMenu.items = [];
+    // Retires the lookup this menu started: a menu that is closing — or one being
+    // replaced by a right-click on another photo — must not be corrected by an
+    // answer about the photo it used to be about.
+    tileMenu.lookup += 1;
     layer.hidden = true;
     $('tileMenu').replaceChildren();
     $('tileMenuHint').textContent = '';
@@ -3087,10 +3148,11 @@
   /** The thumbnail handing over to the real preview: one cross-fade, this long. */
   const PREVIEW_HANDOFF_MS = 120;
   /**
-   * A bound on waiting for the preview bitmap. A photo whose preview cannot be
-   * read raises `error` rather than `load`, and the travelling thumbnail has to
-   * be taken away either way — the alternative is a ghost over a photo that is
-   * never coming.
+   * A bound on waiting for a *clip*. A still is not on a timer at all: its own
+   * walk through the renditions of it reports when there is a picture on the stage
+   * (see `renderLightboxStill`), and one that is still coming down from iCloud
+   * leaves the local rendition the grid was already drawing in place rather than an
+   * empty stage holding a photograph that may never arrive.
    */
   const PREVIEW_DECODE_GRACE_MS = 2500;
 
@@ -3098,6 +3160,8 @@
     ghost: null,
     timers: [],
     source: null,
+    /** The photograph the travelling copy flew from — see `renderLightbox`. */
+    rowId: null,
     aspect: 0,
     travelled: false,
     decoded: false,
@@ -3124,6 +3188,7 @@
     previewClearTimers();
     if (previewTravel.ghost) previewTravel.ghost.remove();
     previewTravel.ghost = null;
+    previewTravel.rowId = null;
     $('lightbox').classList.remove('lightbox-entering');
   }
 
@@ -3296,6 +3361,7 @@
     previewTravel.travelled = false;
     previewTravel.decoded = false;
     previewTravel.settled = false;
+    previewTravel.rowId = row.id;
     const source = previewSourceFor(row.id);
     previewTravel.aspect = previewAspect(row, source);
     previewTravel.source = source;
@@ -3319,31 +3385,45 @@
     previewTravel.ghost = ghost;
     previewRelease(ghost);
     previewSoon(() => { previewTravel.travelled = true; settlePreviewTravel(); }, PREVIEW_TRAVEL_MS);
-    previewWhenDecoded();
+    previewClipWhenDecoded();
   }
 
-  /** Resolves once the preview bitmap has decoded, or the grace period runs out. */
-  function previewWhenDecoded() {
+  /**
+   * A clip is the one case that waits for something a still's own walk cannot
+   * report.
+   *
+   * A photograph calls `previewMediaReady` the moment a rendition of it is on the
+   * stage — that is `renderLightboxStill`'s job, and it knows because it is the
+   * thing that put it there. A clip has no such walk: what arrives is metadata for
+   * a media element, and waiting for that rather than for a bitmap is not a
+   * downgrade. The travelling copy is a still of the poster frame, so the thing
+   * arriving on top of it is a video of the same frame at the same size, and
+   * holding the still until the clip can play would hold a frame that is already
+   * visible for however long the export takes. `loadedmetadata` is also bounded by
+   * `preload="metadata"` rather than by the reader having pressed play, so it
+   * arrives without a byte of the body being downloaded.
+   */
+  function previewClipWhenDecoded() {
     const row = currentLightboxRow();
-    // A clip waits for its *metadata*, not for a bitmap, and that is not a
-    // downgrade: the travelling copy is a still of the poster frame, so the thing
-    // arriving on top of it is a video of the same frame at the same size, and
-    // holding the still until the clip can play would hold a frame that is already
-    // visible for however long the export takes. `loadedmetadata` is also bounded
-    // by `preload="metadata"` rather than by the reader having pressed play, so it
-    // arrives without a byte of the body being downloaded.
-    const video = isVideoRow(row) ? $('lightboxVideo') : null;
-    const image = $('lightboxImage');
-    const ready = () => { previewTravel.decoded = true; settlePreviewTravel(); };
-    if (video) {
-      video.addEventListener('loadedmetadata', ready, { once: true });
-      video.addEventListener('error', ready, { once: true });
-    } else if (typeof image.decode === 'function') image.decode().then(ready, ready);
-    else {
-      image.addEventListener('load', ready, { once: true });
-      image.addEventListener('error', ready, { once: true });
-    }
+    if (!isVideoRow(row)) return;
+    const video = $('lightboxVideo');
+    const ready = () => previewMediaReady();
+    video.addEventListener('loadedmetadata', ready, { once: true });
+    video.addEventListener('error', ready, { once: true });
     previewSoon(ready, PREVIEW_DECODE_GRACE_MS);
+  }
+
+  /**
+   * The stage has a picture in it — or has run out of ways to get one.
+   *
+   * Half of what the open travel waits for; the other half is the travel itself
+   * finishing. A fallback calls this too, and deliberately: a travelling copy must
+   * not be left floating over a stage that has finished arriving, whatever it
+   * arrived at.
+   */
+  function previewMediaReady() {
+    previewTravel.decoded = true;
+    settlePreviewTravel();
   }
 
   /**
@@ -3479,6 +3559,11 @@
     if (!state.lightbox.open) return;
     const index = state.lightbox.index;
     const wasAllPhotos = state.lightbox.allPhotos;
+    // Before the travel, and instantly: the photograph leaves at fit, and a
+    // shrinking animation underneath the copy flying back to the tile would be two
+    // motions of one photo at once.
+    zoomReset(false);
+    lightboxZoom.rowId = null;
     state.lightbox = { open: false, queue: [], index: -1, live: false, allPhotos: false, groups: false, label: '' };
     // The state above is already closed, so the keyboard, the grid underneath and
     // Escape all behave as though the preview is gone while it is still visibly on
@@ -3559,8 +3644,14 @@
   function hideLightbox() {
     $('lightbox').hidden = true;
     teardownLightboxMedia();
-    $('lightboxImage').onerror = null;
-    $('lightboxImage').src = '';
+    const image = $('lightboxImage');
+    image.onload = null;
+    image.onerror = null;
+    image.src = '';
+    // Whatever the still was still waiting for belongs to a preview that is no
+    // longer open: the token retires its walk, and the photograph it belonged to is
+    // forgotten so the next open arms a fresh one rather than trusting a stale one.
+    releaseLightboxStill();
     restoreFocus();
   }
 
@@ -3612,10 +3703,161 @@
     renderLightbox();
   }
 
+  /**
+   * The still on the stage, and the walk it is taking through the renditions of it.
+   *
+   * `token` retires every callback of an earlier render. A preview request outlives
+   * the photograph it was made for — paging on while a 2048px JPEG is still coming
+   * down from iCloud leaves a response in flight for something that is no longer on
+   * screen — and the walk installed by the render that is current is the only one
+   * allowed to move the element. `rowId` is the same idea pointed the other way: a
+   * repaint of the *same* photograph, which is what hearting it from the preview is,
+   * must not restart the walk and throw the request behind it away. `givenUp`
+   * outlives such a repaint, so the fallback sentence is restored rather than
+   * re-earned by a second walk.
+   */
+  const lightboxStill = { token: 0, rowId: null, givenUp: false };
+
+  /**
+   * Retires the walk: nothing it has in flight may touch the stage again.
+   *
+   * Called when the stage changes hands — to a clip, or out of the lightbox — so a
+   * rendition still arriving for the photograph before it cannot paint itself over
+   * the thing now being shown.
+   */
+  function releaseLightboxStill() {
+    lightboxStill.token += 1;
+    lightboxStill.rowId = null;
+    lightboxStill.givenUp = false;
+  }
+
+  /**
+   * The renditions of a still that this Mac already holds, sharpest first.
+   *
+   * The grid tile's own bitmap when there is one — decoded, on screen and in the
+   * browser's cache, so painting it costs a repaint and no request at all — and the
+   * largest local thumbnails otherwise. Local by construction rather than by hope:
+   * the thumbnail route passes `allowNetwork: false`, so no rung here can start an
+   * iCloud download. A tile whose own request has already failed is skipped rather
+   * than asked again.
+   */
+  function localStillLadder(row) {
+    const tile = previewSourceFor(row.id);
+    const held = tile && !tile.classList.contains('failed') ? tile.currentSrc : '';
+    const thumbnails = [thumbURL(row.id, 512), thumbURL(row.id, 256)];
+    return held ? [held, ...thumbnails] : thumbnails;
+  }
+
+  /**
+   * What the stage says when neither the original nor a local rendition could be
+   * produced.
+   *
+   * It names the one cause the reader can act on, and it is the distinction the
+   * grid's placeholder already makes: downloads are off, so the pixels in iCloud
+   * are out of reach, or Photos holds the asset but cannot make a picture of it.
+   * The two surfaces disagreeing about why a photograph is missing is worse than
+   * either wording.
+   */
+  function noPreviewText() {
+    return localOnly()
+      ? 'Preview unavailable — the original is stored in iCloud, and downloads are off.'
+      : 'Preview unavailable — Photos could not produce this photo.';
+  }
+
+  /**
+   * Renders a still: what this Mac has, then the original, and only then the
+   * sentence that says it has neither.
+   *
+   * The preview route asks PhotoKit for the *original*, which with "Download from
+   * iCloud when required" on is a request that waits for pixels to come down —
+   * seconds for a photograph this Mac once held, and longer for one it never has.
+   * The grid tile beside it has been drawing a local rendition the whole time, so
+   * the preview starts from the bitmap the reader is already looking at and
+   * sharpens in place when the original lands.
+   *
+   * That ordering is what keeps two failures from reading as a broken app. A
+   * preview that arrives *late* used to be preceded by an empty stage, because the
+   * travelling thumbnail was taken away on a timer whether or not anything replaced
+   * it; and one that never arrives left the stage empty for good, with the arrows
+   * looking as though they did nothing because every page looked like the same
+   * blank rectangle. Both are the same missing step: there was already a rendition
+   * on this Mac, and the only thing that had ever asked for it was the grid.
+   *
+   * A repaint of the same photograph returns early rather than walking again — see
+   * `lightboxStill`.
+   */
+  function renderLightboxStill(row) {
+    if (lightboxStill.rowId === row.id && !lightboxStill.givenUp) return;
+    lightboxStill.rowId = row.id;
+    lightboxStill.givenUp = false;
+
+    const image = $('lightboxImage');
+    const fallback = $('lightboxFallback');
+    const token = (lightboxStill.token += 1);
+    const live = () => token === lightboxStill.token;
+
+    const ladder = localStillLadder(row);
+    const sources = [...ladder, previewURL(row.id)];
+    let step = 0;
+    // The local rendition on the stage, so that the original's failure has
+    // something to fall back to. Cleared once it is restored, so a rendition that
+    // fails a second time ends the walk instead of starting it over.
+    let painted = null;
+
+    image.onload = () => {
+      if (!live()) return;
+      // On the stage only once it has pixels. An `<img>` between one failed request
+      // and the next paints its `alt` — a line of "Photo scored 0.42" across the
+      // stage, which is a worse answer than nothing at all.
+      image.hidden = false;
+      fallback.hidden = true;
+      if (step < ladder.length) painted = sources[step];
+      // A picture is on the stage, whichever rung produced it, and that is what the
+      // open travel waits for before handing the screen over from its copy.
+      previewMediaReady();
+      // A local rendition is a step, not the destination: the original is what a
+      // preview is for, and it is asked for as soon as there is something on the
+      // stage for it to arrive in front of. The `src` it replaces is what stays
+      // painted while it is fetched.
+      if (step < ladder.length) { step = ladder.length; image.src = sources[step]; }
+    };
+
+    image.onerror = () => {
+      if (!live()) return;
+      image.hidden = true;
+      step += 1;
+      if (step < sources.length) { image.src = sources[step]; return; }
+      // Past the original, the local rendition that was already on the stage is the
+      // answer rather than an empty stage. It comes back out of the browser's cache,
+      // so the same `src` re-decodes rather than waits.
+      if (painted) { const source = painted; painted = null; image.src = source; return; }
+      fallback.hidden = false;
+      fallback.textContent = noPreviewText();
+      lightboxStill.givenUp = true;
+      previewMediaReady();
+    };
+
+    image.src = sources[0];
+  }
+
   function renderLightbox() {
     const row = currentLightboxRow();
     if (!row) return;
     const lightbox = state.lightbox;
+
+    // A travelling copy belongs to the photograph it flew from, and paging has to
+    // take it along: the overlay class that hides the real preview behind it is set
+    // for that one flight, so a copy left over a photo that is no longer selected
+    // would hide the new one for as long as the old travel had left to run.
+    if (previewTravel.ghost && previewTravel.rowId !== row.id) previewDropGhost();
+
+    // Zoom belongs to the photograph as well, and a new one starts fitted: carrying
+    // a magnified rect onto the next photo would show a corner of it with nothing on
+    // screen to say why. Instant, because the reader did not ask for this change —
+    // it is paging, not a zoom step. A *repaint* of the same photo (hearting it from
+    // the preview) keeps whatever zoom the reader set.
+    if (lightboxZoom.rowId !== row.id) zoomReset(false);
+    lightboxZoom.rowId = row.id;
 
     const image = $('lightboxImage');
     const video = $('lightboxVideo');
@@ -3648,6 +3890,12 @@
 
     if (isVideoRow(row)) {
       image.hidden = true;
+      // The still walk is retired rather than just covered: a rendition still
+      // arriving for the photograph before this one must not paint itself back
+      // over the clip that owns the stage now.
+      releaseLightboxStill();
+      image.onload = null;
+      image.onerror = null;
       video.hidden = false;
       video.controls = true;
       // `preload="metadata"` and no `autoplay` — set once in the markup and restated
@@ -3684,10 +3932,8 @@
       // the page change. `teardownLightboxMedia` above has already run for this
       // case, because a still never equals a clip's `src`.
       video.hidden = true;
-      image.hidden = false;
-      image.onerror = () => { image.hidden = true; fallback.hidden = false; };
-      image.src = previewURL(row.id);
       image.alt = `Photo scored ${fmt.score(row.score)}`;
+      renderLightboxStill(row);
     }
 
     $('lightboxScore').textContent = fmt.score(row.score);
@@ -3704,7 +3950,6 @@
     $('lightboxDurationRow').hidden = !(isVideoRow(row) && length);
     $('lightboxDuration').textContent = length;
     $('lightboxFavorite').textContent = row.favorite ? 'Yes' : 'No';
-    $('lightboxSelect').textContent = isSelected(row.id) ? 'Deselect' : 'Select';
     // One photo and one label, because there is no second state to toggle
     // between: this destroys the photo on the spot, which is what a button in a
     // preview of a single photo has always meant everywhere else.
@@ -3761,6 +4006,238 @@
       : `${position} loaded · ${fmt.count(state.total)} matching`;
     $('lightboxPrev').disabled = lightbox.index === 0;
     $('lightboxNext').disabled = !lightbox.live && lightbox.index >= lightbox.queue.length - 1;
+  }
+
+  /* ------------------------------------------------------------- lightbox zoom */
+
+  /**
+   * How far in the photograph can be magnified, and the state of that magnification.
+   *
+   * Zoom is a transform on the still and on nothing else — the panel, the overlay
+   * and the keyboard model do not move with it, because the point of zooming is to
+   * look at the photograph and not at a magnified interface. `scale` is bounded
+   * below at 1, which is *fit*: the whole frame inside the stage's pinned box (§8).
+   *
+   * `dragged` is the one piece of this the click handler needs: the stage's click
+   * pages to the next photograph, and a drag of a zoomed photo that ended in a
+   * click must not be read as "show me the next one".
+   */
+  const ZOOM_MAX = 8;
+  /** The keys that magnify the photograph: `+` and `=` (the same physical key), `-`, and `0` for fit. */
+  const ZOOM_KEYS = new Set(['+', '=', '-', '_', '0']);
+  /** The settle: how long a key step or a return to fit takes. Gestures do not use it. */
+  const ZOOM_SETTLE_MS = 160;
+  /** How long after the last wheel event a gesture is considered over. */
+  const ZOOM_GESTURE_MS = 140;
+  const lightboxZoom = { rowId: null, scale: 1, x: 0, y: 0, pan: null, dragged: false, timer: 0 };
+
+  /** The stage's untransformed box, or null where there is no layout to measure. */
+  function zoomBox() {
+    const stage = $('lightboxStage');
+    const rect = stage ? stage.getBoundingClientRect() : null;
+    return rect && rect.width && rect.height
+      ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+      : null;
+  }
+
+  /**
+   * The shape of what is on the stage.
+   *
+   * The row's own dimensions first: they are what the cache read, and they are
+   * there before a single byte of any rendition has arrived — which is the state a
+   * zoom can be asked for in, since the local rendition is up within a frame.
+   */
+  function zoomAspect() {
+    const row = currentLightboxRow();
+    const image = $('lightboxImage');
+    const width = (row && row.width) || image.naturalWidth;
+    const height = (row && row.height) || image.naturalHeight;
+    return width && height ? width / height : 0;
+  }
+
+  /** The rect the still's pixels occupy inside the element: `object-fit: contain`. */
+  function zoomFitted(box, aspect) {
+    if (!aspect) return { width: box.width, height: box.height };
+    const width = Math.min(box.width, box.height * aspect);
+    return { width, height: width / aspect };
+  }
+
+  /**
+   * Where the photograph may be, clamped so that panning can never lose it.
+   *
+   * The clamp is on the *photograph*, not on the element that holds it. The still is
+   * `object-fit: contain` in a stage-sized box, so the pixels being magnified are
+   * the fitted rect in the middle of it, and that is the rect that must not slide
+   * off the stage: an axis where the magnified photograph is wider than the stage
+   * keeps it covering the stage edge to edge, and an axis where it is still
+   * narrower centres it — which is what makes a portrait photo stay centred
+   * horizontally however far it is zoomed.
+   */
+  function zoomClamp(box, aspect, scale, x, y) {
+    const fitted = zoomFitted(box, aspect);
+    const halfWidth = fitted.width * scale / 2;
+    const halfHeight = fitted.height * scale / 2;
+    const centreX = box.width * scale / 2 + x;
+    const centreY = box.height * scale / 2 + y;
+    const heldX = halfWidth * 2 >= box.width
+      ? Math.min(Math.max(centreX, box.width - halfWidth), halfWidth)
+      : box.width / 2;
+    const heldY = halfHeight * 2 >= box.height
+      ? Math.min(Math.max(centreY, box.height - halfHeight), halfHeight)
+      : box.height / 2;
+    return { scale, x: heldX - box.width * scale / 2, y: heldY - box.height * scale / 2 };
+  }
+
+  /** Puts the current zoom on the element, clamped, and flags the stage for the cursor. */
+  function zoomApply() {
+    const box = zoomBox();
+    const image = $('lightboxImage');
+    if (!box) return;
+    const placed = zoomClamp(box, zoomAspect(), lightboxZoom.scale, lightboxZoom.x, lightboxZoom.y);
+    lightboxZoom.scale = placed.scale;
+    lightboxZoom.x = placed.x;
+    lightboxZoom.y = placed.y;
+    image.style.transform = `translate(${placed.x}px, ${placed.y}px) scale(${placed.scale})`;
+    $('lightboxStage').classList.toggle('is-zoomed', placed.scale > 1);
+  }
+
+  /**
+   * Animates the transform, or does not.
+   *
+   * A gesture must not: a transition on every wheel tick trails the fingers by its
+   * own duration and turns a pinch into a smear. A step the *reader* took — a key,
+   * a return to fit — must: it is one change with no gesture behind it, and
+   * arriving instantly reads as a jump cut.
+   */
+  function zoomTransition(ms) {
+    const image = $('lightboxImage');
+    image.style.transition = ms && !prefersReducedMotion() ? `transform ${ms}ms ease-out` : 'none';
+  }
+
+  /**
+   * Scales to `scale` about a point on the screen, keeping that point still.
+   *
+   * The anchor is the whole of what makes a pinch feel attached to the fingers: the
+   * point of the photograph under the pointer is the point that stays under it, at
+   * every step, which is also what lets a reader reach a corner of a photo without
+   * a pan — zoom *at* it. `point` is in client coordinates, and the centre of the
+   * stage is used when there is none (the keyboard's steps).
+   */
+  function zoomTo(scale, point) {
+    const box = zoomBox();
+    const next = Math.min(Math.max(scale, 1), ZOOM_MAX);
+    const previous = lightboxZoom.scale;
+    if (!box) { lightboxZoom.scale = next; return; }
+    const anchor = point || { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    // Where the anchor sits in the element's own untouched coordinates: the point
+    // that has to still be under `anchor` once the scale has changed.
+    const localX = (anchor.x - box.left - lightboxZoom.x) / previous;
+    const localY = (anchor.y - box.top - lightboxZoom.y) / previous;
+    lightboxZoom.scale = next;
+    lightboxZoom.x += localX * (previous - next);
+    lightboxZoom.y += localY * (previous - next);
+    zoomApply();
+  }
+
+  /**
+   * Back to fit.
+   *
+   * Animated when the reader asked for it, instant when the photograph is on its
+   * way out: a shrinking animation would play underneath the travelling copy going
+   * the other way, which is two motions of one photograph at once.
+   */
+  function zoomReset(animated = false) {
+    lightboxZoom.scale = 1;
+    lightboxZoom.x = 0;
+    lightboxZoom.y = 0;
+    lightboxZoom.pan = null;
+    lightboxZoom.dragged = false;
+    zoomTransition(animated && !prefersReducedMotion() ? ZOOM_SETTLE_MS : 0);
+    $('lightboxImage').style.transform = 'translate(0px, 0px) scale(1)';
+    $('lightboxStage').classList.toggle('is-zoomed', false);
+  }
+
+  /** True while the stage is showing a photograph — the only thing that zooms. */
+  function zoomHasPhotograph() {
+    const row = currentLightboxRow();
+    return Boolean(row) && !isVideoRow(row);
+  }
+
+  /**
+   * The wheel gesture: a trackpad pinch or a mouse wheel over the stage.
+   *
+   * `preventDefault` is not politeness here. A pinch arrives as a wheel with
+   * `ctrlKey` set, and a page that does not claim it gets the *browser's* page zoom
+   * instead — the whole interface magnified, which is the one outcome "zoom only
+   * the photo" is asking against. The two deltas are scaled differently because
+   * they are different instruments: a pinch reports a stream of small precise
+   * deltas, a wheel reports coarse notches, and one factor for both makes one of
+   * them unusable.
+   */
+  function zoomWheel(event) {
+    if (!zoomHasPhotograph()) return;
+    event.preventDefault();
+    const factor = event.ctrlKey ? Math.exp(-event.deltaY / 100) : Math.exp(-event.deltaY / 400);
+    zoomTransition(0);
+    zoomTo(lightboxZoom.scale * factor, { x: event.clientX, y: event.clientY });
+    // The settle, not the gesture: once the fingers are off, a key step or a return
+    // to fit is one motion again and may animate.
+    clearTimeout(lightboxZoom.timer);
+    lightboxZoom.timer = setTimeout(() => zoomTransition(ZOOM_SETTLE_MS), ZOOM_GESTURE_MS);
+  }
+
+  /** `+`/`-` about the centre, `0` back to fit. */
+  function zoomKey(key) {
+    if (!zoomHasPhotograph()) return;
+    if (key === '0') { zoomReset(true); return; }
+    const step = key === '+' || key === '=' ? 1.4 : 1 / 1.4;
+    zoomTransition(ZOOM_SETTLE_MS);
+    zoomTo(lightboxZoom.scale * step, null);
+  }
+
+  /**
+   * Dragging a magnified photograph, which is the only way to reach what the clamp
+   * has pushed out of the frame.
+   *
+   * Only while magnified, only with the primary button, and only when the gesture
+   * starts on the photograph: at fit there is nothing to pan to, the right button
+   * belongs to the context menu, and a press on the stage's own chrome is not a
+   * press on the photo.
+   */
+  function zoomPanStart(event) {
+    if (!zoomHasPhotograph() || lightboxZoom.scale <= 1) return;
+    if (event.button !== 0 || event.target !== $('lightboxImage')) return;
+    lightboxZoom.pan = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: 0 };
+    lightboxZoom.dragged = false;
+    zoomTransition(0);
+    // Claimed so the drag survives the pointer leaving the stage, and so the
+    // photograph does not start the browser's own image drag instead.
+    if (event.target.setPointerCapture) event.target.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function zoomPanMove(event) {
+    const pan = lightboxZoom.pan;
+    if (!pan || pan.id !== event.pointerId) return;
+    pan.moved += Math.abs(event.clientX - pan.x) + Math.abs(event.clientY - pan.y);
+    lightboxZoom.x += event.clientX - pan.x;
+    lightboxZoom.y += event.clientY - pan.y;
+    pan.x = event.clientX;
+    pan.y = event.clientY;
+    zoomApply();
+    event.preventDefault();
+  }
+
+  function zoomPanEnd(event) {
+    const pan = lightboxZoom.pan;
+    if (!pan || pan.id !== event.pointerId) return;
+    // A hand that moved is a hand that panned, and the click that follows it is the
+    // end of the drag rather than a request for the next photograph.
+    lightboxZoom.dragged = pan.moved > 3;
+    lightboxZoom.pan = null;
+    if (event.target.releasePointerCapture && event.target.hasPointerCapture?.(event.pointerId)) {
+      event.target.releasePointerCapture(event.pointerId);
+    }
   }
 
   /* ------------------------------------------------------------------ status */
@@ -4254,6 +4731,11 @@
     $('lightboxPrev').addEventListener('click', () => navigateLightbox(-1));
     $('lightboxNext').addEventListener('click', () => navigateLightbox(1));
     $('lightboxStage').addEventListener('click', (event) => {
+      // The end of a drag, not a click on the photograph: a reader who panned a
+      // magnified photo would otherwise be paged to the next one by letting go.
+      const dragged = lightboxZoom.dragged;
+      lightboxZoom.dragged = false;
+      if (dragged) return;
       // The still, and only the still. Clicking a clip's picture is a click on a
       // transport — the reader is aiming at the play button, the scrub bar or the
       // volume, and paging the overlay out from under that would be the exact
@@ -4261,23 +4743,23 @@
       // describe, arrived at from the other end.
       if (event.target === $('lightboxImage')) navigateLightbox(1);
     });
-    $('lightboxSelect').addEventListener('click', () => {
+    // Zoom lives on the stage rather than on the photograph, because the still is
+    // `object-fit: contain` inside a stage-sized box (see the stylesheet): a gesture
+    // that lands on the letterbox beside a panorama is still a gesture on the
+    // photograph, and the events that bubble from either element arrive here.
+    $('lightboxStage').addEventListener('wheel', zoomWheel, { passive: false });
+    $('lightboxStage').addEventListener('pointerdown', zoomPanStart);
+    $('lightboxStage').addEventListener('pointermove', zoomPanMove);
+    $('lightboxStage').addEventListener('pointerup', zoomPanEnd);
+    $('lightboxStage').addEventListener('pointercancel', zoomPanEnd);
+    $('lightboxOpenInPhotos').addEventListener('click', () => {
       const row = currentLightboxRow();
       if (!row) return;
-      toggleSelection(row.id);
-      renderLightbox();
-    });
-    $('lightboxAllPhotos').addEventListener('click', () => {
-      const row = currentLightboxRow();
-      if (row) openAllPhotos(row.id);
-    });
-    // The chip and the right-click item are the same action, wired to the same
-    // function: the chip is here because a right-click is not reachable from a
-    // trackpad or a keyboard, and a second implementation would be free to drift
-    // from the first.
-    $('lightboxSimilarPhotos').addEventListener('click', () => {
-      const row = currentLightboxRow();
-      if (row) showSimilarPhotos(row.id);
+      // The same function the menu's "Open in Photos" calls, including the toast
+      // that goes out before the hand-off: the answer is Photos' own, and it
+      // arrives after the app has already come to the front.
+      toast('Asking Photos to open that photo…', 'info');
+      revealInPhotos(row);
     });
     // Right-click on the inspected photo. Suppressing the browser's own menu is
     // scoped to the two elements the photo is actually drawn in — the chrome
@@ -4438,7 +4920,8 @@
         return;
       }
 
-      if (event.key !== 'Escape' && event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== ' ') return;
+      if (event.key !== 'Escape' && event.key !== 'ArrowLeft' && event.key !== 'ArrowRight'
+          && event.key !== ' ' && !ZOOM_KEYS.has(event.key)) return;
       const target = event.target;
       if (target instanceof HTMLElement && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) return;
       // A clip's own transport keeps the keys it owns, or paging with → would seek
@@ -4459,6 +4942,14 @@
       }
       if (onClipControls) return;
       if (!state.lightbox.open) return;
+      if (ZOOM_KEYS.has(event.key)) {
+        // Bare keys only: ⌘+ and ⌘- are the *browser's* page zoom, and claiming
+        // them here would take a control away from the reader rather than add one.
+        if (event.metaKey || event.ctrlKey) return;
+        event.preventDefault();
+        zoomKey(event.key);
+        return;
+      }
       if (event.key === 'ArrowLeft') { event.preventDefault(); navigateLightbox(-1); }
       else if (event.key === 'ArrowRight') { event.preventDefault(); navigateLightbox(1); }
       else if (event.key === ' ') {

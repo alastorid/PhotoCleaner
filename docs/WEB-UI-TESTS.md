@@ -96,7 +96,7 @@ already patched by the next test.
 rightly refuses to animate a thumbnail that has no pixels. `layout.loaded(image)`
 overrides those three properties on one element. `HTMLImageElement.prototype.decode`
 does not exist at all, which is why the client has a `load`/`error` fallback path — and
-why `previewArrives(app)` dispatches a `load` event when a test needs the preview
+why `renditionArrives(app)` dispatches a `load` event when a test needs a photo's
 bitmap to have arrived.
 
 **No CSS transitions.** Nothing moves, and `transitionend`/`animationend` never fire.
@@ -123,10 +123,12 @@ triggers a report at all.
 ## Things the harness deliberately does not stub
 
 `fetch` is redirected at the live server rather than faked, so the client's own paging
-and index arithmetic run on the real path. Only `/api/delete` is intercepted, by
-`interceptDeletes`, and only because these tests point at a library somebody actually
-owns — a suite that empties it to check a wire format is not worth the photos it
-destroys.
+and index arithmetic run on the real path. Two routes are intercepted — `/api/delete`
+by `interceptDeletes` and `/api/photos/reveal` by `interceptReveals` — and only
+because they act *outside* this process: one destroys photos in somebody's real
+library and the other puts the Photos window in front of whoever is at the machine. A
+suite that emptied a library, or stole focus on a desktop, to check a wire format is
+not worth what it would cost.
 
 ## Prove it can fail
 

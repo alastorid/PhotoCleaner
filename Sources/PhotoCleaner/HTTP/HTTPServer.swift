@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import Network
 import os
@@ -499,6 +500,19 @@ private final class HTTPConnection: @unchecked Sendable {
                 return
             }
             beginStream(stream)
+        case .videoStream(let videoStream):
+            // `busy` stays true for the whole stream. Nothing else on this connection
+            // may run while a response is half-written.
+            cancelTimers()
+            // A `HEAD` on a video stream answers with headers only.
+            if headOnly {
+                var headers = videoStream.headers
+                headers["Content-Length"] = "0"
+                send(HTTPResponse(status: videoStream.status, headers: headers),
+                     keepAlive: false, headOnly: true)
+                return
+            }
+            beginVideoStream(videoStream, keepAlive: keepAlive)
         }
     }
 
@@ -848,6 +862,78 @@ private final class HTTPConnection: @unchecked Sendable {
         connection.send(content: Data("0\r\n\r\n".utf8), completion: .contentProcessed { [weak self] _ in
             guard let self else { return }
             self.queue.async { self.close(reason: "stream finished") }
+        })
+    }
+
+    // MARK: - Video Streaming (fMP4)
+
+    private func beginVideoStream(_ videoStream: HTTPVideoStream, keepAlive: Bool) {
+        var header = "HTTP/1.1 \(videoStream.status) \(HTTPStatus.text(videoStream.status))\r\n"
+        var headers = videoStream.headers
+        headers["Content-Type"] = "video/mp4"
+        headers["Accept-Ranges"] = "bytes"
+        headers["Transfer-Encoding"] = "chunked"
+        headers["Connection"] = keepAlive ? "keep-alive" : "close"
+        headers["Cache-Control"] = "no-cache, no-transform"
+        headers["X-Content-Type-Options"] = "nosniff"
+        for (name, value) in headers.sorted(by: { $0.key < $1.key }) {
+            header += "\(name): \(value)\r\n"
+        }
+        header += "\r\n"
+
+        streaming = true  // Reuse streaming flag for "body in progress"
+
+        connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            self.queue.async {
+                guard error == nil, !self.closed, !self.finishing else {
+                    self.close(reason: "video stream header send failed: \(error.map { "\($0)" } ?? "closed")")
+                    return
+                }
+                self.streamTask = Task { [weak self] in
+                    await self?.runVideoStream(videoStream)
+                    guard let self else { return }
+                    self.queue.async { self.finishVideoStream() }
+                }
+            }
+        })
+    }
+
+    private func runVideoStream(_ videoStream: HTTPVideoStream) async {
+        let streamer = VideoStreamer()
+
+        do {
+            _ = try await streamer.stream(
+                identifier: videoStream.identifier,
+                allowNetwork: videoStream.allowNetwork,
+                startTime: videoStream.rangeStart.map { CMTime(value: $0, timescale: 1) }  // Approximate; we'll refine below
+            ) { [weak self] fragment in
+                guard let self else { return false }
+                return self.writeVideoChunk(fragment)
+            }
+        } catch {
+            os_log(.error, "Video streaming failed: %{public}@", "\(error)")
+            // Stream will be closed by the connection
+        }
+    }
+
+    private func writeVideoChunk(_ payload: Data) -> Bool {
+        // Similar to SSE writeChunk but for raw fMP4 fragments (no chunked encoding wrapper needed
+        // since we're already using chunked transfer encoding at HTTP level)
+        guard !closed, streaming, !streamEnded else { return false }
+        connection.send(content: payload, completion: .contentProcessed { [weak self] error in
+            guard let self, let error else { return }
+            self.queue.async { self.close(reason: "video stream send failed: \(error)") }
+        })
+        return true
+    }
+
+    private func finishVideoStream() {
+        guard !closed, streaming, !streamEnded else { return }
+        streamEnded = true
+        connection.send(content: Data("0\r\n\r\n".utf8), completion: .contentProcessed { [weak self] _ in
+            guard let self else { return }
+            self.queue.async { self.close(reason: "video stream finished") }
         })
     }
 

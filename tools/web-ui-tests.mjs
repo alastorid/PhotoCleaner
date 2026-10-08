@@ -87,6 +87,36 @@ function interceptDeletes(app) {
   return sent;
 }
 
+/**
+ * Withholds the hand-off to Photos.app and records what was asked for.
+ *
+ * The same rule as `interceptDeletes`, for the same reason: "Open in Photos"
+ * leaves this process and puts the Photos window in front of whoever is at the
+ * machine, and a regression suite is not allowed to steal focus on somebody's
+ * desktop to check a wire format. Only that one route is answered here — the
+ * client's real path, its toast and its own id all run.
+ */
+function interceptReveals(app) {
+  const sent = [];
+  const real = app.window.fetch;
+  app.window.fetch = async (input, init) => {
+    const path = new URL(typeof input === 'string' ? input : input.url, app.window.location.href).pathname;
+    if (!path.endsWith('/api/photos/reveal')) return real(input, init);
+    const body = JSON.parse(init.body || '{}');
+    sent.push(body);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return { ok: true, mechanism: 'asset_link', requested: 1, opened: 1, id: body.id,
+                 message: 'Photos was asked to open that photo.' };
+      },
+      async text() { return ''; },
+    };
+  };
+  return sent;
+}
+
 /** The fingerprint the server itself resolves a set to, asked over the wire. */
 async function serverFingerprint(spec) {
   const response = await fetch(`${base}/api/selection/preview`, {
@@ -467,16 +497,27 @@ function layoutWith(app, tiles) {
 }
 
 /**
- * Announces that the 2048px preview bitmap has arrived, which is what the client
- * waits for before handing the screen over from the travelling thumbnail.
+ * Announces that a rendition of the photograph is on the stage.
  *
- * Dispatched rather than stubbed: jsdom has no `HTMLImageElement.decode` at all, so
- * the client is on its `load`/`error` fallback path, and `load` is the event that path
- * is waiting for. The preview image is never given pixels or a box — it is genuinely
- * "not arrived yet" until this is called, which is the state a real fetch is in.
+ * In a real browser this is the first of the still's candidates arriving — the
+ * local thumbnail the grid was already drawing, or the 2048px original behind it,
+ * depending on which one the client has asked for by now. Either way it is the
+ * event the open travel waits for before handing the screen over from the
+ * travelling copy, which is what the animation checks below need.
+ *
+ * Dispatched rather than stubbed: jsdom has no `HTMLImageElement.decode` at all and
+ * never fetches an image, so `load`/`error` on the element is the only channel the
+ * client has to hear about either one, and nothing fires on its own. The preview
+ * image is never given pixels or a box — it is genuinely "not arrived yet" until
+ * this is called, which is the state a real fetch is in.
  */
-function previewArrives(app) {
+function renditionArrives(app) {
   app.$('lightboxImage').dispatchEvent(new app.window.Event('load'));
+}
+
+/** Announces that a rendition the client asked for could not be produced. */
+function renditionFails(app) {
+  app.$('lightboxImage').dispatchEvent(new app.window.Event('error'));
 }
 
 await check('the photograph flies out of its tile into the preview', async (app) => {
@@ -501,7 +542,7 @@ await check('the photograph flies out of its tile into the preview', async (app)
     // The preview is still in flight: no bitmap yet, so the travelling copy must hold.
     await app.settle(400);
     assert(flight.node.isConnected, 'the travelling thumbnail was handed over before the preview arrived');
-    previewArrives(app);
+    renditionArrives(app);
     // Long enough for the hand-over's own cross-fade and its removal, which is a
     // separate, shorter motion after the travel itself has landed.
     await app.settle(300);
@@ -520,7 +561,7 @@ await check('Space back out plays the travel in reverse', async (app) => {
   try {
     tile.dispatchEvent(new app.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
     await app.settle(60);
-    previewArrives(app);
+    renditionArrives(app);
     await app.settle(200);
     app.key(' ');
     await app.settle(60);
@@ -574,6 +615,363 @@ await check('opening a second preview leaves no photograph behind', async (app) 
     await app.settle(500);
     assertEqual(ghost(app), null, 'a photograph was left on screen after the interruption');
     assertEqual(app.$('lightbox').hidden, true, 'the interrupted preview never closed');
+  } finally {
+    layout.restore();
+  }
+});
+
+console.log('the preview: what the stage shows when the original is not here yet');
+
+/**
+ * The photographs on the first page, in grid order.
+ *
+ * Read off the default grid rather than by pressing the media chip: the media
+ * filter is a route of its own with checks of its own, and a preview check that
+ * cannot run when that route stalls would be testing two things at once. A tile
+ * says what it is — a clip's is the only one carrying a play glyph — so a
+ * photograph is a tile without one.
+ */
+function stillTiles(app) {
+  return [...app.window.document.querySelectorAll('#grid .tile')]
+    .filter((tile) => !tile.querySelector('.tile-play'));
+}
+
+/**
+ * Two photographs that are next to each other in the grid, for a paging check.
+ *
+ * Adjacent in the DOM is adjacent in the queue — the first page is rendered from
+ * offset zero in order — so the tile after this pair's first is the one a right
+ * arrow lands on.
+ */
+function adjacentStills(app) {
+  const tiles = [...app.window.document.querySelectorAll('#grid .tile')];
+  for (let i = 0; i + 1 < tiles.length; i += 1) {
+    if (!tiles[i].querySelector('.tile-play') && !tiles[i + 1].querySelector('.tile-play')) {
+      return [tiles[i], tiles[i + 1]];
+    }
+  }
+  return null;
+}
+
+await check('a preview that has not arrived shows a local rendition, not an empty stage', async (app) => {
+  // The defect this pins. The stage used to be blank until the 2048px preview came
+  // down from iCloud — and stayed blank for good when it never did, which is what an
+  // optimised library with downloads on looks like while the original is fetched.
+  // Every tile already holds a decoded local rendition, so the first thing in the
+  // stage has to be that.
+  const [tile] = stillTiles(app);
+  assert(tile, 'the first page has no photograph on it');
+  await openLightboxOn(app, tile);
+  const id = tile.dataset.id;
+  const encoded = app.window.encodeURIComponent(id);
+  const image = app.$('lightboxImage');
+  const src = image.getAttribute('src');
+
+  // The first thing asked for is a local rendition of *this* photograph, not the
+  // 2048px original that may have to come down from iCloud first.
+  assert(/^\/api\/photo\/.+\/thumbnail\?size=\d+$/.test(src),
+    `the stage is not showing a local rendition of the photo: ${src}`);
+  assert(src.includes(encoded), `the local rendition belongs to another photo: ${src}`);
+  assertEqual(app.$('lightboxFallback').hidden, true, 'the fallback sentence is up over a photo we can draw');
+
+  // It is on the stage as soon as it decodes, and the original is asked for behind
+  // it — a local rendition is a step, not the destination.
+  renditionArrives(app);
+  assertEqual(image.hidden, false, 'the stage was left empty while the preview was pending');
+  assertEqual(image.getAttribute('src'), `/api/photo/${encoded}/preview?size=2048`,
+    'the original was never asked for behind the local rendition');
+});
+
+await check('a preview that fails leaves a rendition on the stage, not a blank one', async (app) => {
+  // The other half: the 2048px request is refused. What was on the stage a moment
+  // ago is the honest answer, and it must not be replaced by nothing.
+  const [tile] = stillTiles(app);
+  assert(tile, 'the first page has no photograph on it');
+  await openLightboxOn(app, tile);
+  const image = app.$('lightboxImage');
+  const local = image.getAttribute('src');
+
+  renditionArrives(app);   // the local rendition, which raises the original
+  renditionFails(app);     // …and the original cannot be produced
+
+  assertEqual(image.getAttribute('src'), local, 'the stage did not fall back to the rendition it had');
+  assertEqual(app.$('lightboxFallback').hidden, true,
+    'the fallback sentence is up while a rendition is on the stage');
+  // And it really is the thing on the stage, not a request that went nowhere.
+  renditionArrives(app);
+  assertEqual(image.hidden, false, 'the photograph vanished when the original could not be produced');
+});
+
+await check('the fallback sentence is only reached when nothing can be drawn at all', async (app) => {
+  const [tile] = stillTiles(app);
+  assert(tile, 'the first page has no photograph on it');
+  await openLightboxOn(app, tile);
+  const image = app.$('lightboxImage');
+  const fallback = app.$('lightboxFallback');
+
+  // The local ladder, then the original: nothing on this Mac can draw the
+  // photograph and Photos cannot produce it either.
+  for (let attempt = 0; attempt < 3; attempt += 1) renditionFails(app);
+
+  assertEqual(image.hidden, true, 'the <img> is still on the stage with nothing in it');
+  assertEqual(fallback.hidden, false, 'nothing was said about a photograph that cannot be drawn');
+  assert(/Preview unavailable/.test(fallback.textContent),
+    `the fallback does not read as a fallback: ${fallback.textContent}`);
+});
+
+await check('paging shows the next photograph’s own rendition rather than a blank stage', async (app) => {
+  // The reader's second symptom: with the original unavailable, every arrow key
+  // repainted the same empty rectangle, so the arrows looked dead. Paging has to put
+  // the *next* photo's local rendition up, and it must be a local one — the point is
+  // that it arrives without waiting for iCloud.
+  const pair = adjacentStills(app);
+  assert(pair, 'the first page has no two adjacent photographs on it');
+  const [first, second] = pair;
+  await openLightboxOn(app, first);
+  const image = app.$('lightboxImage');
+
+  app.key('ArrowRight');
+  await app.settle(60);
+
+  // The pair is found anywhere on the page, so the position it moves *to* is the
+  // tile's own grid index plus two, not a literal.
+  const arrived = Number(first.dataset.index) + 2;
+  assert(app.$('lightboxPosition').textContent.startsWith(`${arrived} of`),
+    `the lightbox did not move: ${app.$('lightboxPosition').textContent}`);
+  assertEqual(image.hidden, false, 'paging left the stage empty');
+  assertEqual(app.$('lightboxFallback').hidden, true, 'paging put the fallback sentence up instead of a photo');
+  const src = image.getAttribute('src');
+  assert(/^\/api\/photo\/.+\/thumbnail\?size=\d+$/.test(src), `paging did not show a local rendition: ${src}`);
+  assert(src.includes(app.window.encodeURIComponent(second.dataset.id)),
+    `the stage is not showing the photo that was paged to: ${src}`);
+});
+
+console.log('the preview: the panel, and zoom');
+
+await check('the preview panel offers the hand-off to Photos, and not the chips that moved', async (app) => {
+  // The three chips this replaced each had another way in — "Show in All Photos" is
+  // the tile's hover tool and a menu item, "Show Similar Photos" is the menu item,
+  // and selecting is a click on the tile — while the one action that leaves the app
+  // had no control on this surface at all. Asserted on the ids first, because a chip
+  // that survives under a new id is the regression this is here to catch.
+  assertEqual(app.$('lightboxAllPhotos'), null, 'the "Show in All Photos" chip is still in index.html');
+  assertEqual(app.$('lightboxSimilarPhotos'), null, 'the "Show Similar Photos" chip is still in index.html');
+  assertEqual(app.$('lightboxSelect'), null, 'the Select chip is still in index.html');
+  assert(app.$('lightboxOpenInPhotos'), 'the panel has no Photos hand-off');
+
+  const sent = interceptReveals(app);
+  const [tile] = stillTiles(app);
+  assert(tile, 'the first page has no photograph on it');
+  await openLightboxOn(app, tile);
+  app.click('lightboxOpenInPhotos');
+  await app.settle(120);
+
+  assertEqual(sent.length, 1, `the hand-off asked Photos for ${sent.length} photos`);
+  assertEqual(sent[0].id, tile.dataset.id, 'the hand-off did not name the photograph on the stage');
+});
+
+/** The still's own transform, as the three numbers `zoomTo` writes. */
+function zoomOf(app) {
+  const raw = app.$('lightboxImage').style.transform || '';
+  const scale = Number((raw.match(/scale\(([\d.]+)\)/) || [])[1] || 1);
+  const translate = (raw.match(/translate\((-?[\d.]+)px, (-?[\d.]+)px\)/) || []).slice(1).map(Number);
+  return { scale, x: translate[0] || 0, y: translate[1] || 0 };
+}
+
+/**
+ * Where the photograph's own centre is on screen.
+ *
+ * The still is `object-fit: contain` inside the stage-sized element, so its pixels
+ * are centred in that box whatever their shape and whatever the magnification.
+ */
+function zoomCentre(app, box) {
+  const zoom = zoomOf(app);
+  return { x: box.x + zoom.x + zoom.scale * box.width / 2,
+           y: box.y + zoom.y + zoom.scale * box.height / 2 };
+}
+
+/** Where a point of the stage's own box ends up once the still is transformed. */
+function zoomLands(app, box, point) {
+  const zoom = zoomOf(app);
+  return { x: box.x + zoom.x + zoom.scale * point.x, y: box.y + zoom.y + zoom.scale * point.y };
+}
+
+/**
+ * The first landscape photograph on the page, with the row the server reports for it.
+ *
+ * A zoom anchor has to be a point *on* the photograph, and the checks below give
+ * the stage a square box: for any landscape shape the band across the stage's
+ * middle is on the pixels (a landscape still is fitted to the stage's full width and
+ * is centred vertically), while for a portrait one the middle band is partly the
+ * empty letterbox beside it. Skipped rather than faked when this page holds none —
+ * asserting a zoom about a point over nothing would be asserting about the fixture.
+ */
+async function landscapeStill(app) {
+  for (const tile of stillTiles(app).slice(0, 8)) {
+    const response = await fetch(`${base}/api/photo/${encodeURIComponent(tile.dataset.id)}`);
+    const row = (await response.json()).photo || {};
+    if (row.width > row.height) return { tile, row };
+  }
+  return null;
+}
+
+/** A pinch (a wheel with `ctrlKey`) at a point of the stage. */
+function pinch(app, point, deltaY = -240) {
+  app.$('lightboxStage').dispatchEvent(new app.window.WheelEvent('wheel', {
+    deltaY, ctrlKey: true, clientX: point.x, clientY: point.y, bubbles: true, cancelable: true,
+  }));
+}
+
+await check('a pinch magnifies the photograph about the point under the fingers', async (app) => {
+  const subject = await landscapeStill(app);
+  if (!subject) return; // this page happens to hold no landscape photograph
+  const layout = layoutWith(app, []);
+  try {
+    await openLightboxOn(app, subject.tile);
+    // A point of the stage that is on the photograph and off its centre: the centre
+    // would hold still under any scale, so it is the only anchor that tests the
+    // arithmetic — and it is also the only one where the clamp (which stops the
+    // photograph sliding off the stage) never has to intervene.
+    const local = { x: STAGE_BOX.width * 0.7, y: STAGE_BOX.height * 0.5 };
+    const at = { x: STAGE_BOX.x + local.x, y: STAGE_BOX.y + local.y };
+
+    pinch(app, at);
+    const zoomed = zoomOf(app);
+    assert(zoomed.scale > 1, `a pinch did not magnify the photograph (scale ${zoomed.scale})`);
+
+    // The point under the fingers is the point that stays under them.
+    const landed = zoomLands(app, STAGE_BOX, local);
+    assert(Math.abs(landed.x - at.x) < 1.5 && Math.abs(landed.y - at.y) < 1.5,
+      `the photograph slid out from under the gesture (${JSON.stringify(landed)} vs ${JSON.stringify(at)})`);
+
+    // And only the photograph moved with it: the overlay, the stage the reader is
+    // pointing at, and the panel are all where they were.
+    assertEqual(app.$('lightbox').style.transform, '', 'the overlay was magnified too');
+    assertEqual(app.$('lightboxStage').style.transform, '', 'the stage was magnified too');
+    assertEqual(app.window.document.querySelector('.lightbox-meta').style.transform, '',
+      'the panel was magnified too');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('the keys zoom about the centre, and 0 returns to fit', async (app) => {
+  const [tile] = stillTiles(app);
+  assert(tile, 'the first page has no photograph on it');
+  const layout = layoutWith(app, []);
+  try {
+    await openLightboxOn(app, tile);
+    const before = zoomCentre(app, STAGE_BOX);
+    app.key('=');
+    await app.settle(30);
+    assert(zoomOf(app).scale > 1, 'the zoom-in key did nothing');
+
+    // About the *centre*: the photograph's own centre must not drift. (The
+    // element's translation is not the thing to assert — a centre-anchored zoom
+    // writes one — which is why this reads the geometry the reader sees.)
+    const after = zoomCentre(app, STAGE_BOX);
+    assert(Math.abs(after.x - before.x) < 1.5 && Math.abs(after.y - before.y) < 1.5,
+      `the centred step moved the photograph (${JSON.stringify(before)} → ${JSON.stringify(after)})`);
+
+    app.key('0');
+    await app.settle(30);
+    assertEqual(zoomOf(app).scale, 1, '0 did not return the photograph to fit');
+    assertEqual(app.$('lightboxStage').classList.contains('is-zoomed'), false,
+      'the stage still offers a pan cursor at fit');
+
+    // ⌘= is the browser's page zoom and this client must not take it.
+    app.key('=', { metaKey: true });
+    await app.settle(30);
+    assertEqual(zoomOf(app).scale, 1, 'the client claimed the browser page-zoom shortcut');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('a drag pans a magnified photograph instead of paging to the next one', async (app) => {
+  const subject = await landscapeStill(app);
+  if (!subject) return; // this page happens to hold no landscape photograph
+  const layout = layoutWith(app, []);
+  try {
+    await openLightboxOn(app, subject.tile);
+    const image = app.$('lightboxImage');
+    const before = app.$('lightboxPosition').textContent;
+    app.key('='); // one step, about the centre: a known pose to pan from
+    await app.settle(30);
+    const zoomed = zoomOf(app);
+    assert(zoomed.scale > 1, 'nothing to pan');
+
+    const pointer = (type, x, y) => image.dispatchEvent(new app.window.PointerEvent(type, {
+      pointerId: 1, button: 0, clientX: x, clientY: y, bubbles: true, cancelable: true,
+    }));
+    pointer('pointerdown', 900, 600);
+    pointer('pointermove', 940, 630);
+    pointer('pointerup', 940, 630);
+    // The pan is the drag's own delta, to within the arithmetic's own precision:
+    // these are float transforms, and asserting the last bit of one is asserting
+    // about the double, not about the drag.
+    const panned = zoomOf(app);
+    assert(Math.abs(panned.x - (zoomed.x + 40)) < 0.01,
+      `the drag did not pan the photograph sideways (${panned.x} vs ${zoomed.x + 40})`);
+
+    // Downwards only once the photograph is taller than the stage: below that the
+    // clamp centres it, which is what "the photograph can never be panned off the
+    // stage" means, and it is the answer to the same drag. Asserted either way
+    // rather than skipped — both are behaviour a regression could break.
+    const aspect = subject.row.width / subject.row.height;
+    const tallerThanStage = (STAGE_BOX.width / aspect) * zoomed.scale > STAGE_BOX.height + 1;
+    if (tallerThanStage) {
+      assert(Math.abs(panned.y - (zoomed.y + 30)) < 0.01,
+        `the drag did not pan the photograph down (${panned.y} vs ${zoomed.y + 30})`);
+    } else {
+      assertEqual(panned.y, zoomed.y, 'an axis with no slack was panned anyway');
+    }
+
+    // The click that ends a drag is the end of the drag, not a request for the next
+    // photograph — and it is the drag that is swallowed, not every click after it.
+    image.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await app.settle(60);
+    assertEqual(app.$('lightboxPosition').textContent, before, 'letting go of a pan paged the overlay');
+    image.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await app.settle(60);
+    assert(app.$('lightboxPosition').textContent !== before,
+      'the photograph stopped paging on a click from then on');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('paging puts the next photograph back at fit', async (app) => {
+  const pair = adjacentStills(app);
+  if (!pair) return; // this page happens to hold no two adjacent photographs
+  const layout = layoutWith(app, []);
+  try {
+    await openLightboxOn(app, pair[0]);
+    pinch(app, { x: STAGE_BOX.x + 300, y: STAGE_BOX.y + 300 });
+    assert(zoomOf(app).scale > 1, 'the pinch did not magnify anything to reset');
+    app.key('ArrowRight');
+    await app.settle(60);
+    // The next photo's rendition, not the previous photo's magnification: a
+    // magnified rect carried onto it would show a corner with nothing to explain it.
+    assertEqual(zoomOf(app).scale, 1, 'the magnification was carried onto the next photograph');
+    assertEqual(zoomOf(app).x, 0, 'the magnification was carried onto the next photograph');
+  } finally {
+    layout.restore();
+  }
+});
+
+await check('a clip is not magnified — its transport owns its own gestures', async (app) => {
+  // "Zoom only the photo" cuts both ways: a wheel over a clip's picture is next to
+  // its scrub bar and its volume, and a magnified `<video>` would drag those with it.
+  const clip = [...app.window.document.querySelectorAll('#grid .tile')]
+    .find((tile) => tile.querySelector('.tile-play'));
+  if (!clip) return; // this page happens to hold no clip
+  const layout = layoutWith(app, []);
+  try {
+    await openLightboxOn(app, clip);
+    assertEqual(app.$('lightboxVideo').hidden, false, 'the clip did not reach the stage');
+    pinch(app, { x: STAGE_BOX.x + 300, y: STAGE_BOX.y + 300 });
+    assertEqual(zoomOf(app).scale, 1, 'a clip was magnified');
   } finally {
     layout.restore();
   }
@@ -899,6 +1297,45 @@ await check('the favourite is one item, and it is never greyed out', async (app)
     'a favourite does not offer exactly one favourite item');
   assertEqual(favItems.find((i) => i.label === 'Remove from Favourites').disabled, false,
     'the favourite toggle was greyed out on a favourite');
+});
+
+await check('Show Similar Photos is greyed out for a photograph that has none', async (app) => {
+  // Which photographs have a group is a fact about the grouping pass, not about the
+  // row — nothing the grid holds names a group — so the item is corrected from
+  // `GET /api/photo/{id}/similar` once the menu is up. Ask the server the same
+  // question here and work with what it says about the photographs actually on this
+  // page, rather than inventing one to assert about.
+  const tiles = [...app.window.document.querySelectorAll('#grid .tile')].slice(0, 12);
+  const answers = await Promise.all(tiles.map(async (tile) => {
+    const response = await fetch(`${base}/api/photo/${encodeURIComponent(tile.dataset.id)}/similar`);
+    return { tile, answer: await response.json() };
+  }));
+  const lone = answers.find(({ answer }) => answer.analyzed === true && !answer.groupId);
+  const grouped = answers.find(({ answer }) => answer.groupId);
+
+  if (lone) {
+    const items = await openMenuOn(app, lone.tile);
+    // The lookup is a round trip that starts after the menu is on screen.
+    await app.settle(400);
+    const item = items.find((entry) => entry.label === 'Show Similar Photos');
+    assert(item, 'the menu no longer offers similar photos at all');
+    assertEqual(item.disabled, true, 'a photograph with no similar photos still offers the item');
+    assertEqual(item.hint, 'none found', 'the greyed-out item does not say why');
+    // Greyed out *and* inert: the label is the promise, the click is the behaviour.
+    menuItemNode(app, 'Show Similar Photos')
+      .dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await app.settle(300);
+    assertEqual(app.$('groupsView').hidden, true, 'the greyed-out item ran anyway');
+  }
+
+  if (grouped) {
+    const items = await openMenuOn(app, grouped.tile);
+    await app.settle(400);
+    const item = items.find((entry) => entry.label === 'Show Similar Photos');
+    assert(item, 'the menu no longer offers similar photos at all');
+    assertEqual(item.disabled, false, 'a photograph that has a group was greyed out');
+    assertEqual(item.hint, '', 'a photograph that has a group is carrying the "none found" hint');
+  }
 });
 
 await check('the favourite item makes the photo a favourite', async (app) => {
@@ -1410,9 +1847,11 @@ await check('a photograph in the lightbox is still an <img>', async (app) => {
 
   assertEqual(app.$('lightboxImage').hidden, false, 'a photograph is not shown by the <img>');
   assertEqual(app.$('lightboxVideo').hidden, true, 'a photograph put a <video> on the stage');
-  assertEqual(app.$('lightboxImage').getAttribute('src'),
-    `/api/photo/${app.window.encodeURIComponent(tile.dataset.id)}/preview?size=2048`,
-    'a photograph is not sourced from the preview route');
+  // A still route, and not the clip's: which *rendition* of it is on the stage at
+  // any moment is the still walk's business and is checked on its own below.
+  const src = app.$('lightboxImage').getAttribute('src');
+  assert(/^\/api\/photo\/.+\/(thumbnail\?size=\d+|preview\?size=\d+)$/.test(src),
+    `a photograph is not sourced from a still route: ${src}`);
   assertEqual(app.$('lightboxDurationRow').hidden, true,
     'a photograph is showing a length');
 });

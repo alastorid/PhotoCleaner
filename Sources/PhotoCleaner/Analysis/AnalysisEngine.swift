@@ -255,6 +255,10 @@ actor AnalysisEngine {
         analysisStartedAt = Date()
         processedCount = 0
         samples.removeAll(keepingCapacity: true)
+        // The iCloud circuit breaker is per run: a relaunch is a fresh decision
+        // about whether PhotoKit is answering. See `allowsICloudFetches`.
+        unansweredRequestsInARow = 0
+        icloudFetchesAllowed = true
         phase = .analyzing
         await publishStatus(force: true)
 
@@ -306,6 +310,12 @@ actor AnalysisEngine {
                 if batch.isEmpty { break }
             }
             let job = batch.removeFirst()
+            // Read per asset rather than per batch: the breaker behind
+            // `allowsICloudFetches` can open in the middle of a batch, and a batch
+            // is 64 assets — long enough for the rest of it to pay a deadline each.
+            let snapshot = settings.snapshot()
+            let engineAllowsICloud = await engine.allowsICloudFetches()
+            let allowNetwork = snapshot.downloadFromICloud && engineAllowsICloud
             // An asset scored by an earlier build has a good aesthetics score but no
             // FeaturePrint. It needs only the vector, and must not go through the
             // state machine — `releaseClaims`/`record` would rewrite a score that is
@@ -313,10 +323,9 @@ actor AnalysisEngine {
             if job.isBackfill {
                 let image: CGImage
                 do {
-                    let snapshot = settings.snapshot()
                     image = try await library.image(identifier: job.identifier,
                                                     maxPixelSize: snapshot.analysisPixelSize,
-                                                    allowNetwork: snapshot.downloadFromICloud)
+                                                    allowNetwork: allowNetwork)
                     let observation = try await analyzer.featurePrint(image)
                     if let payload = SignalCompression.featurePrintData(observation) {
                         try await cache.recordFeaturePrint(payload, for: job.identifier)
@@ -334,7 +343,6 @@ actor AnalysisEngine {
                 }
                 continue
             }
-            let snapshot = settings.snapshot()
             do {
                 // One frame for a still, one to three for a video. The single call
                 // is what keeps the *failure routing* below unchanged: `framesForAnalysis`
@@ -413,17 +421,63 @@ actor AnalysisEngine {
         if !backfill.isEmpty { try? await cache.releaseFeaturePrints(identifiers: backfill) }
     }
 
-    private func noteProcessed() async {
+    private func noteProcessed(unanswered: Bool = false) async {
+        // The circuit breaker, driven from the one place that counts an outcome.
+        // See `allowsICloudFetches`.
+        if unanswered {
+            unansweredRequestsInARow += 1
+            if unansweredRequestsInARow >= Self.unansweredRequestLimit, icloudFetchesAllowed {
+                icloudFetchesAllowed = false
+                Log.warn("\(unansweredRequestsInARow) requests in a row went unanswered with iCloud downloads on; "
+                         + "the rest of this run reads only what is on this Mac, and Retry re-queues the rest")
+            }
+        } else {
+            unansweredRequestsInARow = 0
+        }
         // One bad photo must never abort a scan: failures are recorded against
         // the asset itself and the queue moves on.
         processedCount += 1
         samples.append((Date(), processedCount))
-        let cutoff = Date().addingTimeInterval(-15)
-        if let firstFresh = samples.firstIndex(where: { $0.at >= cutoff }), firstFresh > 0 {
-            samples.removeFirst(firstFresh)
-        }
         await publishStatus()
     }
+
+    /// How many requests in a row, allowed to reach iCloud, may go unanswered
+    /// before this run stops asking.
+    private static let unansweredRequestLimit = 3
+
+    /// Consecutive unanswered requests. Any completed one resets it.
+    private var unansweredRequestsInARow = 0
+
+    /// Whether this run still lets an analysis request reach iCloud.
+    private var icloudFetchesAllowed = true
+
+    /// Whether this run is still willing to let an analysis request reach iCloud.
+    ///
+    /// PhotoKit can leave a network-allowed request unanswered indefinitely, and a
+    /// per-request deadline is not enough when that is the *normal* outcome for
+    /// cloud-only assets: measured against a real 54,614-asset library, most of the
+    /// assets whose bytes are in iCloud were never answered, and because the queue
+    /// is drained newest-first that answer-less region sits exactly where the pass
+    /// is. One deadline each is still hours of waiting, and waiting is not
+    /// convergence.
+    ///
+    /// So the policy is measured rather than assumed: three requests in a row that
+    /// nothing answers, and this run stops asking. What that produces for the rest
+    /// of the cloud-only assets is what `downloadFromICloud = false` produces
+    /// anyway — "not on this Mac", not a failure, not retried, and true: their
+    /// pixels really are not here.
+    ///
+    /// **Three in a row** is the part that matters. An *answered* request resets
+    /// the count, whether it was a successful download or PhotoKit's fast "stored
+    /// in iCloud only" refusal, so on a machine whose downloads work — where hangs
+    /// are the rare defect the deadline exists for — a few of them cannot switch
+    /// iCloud off for the run.
+    ///
+    /// Run-scoped on purpose, and both escapes work: a relaunch starts over with
+    /// fetches allowed, and **Retry** re-queues these rows here and now, because
+    /// `requeueFailures(includeUnavailable:)` includes `unavailable` while iCloud
+    /// downloads are on.
+    func allowsICloudFetches() -> Bool { icloudFetchesAllowed }
 
     /// Routes one failure to the right bucket.
     ///
@@ -443,7 +497,11 @@ actor AnalysisEngine {
         // the one the progress read-out reports. Leaving the call inside the
         // switch instead leaves that up to one `return` per case, and a case
         // added later would quietly not count itself.
-        await noteProcessed()
+        var unanswered = false
+        if let libraryError = error as? PhotoLibraryError, case .requestTimedOut = libraryError {
+            unanswered = true
+        }
+        await noteProcessed(unanswered: unanswered)
     }
 
     /// Records what happened to one asset: which terminal state it lands in, and
@@ -474,6 +532,16 @@ actor AnalysisEngine {
         case .imageRequestFailed(let detail):
             try? await cache.recordFailure(for: job.identifier, error: detail)
             Log.warn("image request failed for \(job.identifier): \(detail)")
+
+        case .requestTimedOut(let detail):
+            // A failure, not `unavailable`: nothing was learned about the asset,
+            // and `unavailable` is the one state that is never retried and is only
+            // re-queued when iCloud downloads are on. `retry: false` because the
+            // automatic retry would send the row back to the front of the queue
+            // and re-block the pass for another whole deadline — see
+            // `CacheStore.recordFailure`.
+            try? await cache.recordFailure(for: job.identifier, error: detail, retry: false)
+            Log.warn("PhotoKit did not answer for \(job.identifier): \(detail)")
 
         case .notAuthorized(let detail):
             lastError = "Photos access was revoked during analysis (\(detail))"
@@ -541,8 +609,31 @@ actor AnalysisEngine {
         return status
     }
 
+    /// How wide the window throughput is measured over.
+    private static let rateWindow: TimeInterval = 15
+
+    /// Assets completed per second over the recent window — or zero, when none
+    /// have been.
+    ///
+    /// Zero is a real answer here and it is the important one: a stalled pass must
+    /// not keep reporting the throughput it had *before* it stalled. Measured on a
+    /// real library of 54,614 assets, a pass that had made no progress for four
+    /// minutes was still reporting `rate` 0.54 and an `etaSeconds` of 8.7 hours,
+    /// because the window was only ever pruned when a *new* sample arrived — and
+    /// during a stall there are none, so the last window's average was reported
+    /// for as long as the stall lasted. That is worse than reporting nothing: the
+    /// client draws a countdown from it, and a user watching a plausible ETA is
+    /// told the pass is healthy while it is stopped.
+    ///
+    /// The pruning lives here rather than in `noteProcessed` because this runs on
+    /// every status build — the status route and every publish — while
+    /// `noteProcessed` only runs when something completes, which is exactly the
+    /// case that is missing.
     private func currentRate() -> Double {
-        guard phase == .analyzing, let first = samples.first, let last = samples.last else { return 0 }
+        guard phase == .analyzing else { return 0 }
+        let cutoff = Date().addingTimeInterval(-Self.rateWindow)
+        while let oldest = samples.first, oldest.at < cutoff { samples.removeFirst() }
+        guard let first = samples.first, let last = samples.last else { return 0 }
         let elapsed = last.at.timeIntervalSince(first.at)
         guard elapsed >= 1 else { return 0 }
         return Double(last.processed - first.processed) / elapsed

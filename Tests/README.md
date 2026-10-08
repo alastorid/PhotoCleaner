@@ -61,6 +61,7 @@ the runner says so and the marker should be deleted.
 | `ConfirmTokenTests.swift` | the deletion fingerprint and the 409 path |
 | `RecordTests.swift` | `PhotoRow`/`PhotoCursor`/enums, query parsing, the wire contract |
 | `EventBusTests.swift` | SSE fan-out, heartbeat vs. retained snapshot, `Settings` |
+| `DeadlineTests.swift` | `CallbackDeadline`: fires once after its interval, and never after a disarm |
 | `AuthorizationTests.swift` | the Photos gate: which routes refuse, and the routes that must not |
 | `SchemaTests.swift` | the cache schema and its migrations |
 | `PresentationTests.swift` | launch flags, the shutdown relay, the window's navigation policy |

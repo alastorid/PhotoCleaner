@@ -1091,14 +1091,23 @@ button { font: inherit; cursor: pointer; }
 .lightbox:not(.is-open) { pointer-events: none; }
 /* The real preview holds back until the travelling thumbnail has handed over, so a
    cached 2048px JPEG cannot appear underneath a copy of itself still in flight.
-   A clip gets the same treatment and for the same reason: its poster frame is the
-   same frame the travelling copy is showing, so an un-held-back `<video>` would put
-   two copies of one frame on screen at once. `previewWhenDecoded` waits for
-   `loadedmetadata` rather than a bitmap, which is bounded by `preload="metadata"`
-   and needs none of the clip's bytes. */
-.lightbox-entering #lightboxImage,
+   `renderLightboxStill` reports when a photograph has a rendition on the stage and
+   `previewClipWhenDecoded` when a clip has its metadata.
+
+   The hold has to be *instant* on both edges for a still, and neither edge is
+   cosmetic. Fading in means the destination-sized photograph is partly visible
+   under the copy that is still flying towards it — two copies of one photo at two
+   sizes, which is the thing the hold exists to prevent. Fading out means the
+   photograph and the copy are both semi-transparent over the dark backdrop as they
+   hand over, and the frame visibly dims for the ~80ms they take to sum back to
+   opaque. The copy is *the same bitmap* in the same box (both are the local
+   rendition — see `.lightbox-stage img`), so there is nothing to cross-fade. */
+.lightbox-entering #lightboxImage { opacity: 0; }
 .lightbox-entering #lightboxVideo { opacity: 0; }
-#lightboxImage, #lightboxVideo { transition: opacity 160ms ease; }
+/* A clip keeps its fade: what arrives on top of the travelling copy is the video's
+   own frame rather than a second copy of the poster still, and a cut between the
+   two would read as a jolt. */
+#lightboxVideo { transition: opacity 160ms ease; }
 
 /* The travelling photograph.
 
@@ -1149,19 +1158,42 @@ button { font: inherit; cursor: pointer; }
   border-radius: var(--radius);
   overflow: hidden;
 }
-/* Both the still and the clip are sized the same way, and it matters that they
-   are: the stage has a pinned height (§8), so whichever element is on it has to
-   fit *inside* that box itself. `object-fit: contain` on the clip rather than the
-   `cover` the tile uses — a still in the lightbox shows the whole photograph, and
-   a clip that cropped to a letterbox would put bars in front of a video that is
-   letterboxed anyway. */
-.lightbox-stage img,
+/* The still occupies the stage's fitted box whatever its own pixel size, and that
+   is not cosmetic.
+
+   The photograph on the stage is not always the 2048px rendition: it starts as the
+   local one the grid was already showing — 256px of a photograph — and sharpens in
+   place when the original lands (§8). Sized by `max-width` alone, that rendition
+   draws at its own 256 CSS pixels in the middle of the stage, so paging to the next
+   photograph reads as a small picture expanding, and until the original arrives the
+   frame is mostly the stage's own dark panel. `object-fit: contain` on a
+   stage-sized box is the geometry the travelling copy already uses, so the
+   hand-over changes sharpness and nothing else.
+
+   A clip keeps its own box: its frame is never one of these renditions, and
+   `object-fit: contain` rather than the `cover` the tile uses is what stops a
+   letterboxed clip from being cropped twice. */
+.lightbox-stage img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .lightbox-stage video { max-width: 100%; max-height: 100%; display: block; }
-/* A clip is not an image, so it does not transition into place the way
-   `#lightboxImage` does: the travelling thumbnail *is* the poster frame at the
-   tile's size, and cross-fading it out would hand the screen to a second,
-   lower-quality copy of the very frame that was just on it. The element is
-   instead hidden until the travelling copy lands — see `renderLightbox`. */
+
+/* Zoom is a transform on the still and on nothing else — the panel, the overlay
+   and the keyboard model do not move with it, because the point of zooming is the
+   photograph rather than a magnified interface. `transform-origin: 0 0` is what
+   lets that arithmetic be stated in one coordinate space (the element's own), so
+   the point under the fingers stays under them; see `zoomTo`.
+
+   The pixels being magnified are the fitted rect in the middle of a stage-sized
+   box, which is why the letterbox beside a panorama is still a gesture on the
+   photograph — the element covers the stage either way.
+
+   `user-select`/`-webkit-user-drag` are not decoration: without them a drag to pan
+   a magnified photo is also a drag of the *file*, and a Finder window beside the
+   browser will take it. `draggable="false"` on the element says the same thing in
+   the markup, where it is also true for a reader with no gesture support at all. */
+#lightboxImage { transform-origin: 0 0; }
+.lightbox-stage img { user-select: none; -webkit-user-drag: none; }
+.lightbox-stage.is-zoomed { cursor: grab; }
+.lightbox-stage.is-zoomed:active { cursor: grabbing; }
 .lightbox-fallback { color: #fff; opacity: 0.85; padding: 24px; text-align: center; }
 
 .lightbox-close, .lightbox-nav {

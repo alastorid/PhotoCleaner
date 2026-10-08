@@ -250,7 +250,10 @@ dependency-free local build can do.)
    PhotoCleaner never assumes they are. Drag either handle; **Reset** puts both
    back on the observed bounds.
 4. **Inspects** any photo in a large preview with keyboard navigation
-   (`←` / `→`, `Space` to toggle the preview, `Esc` to close).
+   (`←` / `→`, `Space` to toggle the preview, `Esc` to close), **zoom** (scroll or
+   pinch to magnify the photo itself — the panel does not move with it — drag to
+   pan, `+`/`-` and `0` from the keyboard), and a hand-off to Photos
+   (**Open in Photos**) when what you want next is Photos' own tools.
 5. **Shows any photo in All Photos** — the whole library in date order, grouped by
    day, with the photo you came from highlighted in the middle of its series.
 6. **Deletes** the photos you select, straight through PhotoKit, from the
@@ -428,8 +431,23 @@ silently pulls down an entire optimized library.
   poster frame is no exception. Such tiles show an "In iCloud" placeholder.
 - Turning the option on re-queues everything that was skipped and lets analysis,
   lightbox previews and clip playback fetch originals.
+- A preview opened on a photo whose original has not arrived yet shows the local
+  rendition the grid already has and sharpens in place when the original lands,
+  rather than an empty stage while the download runs.
 - Playing a clip that lives only in iCloud is refused with a message naming the
   setting, rather than reported as a missing video.
+- **A request PhotoKit never answers is given up on, not waited on.** Photos can
+  accept a request and then never call its handler — measured, and rare per asset —
+  and an unbounded wait on one used to park a worker and stop the whole pass at a
+  fixed percentage that a relaunch reproduced exactly, because the queue is drained
+  in the same order every time. Such an asset is now recorded as a failure and
+  re-queued by **Retry failures**, so the run always finishes and the number moves.
+- **If a whole library's worth of those fetches go unanswered, the run stops asking
+  for iCloud rather than paying a deadline per asset.** Three requests in a row with
+  no answer and the rest of the run reads only what is on this Mac; those assets are
+  recorded as *not on this Mac*, exactly as they are when *"Download from iCloud when
+  required"* is off, and **Retry** puts them back in the queue. See
+  `docs/ARCHITECTURE.md` §5.4.
 
 On an optimised library a large share of assets are cloud-only: in the library
 these numbers were measured against, **15,600 of 52,661** stills (**30%**) were
@@ -769,8 +787,17 @@ rather than being quietly treated as no filter at all.
 ### Show Similar Photos
 
 Right-click any photo — in the score grid, in All Photos, in a group, or in the
-lightbox — and choose **Show Similar Photos** to jump straight to the group that
+preview — and choose **Show Similar Photos** to jump straight to the group that
 photo belongs to.
+
+A photo the analysis has looked at and found no neighbours for greys the item out
+and says **none found**, so the answer is on the menu rather than in a page opened
+to tell you there was nothing to show. That is only said when it is *known*: a photo
+the analysis has not reached yet keeps a live item, because "no similar photos" and
+"nothing has compared this photo yet" are different facts and the page for the
+second one says so (see the table below). The answer is not on the grid's rows, so
+the item is enabled when the menu opens and corrected a round trip later — the same
+`GET /api/photo/{id}/similar` the item itself performs when it is chosen.
 
 It is a **show**, not a find. Grouping already happened when the FeaturePrints were
 analysed, and the answer is sitting in `similar_group_members`. So the whole action

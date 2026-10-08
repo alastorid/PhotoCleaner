@@ -11,6 +11,14 @@ enum PhotoLibraryError: Error, CustomStringConvertible {
     case imageNotLocal
     case imageRequestFailed(String)
     case deletionFailed(String)
+    /// The request was accepted and then never answered. See `CallbackDeadline`.
+    ///
+    /// Deliberately its own case rather than `imageRequestFailed` or
+    /// `imageUnavailable`: nothing was learned about the asset, so it must not be
+    /// routed to `unavailable` — the one state that is never retried — and the
+    /// read-out should be able to say "PhotoKit did not answer" rather than
+    /// inventing a reason.
+    case requestTimedOut(String)
 
     var description: String {
         switch self {
@@ -20,6 +28,7 @@ enum PhotoLibraryError: Error, CustomStringConvertible {
         case .imageNotLocal: return "the asset is stored in iCloud only"
         case .imageRequestFailed(let detail): return "the image request failed: \(detail)"
         case .deletionFailed(let detail): return "PhotoKit refused the deletion: \(detail)"
+        case .requestTimedOut(let detail): return "PhotoKit did not answer the request (\(detail))"
         }
     }
 }
@@ -404,7 +413,8 @@ final class PhotoLibrary: @unchecked Sendable {
     /// throws, and that is the point. `AnalysisEngine.recordOutcome` routes on them
     /// exhaustively — `.assetNotFound` deletes the row, `.imageNotLocal` parks the
     /// asset as `unavailable` without counting a failure, `.imageRequestFailed`
-    /// counts one. A new "video failed" case would have had to be taught about the
+    /// counts one, and `.requestTimedOut` counts one because the framework never
+    /// answered. A new "video failed" case would have had to be taught about the
     /// analysis path, and the tempting mapping — a clip that cannot be decoded being
     /// reported as a *scoring* failure — is exactly how a run that was interrupted
     /// would come to be counted as thousands of broken assets.
@@ -438,6 +448,13 @@ final class PhotoLibrary: @unchecked Sendable {
                 // claim back instead of scoring a one-frame clip as though that
                 // were the whole of it.
                 throw CancellationError()
+            } catch PhotoLibraryError.requestTimedOut(let detail) {
+                // Not a moment that failed: the clip's `AVAsset` was never handed
+                // over, so the next two samples would each wait out the same
+                // silence again — three deadlines for one answer that is not
+                // coming, and the clip is then re-queued and does it all twice.
+                // One wait per attempt is the whole of what the deadline is for.
+                throw PhotoLibraryError.requestTimedOut(detail)
             } catch {
                 // One bad moment must not cost the whole clip its score. Dropping
                 // the frame turns three samples into two, and two into one — which
@@ -452,7 +469,8 @@ final class PhotoLibrary: @unchecked Sendable {
         // `imageNotLocal` and is parked as unavailable instead of marked broken.
         // "The last one" is an arbitrary choice only among failures that are all
         // the same failure, because whichever one first fails for a given
-        // `allowNetwork` will fail for the rest of them too.
+        // `allowNetwork` will fail for the rest of them too. A `requestTimedOut`
+        // never reaches here: it aborts the loop above on the first sample.
         guard !frames.isEmpty else { throw lastError }
         return frames
     }
@@ -493,6 +511,12 @@ final class PhotoLibrary: @unchecked Sendable {
                     continue
                 case .assetNotFound, .notAuthorized, .deletionFailed:
                     throw error
+                case .requestTimedOut:
+                    // Not a statement about *this* rendition. Walking down the
+                    // ladder would re-issue a request that just went unanswered —
+                    // five deadlines instead of one, each of them letting the
+                    // caller wait for the same silence.
+                    throw error
                 }
             }
         }
@@ -513,6 +537,15 @@ final class PhotoLibrary: @unchecked Sendable {
                       height: max(1, (height * scale).rounded()))
     }
 
+    /// How long a `PHImageManager` request may go unanswered.
+    ///
+    /// Two minutes is far beyond any healthy request: a local decode is
+    /// milliseconds, and a still fetched from iCloud is a few megabytes. It is
+    /// also far shorter than "forever", which is the alternative — see
+    /// `CallbackDeadline`. A still that cannot answer in two minutes is recorded
+    /// as a failure and can be retried; a run that stops for it cannot.
+    private static let imageDeadline: TimeInterval = 120
+
     private func requestImage(asset: PHAsset,
                               targetSize: CGSize,
                               allowNetwork: Bool) async throws -> CGImage {
@@ -520,8 +553,20 @@ final class PhotoLibrary: @unchecked Sendable {
         // more than once (degraded then final, or image then error) and a second
         // resume of a checked continuation traps.
         let box = ResumeBox()
+        // The handler is also allowed to never arrive at all, and one such asset
+        // is enough to park a worker — and with it the pass — for the life of the
+        // process. See `CallbackDeadline`.
+        let deadline = CallbackDeadline()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                // Every exit goes through `finish`, so the deadline is disarmed
+                // exactly when PhotoKit answers, and never races a resolution that
+                // has already happened.
+                let finish: @Sendable (Result<CGImage, Error>) -> Void = { result in
+                    guard box.beginResume() else { return }
+                    deadline.disarm()
+                    continuation.resume(with: result)
+                }
                 let options = PHImageRequestOptions()
                 options.isSynchronous = false
                 options.isNetworkAccessAllowed = allowNetwork
@@ -537,13 +582,11 @@ final class PhotoLibrary: @unchecked Sendable {
                     options: options
                 ) { image, info in
                     if let cancelled = info?[PHImageCancelledKey] as? Bool, cancelled {
-                        if box.beginResume() {
-                            continuation.resume(throwing: PhotoLibraryError.imageUnavailable)
-                        }
+                        finish(.failure(PhotoLibraryError.imageUnavailable))
                         return
                     }
                     if let image, let cgImage = PhotoLibrary.cgImage(from: image) {
-                        if box.beginResume() { continuation.resume(returning: cgImage) }
+                        finish(.success(cgImage))
                         return
                     }
                     let degraded = info?[PHImageResultIsDegradedKey] as? Bool ?? false
@@ -551,26 +594,35 @@ final class PhotoLibrary: @unchecked Sendable {
                     // Photos tells us explicitly when the pixels were never on
                     // this Mac; that is a normal, expected state, not an error.
                     if info?[PHImageResultIsInCloudKey] as? Bool == true, !allowNetwork {
-                        if box.beginResume() { continuation.resume(throwing: PhotoLibraryError.imageNotLocal) }
+                        finish(.failure(PhotoLibraryError.imageNotLocal))
                         return
                     }
                     if let error = info?[PHImageErrorKey] as? Error {
-                        if box.beginResume() {
-                            let nsError = error as NSError
-                            // 3164: pixels are in iCloud and network access was
-                            // not granted. 3169: the fetch over the network failed.
-                            let isCloud = nsError.domain == PHPhotosErrorDomain
-                                && (nsError.code == PHPhotosError.networkAccessRequired.rawValue
-                                    || nsError.code == PHPhotosError.networkError.rawValue)
-                            continuation.resume(throwing: isCloud
-                                ? PhotoLibraryError.imageNotLocal
-                                : PhotoLibraryError.imageRequestFailed(error.localizedDescription))
-                        }
+                        let nsError = error as NSError
+                        // 3164: pixels are in iCloud and network access was
+                        // not granted. 3169: the fetch over the network failed.
+                        let isCloud = nsError.domain == PHPhotosErrorDomain
+                            && (nsError.code == PHPhotosError.networkAccessRequired.rawValue
+                                || nsError.code == PHPhotosError.networkError.rawValue)
+                        finish(.failure(isCloud
+                            ? PhotoLibraryError.imageNotLocal
+                            : PhotoLibraryError.imageRequestFailed(error.localizedDescription)))
                         return
                     }
-                    if box.beginResume() { continuation.resume(throwing: PhotoLibraryError.imageNotLocal) }
+                    finish(.failure(PhotoLibraryError.imageNotLocal))
                 }
                 box.set(requestID: requestID, manager: imageManager)
+                deadline.arm(after: Self.imageDeadline) {
+                    // Answer first, then cancel. `finish` is the one-shot gate, so
+                    // cancelling first would let PhotoKit's own cancelled callback
+                    // win the resume with `imageUnavailable` — and an `unavailable`
+                    // asset is never retried, which is the wrong fate for an asset
+                    // nothing was learned about.
+                    finish(.failure(PhotoLibraryError.requestTimedOut(
+                        "no answer after \(Int(Self.imageDeadline)) s for a "
+                        + "\(Int(targetSize.width))×\(Int(targetSize.height)) request")))
+                    box.cancel()
+                }
             }
         } onCancel: {
             box.cancel()

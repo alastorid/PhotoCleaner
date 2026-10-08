@@ -549,6 +549,8 @@ extension Router {
             return Reply(status: -1, headers: [:], body: Data("unexpected SSE stream".utf8))
         case .file(let file):
             return Reply(status: file.status, headers: file.headers, body: Data("unexpected file body".utf8))
+        case .videoStream:
+            return Reply(status: -1, headers: [:], body: Data("unexpected video stream".utf8))
         }
     }
 }
