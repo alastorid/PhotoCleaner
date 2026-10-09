@@ -3590,6 +3590,15 @@
     // Closing in the All Photos window leaves the photo just inspected on
     // screen, which is where the user expects to carry on from.
     if (wasAllPhotos) scrollAllPhotosIntoView(index);
+    // If the initial grid load was deferred while the lightbox was open, trigger it now.
+    if (state.needsFirstPage || !state.firstLoadDone) {
+      if (state.needsFirstPage) {
+        state.needsFirstPage = false;
+        state.firstLoadDone = true;
+        state.lastGridRefresh = 0;
+      }
+      resetGrid();
+    }
   }
 
   /**
@@ -4360,12 +4369,25 @@
     state.lastLibraryTotal = libraryTotal;
 
     if (state.needsFirstPage) {
-      state.needsFirstPage = false;
-      state.firstLoadDone = true;
-      state.lastGridRefresh = 0; // the very first page is never throttled
-      resetGrid();
+      // If the lightbox is open, defer the initial grid load until it closes.
+      // resetGrid() would close the lightbox and reload thumbnails unnecessarily.
+      if (state.lightbox.open) {
+        // Keep needsFirstPage true so we'll retry on the next status frame.
+        // The grid will load automatically when the lightbox closes.
+      } else {
+        state.needsFirstPage = false;
+        state.firstLoadDone = true;
+        state.lastGridRefresh = 0; // the very first page is never throttled
+        resetGrid();
+      }
     } else if (!state.firstLoadDone) {
-      if (boundsUsable()) resetGrid().then(() => { state.firstLoadDone = true; });
+      if (boundsUsable()) {
+        if (state.lightbox.open) {
+          // Defer until lightbox closes; firstLoadDone stays false.
+        } else {
+          resetGrid().then(() => { state.firstLoadDone = true; });
+        }
+      }
     } else if (boundsChanged || boundsMoved || analyzedChanged || libraryChanged) {
       maybeAutoRefresh();
     }
