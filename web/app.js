@@ -125,7 +125,7 @@
      * Identifiers this client named that the server does not have.
      *
      * Non-zero when a photo has left the library since the page that named it was
-     * loaded, which is the one case where the bar's "N photos selected" and the
+     * loaded, which is the one case where the selection summary's count and the
      * Delete button's count disagree for a reason protection does not explain.
      */
     unknownIdentifiers: 0,
@@ -551,8 +551,7 @@
    *
    * "assets" for `all`, because Photos' assets are now photos *and* videos and
    * the count beside the slider counts both — a read-out that said "photos" over
-   * a mixed grid would be wrong on the default view rather than only on a
-   * filtered one, which makes it the more important of the three.
+   * a mixed grid would be wrong on an unfiltered (`all`) grid.
    */
   function mediaNoun(selection = state.media) {
     if (selection === 'videos') return 'video';
@@ -891,7 +890,7 @@
    *
    * The three states are three different facts, and the gate between the last two is the
    * *index*, not the album list. `albums.loaded` means the list of albums arrived, which
-   * says nothing about whether their memberships have been read — the bar's "No album"
+   * says nothing about whether their memberships have been read — the "No album" chip's
    * chip is gated on `indexComplete` for exactly this reason. While the index is
    * incomplete, a photograph with no membership row is one whose albums nobody has
    * looked for yet, and "not read yet" is the true thing to say.
@@ -1841,7 +1840,7 @@
    *
    * Only actions that act *on the photo* or *on the library*. Selecting, ranging,
    * opening and clearing the selection are each one gesture away on the surface
-   * itself — click, ⇧-click, double-click, the bar's own buttons — and a
+   * itself — click, ⇧-click, double-click — and a
    * right-click user who wanted to select something would have clicked it. They
    * were also the items most likely to be *wrong*: "Select range" is a run of
    * photos measured from an anchor the user may not know they set, and "Inspect"
@@ -2013,7 +2012,7 @@
    *
    * A menu whose scope is invisible is the one way a context menu can surprise
    * someone, so the scope is stated rather than implied — including the case
-   * where it is narrower than the selection bar suggests.
+   * where it is narrower than the selection summary suggests.
    */
   function tileMenuHintText() {
     const inSelection = isSelected(tileMenu.row.id);
@@ -2049,7 +2048,7 @@
    * A "all matching" selection is deliberately *not* reachable from here. It is
    * a filter, not an enumerable set: the client does not know its members, so
    * anything that named it would be asking the server to destroy a set the user
-   * never looked at. The footnote says so, and the bar's Delete button remains
+   * never looked at. The footnote says so, and the Delete button remains
    * the one route to it.
    */
   function tileMenuTargets() {
@@ -2276,7 +2275,7 @@
  * inside `decorateTile`, so there is one place that knows how a favourite looks
  * and this only decides *which* tiles ask it to redraw.
  *
- * The selection bar is still refreshed, because its protected-favourite count does
+ * The selection summary is still refreshed, because its protected-favourite count does
  * depend on this flag. It is one element rather than a grid, so it costs nothing
  * next to what was saved.
  *
@@ -2344,7 +2343,7 @@
     const row = group && groupItems(group)[Number(cell.dataset.index)];
     if (!row) return;
     // The selection ring, because clicking a cell now selects it. Without this a
-    // click would look like it did nothing at all until the bar's count moved, and
+    // click would look like it did nothing at all until the count moved, and
     // a selection you cannot see is not a selection.
     const selected = isSelected(row.id);
     cell.classList.toggle('selected', selected);
@@ -3486,11 +3485,12 @@
     const tile = previewTileRect(source);
     if (!tile) return false;
     const image = $('lightboxImage');
-    // The fallback is not only for a missing bitmap: for a clip `#lightboxImage`
-    // is *always* empty, because the stage is showing a `<video>`. So a clip's
-    // return flight flies its poster frame — which is exactly the frame the
-    // travelling copy was showing on the way out, and the one the tile draws.
-    const ghost = previewGhost(target, image.naturalWidth
+    // For a clip, `#lightboxImage` may still hold the *previous still's* pixels
+    // because `renderLightbox` only hides it without clearing `src`. So a clip's
+    // return flight must use the video's poster frame — which is exactly the frame
+    // the travelling copy was showing on the way out, and the one the tile draws.
+    const isClip = isVideoRow(previewTravel.row);
+    const ghost = previewGhost(target, (!isClip && image.naturalWidth)
       ? (image.currentSrc || image.src)
       : (source.currentSrc || source.src));
     document.body.appendChild(ghost);
@@ -3943,7 +3943,17 @@
       video.onerror = () => {
         video.hidden = true;
         fallback.hidden = false;
-        fallback.textContent = 'This clip could not be loaded — its original may be stored in iCloud only.';
+        fallback.textContent = 'This clip could not be loaded — its original may be stored in iCloud only, '
+          + 'or PhotoCleaner could not produce a playable stream for it.';
+      };
+      // The fMP4 stream has no Content-Length, so a failed export surfaces as a
+      // stalled element rather than as an error event.
+      video.onstalled = () => {
+        if (video.readyState < 3) {
+          fallback.hidden = false;
+          fallback.textContent = 'Still buffering this clip — if it does not start, its original may be '
+            + 'stored in iCloud only, or Photos could not produce a playable stream.';
+        }
       };
     } else {
       // A still after a clip: the player goes first, or the clip's audio survives
@@ -4562,10 +4572,9 @@
   function updateCounts() {
     $('matchCount').textContent = fmt.count(state.total);
     // "matching photos" / "matching videos" / "matching assets", from the filter
-    // in force. The noun has to track `state.media` because the count does: on the
-    // default `all` the number spans both media types, and a read-out that said
-    // "photos" there would be wrong on the view most readers use rather than only
-    // on a filtered one.
+    // in force. The noun has to track `state.media` because the count does: under
+    // "All" the number spans both media types, and a read-out that said "photos"
+    // there would be wrong — which is the one bucket that is not the default.
     $('matchCountNoun').textContent = fmt.plural(state.total, mediaNoun(), `${mediaNoun()}s`);
     if (!state.status) return;
     const analysis = state.status.analysis || {};
@@ -4942,7 +4951,7 @@
         return;
       }
 
-      // ⌘A selects every photo the current filter matches — the snapshot the bar's
+      // ⌘A selects every photo the current filter matches — the snapshot the
       // "Select all matching" button used to make, and the same set the server counts
       // and fingerprints before a deletion is allowed to carry it. `preventDefault`
       // because without it the browser selects the page's *text*, which is not what

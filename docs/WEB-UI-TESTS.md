@@ -4,7 +4,7 @@
 grid, the Space-to-preview toggle, the context menu, the delete flow's wiring — is a
 second half, and this is how it gets exercised.
 
-Three files, none of them shipped:
+Four files, none of them shipped:
 
 | File | What it is |
 | --- | --- |

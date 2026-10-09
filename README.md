@@ -314,8 +314,9 @@ A clip's tile is its poster frame — the same thumbnail route a still uses, bec
 duration badge and a play glyph. Opening one puts a `<video>` element on the
 preview stage, fed by `GET /api/photo/{id}/video`. It never autoplays and preloads
 metadata only: paging through a grid of clips should not make noise or pull a whole
-export off the disk for something you are only looking at. Nothing is transcoded or
-re-muxed; the bytes are what Photos holds.
+export off the disk for something you are only looking at. On first play of an
+uncached clip, the video track is passed through and audio is re-encoded to AAC in a
+fragmented MP4 container. Once cached, the original codec and container are preserved.
 
 One thing is drawn *on* the photo rather than beside it, because it changes what an
 action **does**: a **♥** for a favourite, which is also the button that sets it.
@@ -326,8 +327,7 @@ weaken, so a stored `protectFavorites: false` is ignored on load and the API ref
 to set one.
 
 The same heart is on a group member's thumbnail, and it does the same thing there.
-It used to be different: a mark you could read but not press, and only once the
-photo was already a favourite. "The heart sets the favourite" is one promise, and it
+A heart is a button that sets the favourite. "The heart sets the favourite" is one promise, and it
 holds everywhere a heart is drawn.
 
 ### While the library is being analysed
@@ -495,7 +495,7 @@ clip export: they are all under Application Support, and the log (with its rotat
 `PhotoCleaner.log.1`) lives in Logs. Clip exports are worth naming explicitly
 because they are the largest thing the app can leave behind and the least
 interesting — every one of them is reproducible from Photos, and the next play of
-the clip re-exports it. Then delete `dist/` to remove the built app. Your Photos
+the clip re-streams it. Then delete `dist/` to remove the built app. Your Photos
 library is untouched — PhotoCleaner adds nothing to it except the deletions you
 perform.
 
@@ -634,8 +634,9 @@ supports `Range` — `bytes=a-b`, `bytes=a-` and `bytes=-suffix` — so seeking 
 An unparseable range and a multi-range one are ignored and answered `200` with the
 whole file; a start past the end is `416`; and a clip that exists but is stored only
 in iCloud is **`409` naming the setting** that turns it into a `200`, because a
-`404` would read as "this video is gone". Nothing is transcoded or re-muxed: the
-bytes are what Photos holds, exported once and cached.
+`404` would read as "this video is gone". On first play of an uncached clip, the
+video track is passed through and audio is re-encoded to AAC in a fragmented MP4
+container. Once cached, the original codec and container are preserved.
 
 ## Source layout
 
@@ -651,7 +652,8 @@ Sources/PhotoCleaner/
   Support/                  paths, logging, preferences, SSE fan-out
   Model/Records.swift       asset/filter/sort/cursor types
   Library/PhotoLibrary.swift    all PhotoKit access (auth, enumerate, images, delete)
-  Library/VideoLibrary.swift    the only file that imports AVFoundation: frames, playback, export
+  Library/VideoLibrary.swift    PhotoKit frames, clip export, playback and the export cache
+  Library/VideoStreaming.swift fMP4 re-mux streaming for clips (AVAssetReader/AVAssetWriter)
   Analysis/VisionAnalyzer.swift Apple's aesthetics, FeaturePrint and face requests
   Analysis/CacheStore.swift     SQLite actor: schema, reconciliation, queries
   Analysis/AnalysisEngine.swift scan + bounded analysis run loop, progress
@@ -745,7 +747,9 @@ Opening one puts a `<video>` on the preview stage, fed by
 - **It is paused and released on paging and on close.** A retained `<video>` holds a
   decoder and its network stream open; pausing before dropping the source is what
   stops audio continuing under the next photo.
-- **Nothing is transcoded.** The bytes are what Photos holds, exported once through
+- **Video is not re-encoded.** On first play of an uncached clip, the video track is
+  passed through and audio is re-encoded to AAC in a fragmented MP4 container. Once
+  cached, the bytes are what Photos holds, exported once through
   `AVAssetExportPresetPassthrough`. On any iPhone-shot library since 2017
   that means **HEVC**, which Safari and the app's own window play and **Chrome does
   not** — accepted, because the shipped presentation *is* the window, and a

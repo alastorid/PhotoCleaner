@@ -203,23 +203,22 @@ struct HTTPFile: Sendable {
 /// produced. The client receives an init segment (ftyp+moov) followed by moof+mdat
 /// fragments.
 ///
-/// Seeking is handled by the client requesting byte ranges. We translate the byte
-/// offset to a presentation timestamp using a fragment index, then restart the
-/// stream from the nearest preceding keyframe.
+/// This is used for the first play of an uncached clip, so playback starts
+/// immediately without waiting for a full export. Once the export is cached,
+/// subsequent plays and all seeks are served from the file via `HTTPFile`.
 struct HTTPVideoStream: Sendable {
-    /// `200` for initial request, `206` for Range requests.
+    /// Always `200` — this path serves the whole stream from the beginning.
     var status: Int = 200
     /// Headers to send: `Content-Type: video/mp4`, `Accept-Ranges: bytes`.
-    /// `Content-Length` is NOT set — we use chunked transfer encoding for the
-    /// live stream, or Content-Length for Range requests against a known fragment index.
+    /// `Content-Length` is NOT set — the stream uses chunked transfer encoding.
     var headers: [String: String] = [:]
     /// The asset identifier to stream.
     let identifier: String
     /// Whether to allow iCloud download.
     let allowNetwork: Bool
-    /// For Range requests: the byte offset to start from.
+    /// Reserved for future seeking support. Always `nil` today.
     let rangeStart: Int64?
-    /// For Range requests: the byte length to serve.
+    /// Reserved for future seeking support. Always `nil` today.
     let rangeLength: Int64?
 }
 

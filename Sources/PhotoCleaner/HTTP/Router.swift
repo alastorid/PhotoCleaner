@@ -257,9 +257,11 @@ struct Router: Sendable {
         case "similar":
             return await similarPhotos(identifier: identifier)
         case "video":
-            // `video`, not `play`/`stream`: the route serves a file, and a name that
-            // said what it did would invite a future caller to expect a transcoded or
-            // re-muxed stream from it. It is a byte range of what Photos holds.
+            // `video`, not `play`/`stream`: the route serves bytes, and a name that
+            // said what it did would invite a future caller to expect a transcoded
+            // or re-muxed stream from it. On first play of an uncached clip it
+            // re-muxes to fMP4 on the fly; thereafter it is a byte range of the
+            // passthrough export.
             return await video(identifier: identifier, request: request)
         default:
             return await photo(identifier: identifier)
@@ -1434,10 +1436,12 @@ struct Router: Sendable {
         let hasCachedFile = cachedSize != nil && cachedSize! > 0
 
         if isInitialPlayback && !hasCachedFile {
-            // No cached export — stream via fMP4 for instant start
+            // No cached export — stream via fMP4 for instant start.
+            // Do NOT advertise Accept-Ranges: the stream is generated on-the-fly
+            // and cannot be seeked. Once cached, the file path handles ranges.
             let videoStream = HTTPVideoStream(
                 status: 200,
-                headers: ["Content-Type": "video/mp4", "Accept-Ranges": "bytes"],
+                headers: ["Content-Type": "video/mp4"],
                 identifier: identifier,
                 allowNetwork: allowNetwork,
                 rangeStart: nil,

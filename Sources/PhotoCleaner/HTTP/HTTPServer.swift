@@ -918,10 +918,14 @@ private final class HTTPConnection: @unchecked Sendable {
     }
 
     private func writeVideoChunk(_ payload: Data) -> Bool {
-        // Similar to SSE writeChunk but for raw fMP4 fragments (no chunked encoding wrapper needed
-        // since we're already using chunked transfer encoding at HTTP level)
+        // Chunked transfer encoding requires each fragment to be wrapped in
+        // <hex length>\r\n<data>\r\n. The SSE path does this; the video path must too.
         guard !closed, streaming, !streamEnded else { return false }
-        connection.send(content: payload, completion: .contentProcessed { [weak self] error in
+        var frame = Data(String(payload.count, radix: 16).utf8)
+        frame.append(contentsOf: "\r\n".utf8)
+        frame.append(payload)
+        frame.append(contentsOf: "\r\n".utf8)
+        connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             guard let self, let error else { return }
             self.queue.async { self.close(reason: "video stream send failed: \(error)") }
         })

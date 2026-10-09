@@ -26,7 +26,8 @@ Apple Photos ──PhotoKit──► PhotoLibrary ──► AnalysisEngine (4 bo
                               │  │                │   + FeaturePrint + face quality)
                               │  │                └─► CacheStore (SQLite actor)
                               │  │
-                              │  └─► VideoLibrary (clips: frames, export, playback)
+                              │  ├─► VideoLibrary (clips: frames, export, playback)
+                              │  └─► VideoStreamer (clips: fMP4 re-mux streaming)
                               │
                               ├─► AlbumIndexer ──► CacheStore
                               ├─► SimilarGroupEngine ──► CacheStore
@@ -896,7 +897,7 @@ bug, not a cleanup.
   `lightbox-entering` opacity hold, because the frame on screen behind the travelling
   copy *is* that clip's poster. Holding it until the clip could play would hold a
   frame that is already visible for however long the export takes.
-- **`/api/photo/{id}/video` must stream a range, and it must not buffer the file.**
+- **`/api/photo/{id}/video` must not buffer the file.** On first play of an uncached clip it re-muxes to fMP4 on the fly; thereafter it serves a byte range of the cached export.
   Every other route answers from `Data` because a 2048 px JPEG is a `Data`. A clip is
   not: `AVAssetExportPresetPassthrough` keeps the original codec and the original
   container, so a 4 GB 4K clip is 4 GB. Reading it into a `RouteResult` before the
@@ -922,7 +923,7 @@ bug, not a cleanup.
   optional in RFC 9110 and the framing risk is not worth taking. Answering a bad
   range with a `500` or with the wrong bytes is the failure; serving the file is a
   correct answer to a request the client can recover from on its own.
-- **The clip's `<video>` is paused and emptied on *every* render, not only on close.**
+- **The clip's `<video>` is paused and emptied whenever the clip changes, and on close.**
   `renderLightbox` is also the repaint path for a favourite toggle applied from the
   lightbox, and the bug the queue reindexing comments describe — something still
   running underneath the next photo — arrives in this feature as sound rather than a
@@ -1050,7 +1051,7 @@ within-group ordering? If neither, it does not belong.
   `Content-Range: bytes 0-99/1234186379`, `bytes=5000-5099` → genuinely different bytes
   (offset 0 is a valid MP4 `ftyp` box), and `bytes=99999999999-` → `416`.
   `tools/web-ui-tests.mjs` runs 49 checks against that server, all green, including
-  the fourteen video ones: the media control, a clip rendering as a `<video>` with the
+  the 17 video ones: the media control, a clip rendering as a `<video>` with the
   poster and no autoplay, and teardown on close and on paging. What is **not** proven
   is what only pixels can answer: the lightbox hand-over timing (does
   `loadedmetadata` arrive fast enough for the poster frame to read as the video, or is
@@ -1180,10 +1181,10 @@ Set `PHOTOCLEANER_SLOW_TESTS=1` to include the cases that wait on production
 timeouts.
 
 **Current state**, for whoever picks this up next. `./run-tests.sh --strict` reports
-**321 passed, 0 failed, 2 skipped** (the two are the production-timeout cases above);
-`./build.sh` is clean under `-warnings-as-errors`; `./smoke-test.sh` reports 56 passed;
-and `node tools/web-ui-tests.mjs` reports **49 passed, 0 failed** against a server on a
-populated library, fourteen of those being the video cases. Two things are
+**325 passed, 0 failed, 2 skipped** (the two are the production-timeout cases above);
+`./build.sh` is clean under `-warnings-as-errors`; `./smoke-test.sh` reports **59 passed**;
+and `node tools/web-ui-tests.mjs` reports **68 passed, 0 failed** against a server on a
+populated library, **17** of those being the video cases. Two things are
 consequently unproven and are recorded in §10 — the lightbox hand-over timing for a
 real clip, and whether `.tile-duration` collides with `.tile-check` or
 `.tile-anchor-label` on a real grid. Neither is a question the test suites can
