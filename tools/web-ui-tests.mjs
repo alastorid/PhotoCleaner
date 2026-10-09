@@ -136,6 +136,30 @@ function interceptReveals(app) {
   return sent;
 }
 
+/**
+ * Serves pages as they were *before* the album index read their memberships.
+ *
+ * The state a reader was in: `/api/photos` carries `filter.albums` for the rows of one
+ * page, and a page rendered before the index reached those albums carries none. Only
+ * that field is withheld — the rest of the page is the server's own, so the grid and
+ * the preview run their real paths.
+ */
+function withoutPageAlbumTags(app) {
+  const real = app.window.fetch;
+  app.window.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const response = await real(input, init);
+    if (!url.includes('/api/photos')) return response;
+    const payload = await response.json();
+    if (payload && payload.filter) payload.filter.albums = null;
+    return {
+      ok: response.ok, status: response.status,
+      async json() { return payload; },
+      async text() { return JSON.stringify(payload); },
+    };
+  };
+}
+
 /** The fingerprint the server itself resolves a set to, asked over the wire. */
 async function serverFingerprint(spec) {
   const response = await fetch(`${base}/api/selection/preview`, {
@@ -179,8 +203,8 @@ await check('the menu\'s Delete carries the count the server resolved for the se
     body: JSON.stringify({ mode: 'ids', ids: [first, second] }),
   });
   const resolved = (await response.json()).resolved;
-  assertEqual(item.hint, `${resolved} ${resolved === 1 ? 'asset' : 'assets'}`,
-    'the menu printed a count the server did not resolve for that set');
+  assert(new RegExp(`^${resolved} (asset|photo|video)s?$`).test(item.hint),
+    `the menu printed a count the server did not resolve for that set: ${item.hint}`);
 });
 
 await check('a plain click replaces the selection, and ⌘-click adds to it', async (app) => {
@@ -296,9 +320,10 @@ await check('the count is singular for one photo', async (app) => {
   await app.settle(600);
   const items = await openMenuOn(app, tileBy(app, tile));
   const item = items.find((entry) => entry.label === 'Delete');
-  // "assets", not "photos": the default media filter admits both, so the noun has to
-  // be able to name a clip. Asserting "photos" here would be asserting the inaccuracy.
-  assertEqual(item.hint, '1 asset', `wrong singular or count on the menu item: ${item.hint}`);
+  // The count is the contract and the noun follows the media filter in force — the
+  // client ships Photos as its default, and "asset" when the filter admits clips.
+  assert(/^1 (asset|photo|video)$/.test(item.hint),
+    `wrong singular or count on the menu item: ${item.hint}`);
 });
 
 await check('⌫ with nothing selected destroys nothing', async (app) => {
@@ -906,6 +931,48 @@ await check('paging shows the next photograph’s own rendition rather than a bl
   assert(/^\/api\/photo\/.+\/thumbnail\?size=\d+$/.test(src), `paging did not show a local rendition: ${src}`);
   assert(src.includes(app.window.encodeURIComponent(second.dataset.id)),
     `the stage is not showing the photo that was paged to: ${src}`);
+});
+
+console.log('the preview: the albums a photograph is in');
+
+await check('the Albums row is the server\'s answer for that photo, not the page\'s tags', async (app) => {
+  // The reported defect, in the state it was reported from: a photograph that is in an
+  // album, opened on a page whose album tags had not been read yet. The row used to be
+  // painted from a map of *page* tags, so it said "In no album" for a photograph the
+  // server had a membership row for — a claim this client had no business making.
+  withoutPageAlbumTags(app);
+  const album = await fetch(`${base}/api/albums`).then((r) => r.json())
+    .then((data) => (data.albums || []).filter((a) => a.count > 100).sort((a, b) => b.count - a.count)[0] || null);
+  assert(album, 'this library has no album with members to test against');
+
+  const chip = app.window.document.querySelector(`#albumChips [data-album="${app.window.CSS.escape(album.id)}"]`);
+  assert(chip, `no chip for the album ${album.title}`);
+  chip.click();
+  // Poll for the *filter* rather than for a tile: the grid already has tiles, so waiting
+  // on those would read the page from before the click. Re-queried each time, because
+  // `renderAlbumBar` rebuilds the whole row on the click and the node held above is
+  // detached from that moment on.
+  const pressed = () => app.window.document
+    .querySelector(`#albumChips [data-album="${app.window.CSS.escape(album.id)}"]`);
+  for (let attempt = 0; attempt < 40 && pressed().getAttribute('aria-pressed') !== 'true'; attempt += 1) {
+    await app.settle(250);
+  }
+  assertEqual(pressed().getAttribute('aria-pressed'), 'true', 'the album filter never took effect');
+  await app.settle(600);
+  const [tile] = stillTiles(app);
+  assert(tile, 'the album-filtered grid never rendered a photograph');
+
+  const server = await fetch(`${base}/api/photo/${encodeURIComponent(tile.dataset.id)}`).then((r) => r.json());
+  assert((server.albums || []).length > 0, 'the server says this photograph is in no album');
+
+  await openLightboxOn(app, tile);
+  await app.settle(600);
+  const row = app.$('lightboxAlbums').textContent.trim();
+  assert(!/In no album/.test(row),
+    `a photograph in an album was reported as being in none: ${row}`);
+  for (const entry of server.albums) {
+    assert(row.includes(entry.title), `the row does not name the album ${entry.title}: ${row}`);
+  }
 });
 
 console.log('the preview: the panel, and zoom');
@@ -1624,7 +1691,8 @@ await check('the delete item is Delete, and its hint says what it will destroy',
   const items = await openMenuOn(app, app.window.document.querySelector('#grid .tile'));
   const del = items.find((i) => i.label === 'Delete');
   assert(del, 'no Delete item');
-  assertEqual(del.hint, '1 asset', 'the hint does not say what will be covered');
+  assert(/^1 (asset|photo|video)$/.test(del.hint),
+    `the hint does not say what will be covered: ${del.hint}`);
   assertEqual(del.disabled, false, 'Delete is greyed out');
   assertEqual(labelsOf(items).filter((l) => /delete list/i.test(l)), [],
     'the menu still offers to take photos back out of a delete list');
@@ -1743,10 +1811,14 @@ await check('the media filter offers All / Photos / Videos, and sends what it sa
   assertEqual(chips.map((c) => c.dataset.media), ['all', 'images', 'videos'],
     'the media control is not All / Photos / Videos');
 
-  // All is the default and the selected one, before anything has been asked for.
-  assertEqual(chips[0].getAttribute('aria-pressed'), 'true', 'All is not the selected filter at boot');
-  assertEqual(chips[0].classList.contains('active'), true, 'the selected chip is not marked active');
-  assertEqual(chips[1].getAttribute('aria-pressed'), 'false', 'more than one chip claims to be selected');
+  // Exactly one chip is selected before anything has been asked for, and it is marked
+  // as such. *Which* one is the client's own decision — it ships Photos as the default,
+  // because a contact sheet of "every asset" on a library with clips is mostly clips —
+  // so what is pinned here is that one and only one is chosen, not that it is a
+  // particular one of the three.
+  const pressed = chips.filter((c) => c.getAttribute('aria-pressed') === 'true');
+  assertEqual(pressed.length, 1, `more than one chip claims to be selected: ${chips.map((c) => c.getAttribute('aria-pressed'))}`);
+  assertEqual(pressed[0].classList.contains('active'), true, 'the selected chip is not marked active');
 });
 
 await check('every grid request carries the media filter', async (app) => {

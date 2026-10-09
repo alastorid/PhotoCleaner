@@ -166,6 +166,10 @@
      * Media filter: 'all', 'images' or 'videos' — the three values the server
      * accepts on `?media=`.
      *
+     * 'images' rather than 'all': this is a photo cleaner, and a grid of every
+     * asset on a library with clips in it is mostly clips. Videos are one click
+     * away and 'all' remains a real bucket.
+     *
      * Written by two things, and read by neither of them blindly:
      * `selectMedia` sets it from a click, and `adoptAppliedMedia` overwrites it
      * with the `filter.media` the server echoes back. The second writer is the
@@ -174,7 +178,7 @@
      * over a grid of photographs — the one state in which every number on screen
      * is a lie. Exactly the rule the album filter already follows.
      */
-    media: 'all',
+    media: 'images',
     /** Album filter: 'all', 'none' (in no album), or an album identifier. */
     album: 'all',
     /** Albums the server has read, plus the indexing state behind them. */
@@ -872,6 +876,62 @@
   }
 
   const albumsFor = (id) => state.rowAlbums.get(id) || [];
+
+  /**
+   * The albums the photograph on the stage is in, as clickable chips.
+   *
+   * Painted from the page map first — instant, and usually right — and then *replaced*
+   * by the server's answer for this one photograph, which is the only answer that is
+   * right every time. The map is filled from the album names a *page* reported
+   * (`filter.albums`), so it knows nothing about a photograph whose page this client
+   * never loaded: one reached through All Photos or a group strip, or one whose page was
+   * rendered before the album index had read its membership. Saying "In no album" for
+   * those was a claim this client had no business making, and it is the claim a reader
+   * saw on a photograph that is in an album.
+   *
+   * The three states are three different facts, and the gate between the last two is the
+   * *index*, not the album list. `albums.loaded` means the list of albums arrived, which
+   * says nothing about whether their memberships have been read — the bar's "No album"
+   * chip is gated on `indexComplete` for exactly this reason. While the index is
+   * incomplete, a photograph with no membership row is one whose albums nobody has
+   * looked for yet, and "not read yet" is the true thing to say.
+   */
+  const lightboxAlbums = { token: 0, rowId: null };
+
+  function renderLightboxAlbums(row) {
+    const host = $('lightboxAlbums');
+    const paint = (entries) => {
+      host.replaceChildren();
+      if (entries.length) {
+        entries.forEach((album) => host.appendChild(buildAlbumTag(album, entries.length)));
+        return;
+      }
+      const none = document.createElement('span');
+      none.className = 'album-none';
+      none.textContent = state.albums.indexComplete
+        ? 'In no album'
+        : 'Album membership not read yet';
+      host.appendChild(none);
+    };
+
+    paint(albumsFor(row.id));
+    // A repaint of the same photograph — hearting it from the preview — keeps the answer
+    // it already has. Only a new photograph is asked about.
+    if (lightboxAlbums.rowId === row.id) return;
+    lightboxAlbums.rowId = row.id;
+    const token = (lightboxAlbums.token += 1);
+    api.get(`/api/photo/${encodeURIComponent(row.id)}`).then((data) => {
+      if (token !== lightboxAlbums.token) return; // a newer photograph won
+      const entries = Array.isArray(data.albums) ? data.albums : [];
+      // Recorded in the map as well, so a tile's tooltip and the next visit to this
+      // photograph agree with what the reader has just been told.
+      absorbAlbumTitles({ [row.id]: entries });
+      paint(albumsFor(row.id));
+    }).catch(() => {
+      // A failed lookup leaves the map's answer — or "not read yet" — in place. The row
+      // is a fact about the library, and a request that never arrived is not one.
+    });
+  }
 
   /**
    * Fetches the album list and the indexing state behind it.
@@ -3605,6 +3665,11 @@
     // longer open: the token retires its walk, and the photograph it belonged to is
     // forgotten so the next open arms a fresh one rather than trusting a stale one.
     releaseLightboxStill();
+    // The album lookup is retired the same way: it belongs to the photograph that was
+    // on the stage, and the next open asks again rather than trusting an answer the
+    // library may have moved on from.
+    lightboxAlbums.rowId = null;
+    lightboxAlbums.token += 1;
     restoreFocus();
   }
 
@@ -3921,19 +3986,7 @@
       ? 'A favourite, so it is excluded from deletion. Click to remove the favourite flag.'
       : 'Mark as a favourite in Photos. Favourites are excluded from deletion.';
 
-    // Every album this photo is in, as clickable chips. A photo in none says so
-    // explicitly rather than showing a dash that reads as "not loaded yet".
-    const albumsHost = $('lightboxAlbums');
-    const entries = albumsFor(row.id);
-    albumsHost.replaceChildren();
-    if (entries.length === 0) {
-      const none = document.createElement('span');
-      none.className = 'album-none';
-      none.textContent = state.albums.loaded ? 'In no album' : 'Album membership not read yet';
-      albumsHost.appendChild(none);
-    } else {
-      entries.forEach((album) => albumsHost.appendChild(buildAlbumTag(album, entries.length)));
-    }
+    renderLightboxAlbums(row);
 
     const position = `${lightbox.index + 1} of ${fmt.count(lightbox.queue.length)}`;
     if (lightbox.groups) {

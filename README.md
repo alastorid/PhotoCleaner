@@ -573,7 +573,7 @@ GET  /api/albums                  the album chips: indexed albums, unassigned co
 GET  /api/timeline/around         ?id={anchor}&limit — one page either side of a photo
 GET  /api/timeline/page           ?direction=older|newer&cursor&limit — All Photos paging
 GET  /api/events                  Server-Sent Events; event: status
-GET  /api/photo/{id}              one asset's metadata
+GET  /api/photo/{id}              one asset's metadata, and the albums it is in
 GET  /api/photo/{id}/thumbnail    ?size=128|256|384|512 — a video's poster frame too
 GET  /api/photo/{id}/preview      ?size=512…4096 (degrades to the best local rendition)
 GET  /api/photo/{id}/similar      the Similar Group this photo is in — {groupId?, totalCount, analyzed}
@@ -704,10 +704,11 @@ samples with the median survives it.
 ### The media filter
 
 **Media** — All / Photos / Videos — sits beside **Sort** in the control panel and
-narrows the grid the same way **Aesthetics** and **Album** do. All is the default,
-because a video is an asset and an asset is what this tool has always shown.
-Videos appear in **All Photos** automatically, and that view is deliberately
-unfiltered: it is about chronology, not ranking, so it has no media control.
+narrows the grid the same way **Aesthetics** and **Album** do. **Photos** is the
+default: this is a photo cleaner, and a contact sheet of "every asset" on a library
+with clips in it is mostly clips. Videos are fully reachable one click away, and
+appear in **All Photos** automatically — that view is deliberately unfiltered, since
+it is about chronology rather than ranking, so it has no media control.
 
 The filter is part of the selection snapshot. Take **Select all matching** on a
 Videos-filtered grid and the snapshot pins the media dimension, so switching to

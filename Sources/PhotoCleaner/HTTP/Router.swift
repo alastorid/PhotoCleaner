@@ -403,12 +403,33 @@ struct Router: Sendable {
         }
     }
 
+    /// `GET /api/photo/{id}` — one cached row, and the albums it is in.
+    ///
+    /// The albums are here because of a lie the preview used to tell. `/api/photos`
+    /// sends album names for the rows of *one page* (`filter.albums`), which is enough
+    /// for a tile's tooltip and not enough for the preview's Albums row: that row is a
+    /// claim about one photograph, and a client-side map of page-scoped answers says
+    /// "in no album" for every photograph it never happened to load — including ones
+    /// whose page was rendered before the album index had read their membership.
+    ///
+    /// So this is the indexed read the preview asks for when it opens one: `asset_albums`
+    /// probed by asset, joined to `albums` for the titles. An empty list means the table
+    /// has no membership row for it, which the client must *not* read on its own as "in no
+    /// album" — it does that only once the index is complete, and the album list route
+    /// says when that is.
     private func photo(identifier: String) async -> RouteResult {
         guard let row = try? await cache.photo(identifier: identifier) else {
             return .response(.error("unknown asset", status: 404))
         }
-        struct Response: Encodable { let photo: PhotoRow }
-        return .response(.json(Response(photo: row)))
+        // The same `{id, title}` tags the page response carries, from the same cache
+        // read, so the preview and the grid cannot disagree about an album's name.
+        let membership = (try? await cache.albumMembership(for: [identifier]))?[identifier] ?? []
+        let tags = membership.map { PhotosResponse.AlbumTag(id: $0.identifier, title: $0.title) }
+        struct Response: Encodable {
+            let photo: PhotoRow
+            let albums: [PhotosResponse.AlbumTag]
+        }
+        return .response(.json(Response(photo: row, albums: tags)))
     }
 
     // MARK: - All Photos

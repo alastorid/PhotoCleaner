@@ -826,6 +826,24 @@ bug, not a cleanup.
   transport, because nothing on the stage has a handler that could take it. The edge of
   the stage is not a navigation zone either — for a clip that is exactly where the
   volume and the scrub bar are.
+- **The preview's Albums row is a claim about one photograph, so it is answered about
+  one photograph.** `/api/photos` tags the rows of *one page* with the albums they are in
+  (`filter.albums`), which is right for a tile's tooltip and wrong for that row: a client
+  map filled from page tags knows nothing about a photograph whose page it never loaded —
+  one reached through All Photos or a group strip, or one whose page was rendered before
+  the album index had read its membership — and "In no album" for those is a claim about
+  the library the client had no business making. So `renderLightboxAlbums` paints from
+  the map (instant) and then replaces it with `GET /api/photo/{id}`'s `albums`, which is
+  the indexed membership read for that one asset. The map is updated from that answer too,
+  so a tooltip and the next visit agree.
+- **"In no album" and "not read yet" are different facts, and the gate between them is
+  the index.** `state.albums.loaded` means the *list* of albums arrived — it says nothing
+  about whether their memberships have been read, and gating the row on it is what let a
+  mid-index library report real albums as absent (the bar's own "No album" chip has always
+  been gated on `indexComplete` for exactly this reason). Measured in the state a reader
+  reported: "Reading albums — 23 of 31" on the bar, and a photograph in an album reading
+  "In no album" in the preview.
+
 - **A click on a photo is one rule, on every surface a photo can be pointed at.**
   `onPhotoClick` is the only reader of the modifiers: ⇧ extends the selection to the
   clicked photo from that surface's anchor and does *not* move it (so a reader can extend

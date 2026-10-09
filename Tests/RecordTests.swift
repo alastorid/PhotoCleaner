@@ -203,6 +203,36 @@ func registerRecordTests() {
 
     // MARK: the wire contract
 
+    Registry.shared.add(suite: suite, TestCase(name: "one photo's albums are its indexed membership", knownBug: nil) {
+        // Why this route carries albums at all: the preview's Albums row is a claim about
+        // one photograph, and a client answering it from a *page*'s album tags says "in no
+        // album" for every photograph whose page it never loaded — including ones whose
+        // page was rendered before the index read their membership. This is the indexed
+        // read that makes the row answerable.
+        let fixture = try await Fixture.make("records-photo-albums")
+        try await fixture.seed([
+            .init(id: "in-album", score: 0.5, date: 1000),
+            .init(id: "alone", score: 0.5, date: 2000),
+        ])
+        try await fixture.cache.upsertAlbum(identifier: "album-1", title: "Holidays", collectionType: 1)
+        try await fixture.cache.replaceAlbumMembership(albumIdentifier: "album-1", identifiers: ["in-album"])
+
+        let member = await fixture.router.reply(Req.get("/api/photo/in-album"))
+        checkEqual(member.status, 200, "status")
+        let tags = member.json["albums"] as? [[String: Any]] ?? []
+        checkEqual(tags.count, 1, "the membership row is reported")
+        checkEqual(tags.first?["id"] as? String, "album-1", "with the identifier a chip filters by")
+        checkEqual(tags.first?["title"] as? String, "Holidays", "and the title it renders")
+
+        // An empty list rather than an absent key: "no membership row" and "in no album"
+        // are the same answer *here*, and the client is the side that must not read
+        // either as a fact until the index says it has finished.
+        let alone = await fixture.router.reply(Req.get("/api/photo/alone"))
+        checkEqual(alone.status, 200, "status")
+        checkEqual((alone.json["albums"] as? [[String: Any]])?.isEmpty, true,
+                   "a photograph in no album carries an empty list, not a missing key")
+    })
+
     Registry.shared.add(suite: suite, TestCase(name: "optional fields are omitted, never sent as null", knownBug: nil) {
         let fixture = try await Fixture.make("records-optional")
         try await fixture.seed([
