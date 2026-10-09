@@ -259,10 +259,10 @@ dependency-free local build can do.)
    readings apart.
 5. **Shows any photo in All Photos** — the whole library in date order, grouped by
    day, with the photo you came from highlighted in the middle of its series.
-6. **Deletes** the photos you select, straight through PhotoKit, from the
-   selection bar's **Delete** button, `⌫` or `Delete`, a photo's right-click menu,
-   or the preview's own **Delete**. One step, no prompt, and the count on the
-   button is the number of photos that go.
+6. **Deletes** the photos you select, straight through PhotoKit, from `⌫` or
+   `Delete`, a photo's right-click menu, or the preview's own **Delete**. One step,
+   no prompt, no dialog and no undo: the menu's item prints the count it will destroy,
+   and the deletion reports what it did.
 
 ### All Photos
 
@@ -341,21 +341,24 @@ failures** re-queues what failed.
 ### Selection, and what "all" means
 
 - **Click** a photo to select *only* it — a click with nothing held down is a fresh
-  selection, so a mis-click can never leave an unnoticed photo inside the set the
-  Delete button counts. **⌘-click** adds or removes one photo (a selection of
-  several that are not neighbours), **shift-click** selects the range from where you
-  last clicked, and **double-click** inspects. **Space** inspects the focused photo
-  and inspects it again to put it away — the same toggle everywhere, including on a
-  group's member thumbnails. All four work the same in the grid, in All Photos and
-  on a group's members.
-- **Select all matching** selects *every* photo matching the current filter — not
-  just the page you have scrolled to. The filter is *saved* at that moment, and
-  the interface says so: moving the sliders afterwards does **not** change what
-  will be deleted. If you change the filter while an "all matching" selection is
-  live, deletion is blocked until you either update the selection to the current
-  filter or clear it. Inside that selection, **⌘-click** takes a single photo out
-  (and puts it back) without leaving the mode — which is why a plain click, the
-  gesture that replaces the selection, is not the one that narrows it.
+  selection, so a mis-click can never leave an unnoticed photo inside a deletion.
+  **⌘-click** adds or removes one photo (a selection of several that are not
+  neighbours), **shift-click** selects the range from where you last clicked, and
+  **double-click** inspects. **Space** inspects the focused photo and inspects it
+  again to put it away — the same toggle everywhere, including on a group's member
+  thumbnails. All four work the same in the grid, in All Photos and on a group's
+  members. A selected photo wears the accent ring **inside** its own frame, so the
+  mark never reaches into the tile beside it.
+- **⌘A** selects *every* photo matching the current filter — not just the page you
+  have scrolled to. Every tile on screen that the filter matches is ringed, and the
+  rest of the set is the server's answer. The filter is *saved* at that moment:
+  moving the sliders afterwards does **not** change what will be deleted, and
+  deleting is refused until you press **⌘A** again to take the current filter or
+  **Esc** to give the selection up. Inside that selection, **⌘-click** takes a single
+  photo out (and puts it back) without leaving the mode — which is why a plain click,
+  the gesture that replaces the selection, is not the one that narrows it.
+- **Esc** gives the selection up, one level at a time: the preview first, then All
+  Photos or Similar Groups, and then the selection.
 - The saved filter is a **snapshot**. Once the selection exists, the live sliders
   cannot change what it covers — "all" can never quietly grow under you.
 
@@ -363,10 +366,10 @@ failures** re-queues what failed.
 
 Deletion is **one step**. Select, press **Delete**, and the photos are gone:
 
-- the **Delete** button in the selection bar, labelled **Delete *N* photos** with
-  the count the server itself resolved;
 - **⌫** or **Delete**, with or without a modifier — on a Mac keyboard the key
-  labelled delete *is* Backspace, and both mean the same thing;
+  labelled delete *is* Backspace, and both mean the same thing. With nothing
+  resolved yet — a selection made a moment ago — the key says it is still counting
+  rather than destroying a set of unknown size;
 - **Delete** on a photo's right-click menu, or on the preview's own bar — both
   acting on the photo you pointed at, or on the whole selection when it is part of
   it, and both saying so in the menu's footnote.

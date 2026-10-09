@@ -469,10 +469,44 @@ button { font: inherit; cursor: pointer; }
    neighbour with no shadow to explain the overlap. The photo brightening instead
    cannot reach outside the tile, so the feedback stays local. */
 .tile:hover { filter: brightness(1.03); }
-.tile.selected { outline: 3px solid var(--accent); outline-offset: -1px; }
-/* Keyboard users need to see where they are: the selection ring only shows
-   for a tile that is already selected. */
-.tile:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* The selection ring is a border on an overlay *inside the tile's media*, and that
+   is the third thing it has been. Both of the obvious ones are wrong here, and the
+   measurements are worth keeping so nobody "simplifies" this back:
+
+   - an **outline** is painted from the border edge *outward* by default, and at this
+     grid's 1px gap that is a mark drawn over the neighbour — the old `3px` at `-1px`
+     reached 2px past the tile, so the ring for one photo showed on two. Insetting it by
+     its own width fixes that on paper and not on screen: the tile is `overflow: hidden`
+     and the outline never painted at all (`getComputedStyle` said `6px solid`, the row
+     of pixels across the tile's edge held no accent).
+   - an **inset box-shadow** is painted with the element's own background, so the
+     photograph — a child, filling the tile — covers it. Also invisible, also measured.
+
+   A border on a positioned overlay is drawn *over* the photograph by construction,
+   takes six pixels of it and not one of the gutter, and cannot be clipped by the tile's
+   overflow because it is inside it. It also lets the focus ring live beside it instead
+   of replacing it, which the pair needs: several photos can be selected, and the
+   keyboard's position among them has to stay legible. */
+.tile.selected .tile-media::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 6px solid var(--accent);
+  border-radius: var(--tile-radius);
+  pointer-events: none;
+}
+/* Keyboard users need to see where they are — on a tile that is not selected, and also
+   on one that is. At the edge when there is no ring to sit inside; two pixels inside
+   the ring's inner edge when there is, so the two do not read as one thick mark. */
+.tile:focus-visible .tile-media::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--accent);
+  border-radius: var(--tile-radius);
+  pointer-events: none;
+}
+.tile.selected:focus-visible .tile-media::before { inset: 8px; border-radius: 2px; }
 
 .tile-media { position: relative; display: block; line-height: 0; }
 
@@ -861,12 +895,21 @@ button { font: inherit; cursor: pointer; }
 }
 .group-cell:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
 .group-cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-/* A selected cell. Clicking a cell selects it, so this has to be visible on the
-   cell itself: the selection bar's count is too far away to be the only feedback,
-   and a strip is read by looking along it rather than at the bar.
-   An inset outline, matching `.tile.selected`, so the two surfaces mark a selected
-   photo identically. */
-.group-cell.selected { outline: 3px solid var(--accent); outline-offset: -1px; }
+/* A selected cell carries the same mark a selected tile does, in the same way and for
+   the same reasons (see the note on `.tile.selected`): the mark belongs on the photo
+   the reader is looking along, not in a bar somewhere else — there is no bar at all now —
+   and it has to sit *inside* the frame rather than over the gap beside it. The cell's own
+   focus ring stays the outline above, and moves inside the ring when there is one, so the
+   two never read as one mark. */
+.group-cell.selected::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 6px solid var(--accent);
+  border-radius: 8px;
+  pointer-events: none;
+}
+.group-cell.selected:focus-visible { outline-offset: -10px; }
 
 /* The member a group was opened for — the photo "Show Similar Photos" was pressed
    on. The ring is the same accent the All Photos anchor uses, so "the one you came
@@ -1043,26 +1086,6 @@ button { font: inherit; cursor: pointer; }
   70% { box-shadow: 0 0 0 16px transparent; }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
-
-/* ---------- selection bar ---------- */
-
-.selection-bar {
-  position: sticky;
-  bottom: 0;
-  z-index: 25;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 24px;
-  background: color-mix(in srgb, var(--bg) 86%, transparent);
-  backdrop-filter: saturate(180%) blur(20px);
-  border-top: 1px solid var(--panel-border);
-}
-.selection-summary { font-weight: 600; font-variant-numeric: tabular-nums; }
-.selection-summary .emphasis { color: var(--accent); }
-.selection-hint { color: var(--muted); font-size: 12px; }
-.selection-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 
 /* ---------- lightbox ---------- */
 

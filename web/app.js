@@ -592,10 +592,6 @@
     if (state.media === echoed) return false;
     state.media = echoed;
     renderMediaBar();
-    // The chips moved, and so did the filter a live "all matching" selection was
-    // snapshotted under, so the bar has to be told — or it would keep printing a
-    // count for a set the server is no longer being asked about.
-    updateSelectionBar();
     return true;
   }
 
@@ -763,7 +759,6 @@
     $('grid').replaceChildren();
     if (state.lightbox.open && state.lightbox.live) closeLightbox();
     updateLoadMore();
-    updateSelectionBar();
     return loadPage(null, generation);
   }
 
@@ -1061,12 +1056,13 @@
    *   too, and their offsets are the same kind of "position inside one result
    *   set" the grid's cursor is.
    * - **A "matching" selection goes stale.** Handled by `sameFilter` reading
-   *   `media`, not by clearing anything: `updateSelectionBar` reports the
-   *   mismatch and blocks deletion until the user re-snapshots or clears it
-   *   explicitly. An explicit id selection is unaffected by a filter change by
-   *   design — those are photographs the reader pointed at, and a filter that
-   *   silently emptied a hand-picked selection would be worse than the staleness
-   *   it is avoiding.
+   *   `media`, not by clearing anything: `selectionStale` is what the deletion guard
+   *   reads, so the deletion is refused until the reader re-snapshots with ⌘A or
+   *   clears it with Esc. `deleteSelection` says which of those two it wants, because
+   *   with no bar there is nothing else to say it. An explicit id selection is
+   *   unaffected by a filter change by design — those are photographs the reader
+   *   pointed at, and a filter that silently emptied a hand-picked selection would be
+   *   worse than the staleness it is avoiding.
    *
    * Unlike the album chips, clicking the pressed chip does **not** clear the
    * filter: "All" is a real bucket with its own meaning rather than the absence
@@ -1078,7 +1074,6 @@
     if (state.media === next) return;
     state.media = next;
     renderMediaBar();
-    updateSelectionBar();
     if (state.groups.active) resetGroupsWindow();
     scheduleReload(0);
   }
@@ -1108,7 +1103,6 @@
       state.album = next;
     }
     renderAlbumBar();
-    updateSelectionBar();
     // Similar Groups is filtered by the same album, so it is reloaded here too. The
     // generation is bumped rather than the window merely cleared: a page for the
     // previous album still in flight would otherwise splice itself into the new
@@ -1537,7 +1531,6 @@
     });
     refreshAllPhotosTiles();
     refreshGroups();
-    updateSelectionBar();
   }
 
   /**
@@ -1819,6 +1812,7 @@
     // it runs, and the menu's own fields are cleared by that close. Anything a
     // closure needs has to be bound while the menu is still open.
     const targets = tileMenuTargets();
+    const deleteCount = menuDeleteCount(targets);
     // One item, not two, and never greyed: whether "this is already a favourite"
     // is a question with an answer, so the menu answers it rather than showing
     // both possibilities and disabling one. "Any target is a favourite" is the
@@ -1876,7 +1870,7 @@
         // held back to take out again, so there is no second item here: what the
         // server did is reported once, in the toast.
         label: 'Delete',
-        hint: `${fmt.count(targets.length)} ${fmt.plural(targets.length, mediaNoun(), `${mediaNoun()}s`)}`,
+        hint: `${fmt.count(deleteCount)} ${fmt.plural(deleteCount, mediaNoun(), `${mediaNoun()}s`)}`,
         disabled: false,
         run: () => deletePhotos({ mode: 'ids', ids: targets }),
       },
@@ -2005,6 +1999,27 @@
     if (selection.mode !== 'ids' || selection.ids.size === 0) return [row.id];
     if (!isSelected(row.id)) return [row.id];
     return [...selection.ids];
+  }
+
+  /**
+   * How many photos the menu's Delete would destroy, in the most honest count there is.
+   *
+   * When the menu's targets *are* the selection — the clicked photo is one of them and
+   * the selection is a list of ids — the server's own resolved count is the answer, and
+   * it is a different number from the client's list whenever a protected favourite or a
+   * photo that has left the library is in it. That count used to be printed on the
+   * bar's button, which is gone; this is where it survives, on the item that starts a
+   * deletion of more than one photo.
+   *
+   * Anything else — one photo, or a photo outside the selection — is a set the server
+   * has resolved nothing about, and the client's own list is all there is to count.
+   */
+  function menuDeleteCount(targets) {
+    const selection = state.selection;
+    const isWholeSelection = selection.mode === 'ids'
+      && targets.length === selection.ids.size
+      && targets.every((id) => selection.ids.has(id));
+    return isWholeSelection && selection.resolved > 0 ? selection.resolved : targets.length;
   }
 
   /**
@@ -2222,7 +2237,6 @@
     // state, so a second press would ask for the change it had just made.
     for (const group of state.groups.rows) patch(groupItems(group));
     refreshTilesById(wanted);
-    updateSelectionBar();
     return ids;
   }
 
@@ -2414,121 +2428,36 @@
       const spec = selectionSpec();
       if (spec.mode === 'ids' && spec.ids.length === 0) {
         clearResolved(selection);
-        updateSelectionBar();
         return;
       }
       const { ok, payload } = await api.post('/api/selection/preview', spec);
       if (token !== state.previewToken) return; // a newer selection won
       if (!ok) {
-        // A failed resolution counts as no resolution. Leaving the previous
-        // selection's numbers in place would leave the Delete button armed over a
-        // set whose count nobody has confirmed, and would carry the old
-        // fingerprint into the next deletion — which the server would refuse, so
-        // the press would fail rather than delete, but with a count on the button
-        // that belonged to a selection the reader has already moved on from.
+        // A failed resolution counts as no resolution: `canDeleteSelection` reads
+        // `resolved`, so an unresolved selection cannot be destroyed at all, and the
+        // old fingerprint must go with the numbers — the server would refuse it, so
+        // the press would fail rather than delete, but for a reason that belonged to
+        // a selection the reader has already moved on from.
         clearResolved(selection);
-        updateSelectionBar();
         toast('Could not resolve the selection — ' + errorText(payload, 'the server refused'), 'error');
         return;
       }
+      // `resolved` is the guard's clause. The other three are the server's answer
+      // about the set and are reported *after* a deletion now rather than beside a
+      // count before it — `deletePhotos` reads them off the deletion's own report, so
+      // nothing here is the only place a reader could learn them; parsing them anyway
+      // is what keeps this client's idea of the selection the server's.
       selection.resolved = Number(payload.resolved) || 0;
       selection.protectedFavorites = Number(payload.protectedFavorites) || 0;
       selection.unknownIdentifiers = Number(payload.unknownIdentifiers) || 0;
       selection.truncated = payload.truncated === true;
       selection.confirmToken = typeof payload.confirmToken === 'string' ? payload.confirmToken : '';
-      updateSelectionBar();
     }, SELECTION_PREVIEW_DEBOUNCE_MS);
   }
 
   function errorText(payload, fallback) {
     if (payload && typeof payload.error === 'string' && payload.error) return payload.error;
     return fallback;
-  }
-
-  function updateSelectionBar() {
-    const selection = state.selection;
-    const summary = $('selectionSummary');
-    const stale = selectionStale();
-    summary.replaceChildren();
-
-    const emphasize = (count) => {
-      const strong = document.createElement('span');
-      strong.className = 'emphasis';
-      strong.textContent = fmt.count(count);
-      return strong;
-    };
-
-    if (stale) {
-      summary.appendChild(document.createTextNode('Selection is out of date'));
-      summary.appendChild(document.createTextNode(' — the filter changed after you selected every match. Nothing has changed about what would be deleted until you say so.'));
-      $('clearSelection').disabled = false;
-      $('selectAllMatching').textContent = 'Update selection to current filter';
-      $('selectAllMatching').disabled = false;
-      $('selectionHint').textContent = 'Deletion is blocked: the saved filter is no longer the filter on screen.';
-      // The Delete button's state is owned entirely by `updateDeleteButton`,
-      // which knows about the selection and about whether a deletion is in
-      // flight. Calling it here rather than setting `disabled` by hand is what
-      // keeps one function the only writer of that property.
-      updateDeleteButton();
-      return;
-    }
-
-    $('selectAllMatching').textContent = selection.mode === 'matching'
-      ? 'Select all matching again'
-      : 'Select all matching';
-    $('selectAllMatching').disabled = !boundsUsable();
-
-    // What the selection actually holds, named by the media filter in force.
-    // A set snapshotted under "Photos" can only be photos, so saying "asset"
-    // there would be the safe-but-vague choice; but on the default mixed view it
-    // would be a falsehood in the other direction, so the noun follows the filter.
-    const noun = mediaNoun();
-    if (selection.mode === 'matching') {
-      summary.appendChild(document.createTextNode(selection.truncated ? 'Up to ' : 'All '));
-      summary.appendChild(emphasize(selection.resolved));
-      summary.appendChild(document.createTextNode(
-        ` ${fmt.plural(selection.resolved, `${noun} matches`, `${noun}s match`)} the saved filter`));
-      // "Up to" rather than "All" when the server capped the resolution: the count
-      // is then a ceiling, and the sentence has to read as one.
-      $('selectionHint').textContent = selection.truncated
-        ? `More ${noun}s match than PhotoCleaner will resolve at once`
-          + ' · ⌘-click one to exclude it'
-        : `⌘-click a ${noun} to exclude it · This covers every match, not just the loaded page`;
-    } else if (selection.ids.size > 0) {
-      summary.appendChild(emphasize(selection.ids.size));
-      summary.appendChild(document.createTextNode(
-        ` ${fmt.plural(selection.ids.size, noun, `${noun}s`)} selected`));
-      $('selectionHint').textContent = 'Click to select · ⌘-click to add · Shift-click for a range · ⌫ or Delete deletes the selection';
-    } else {
-      summary.appendChild(document.createTextNode('Nothing selected'));
-      $('selectionHint').textContent = 'Click to select · ⌘-click to add · Shift-click for a range · ⌫ or Delete deletes the selection';
-    }
-
-    // The two reasons the button's count can be lower than the bar's, stated where
-    // the bar is: one is a setting the reader can see and turn off, and the other
-    // is a photo that has left the library since the page that named it was
-    // loaded. Neither is left for the reader to reconcile on their own.
-    const shortfalls = [];
-    if (selection.protectedFavorites > 0) {
-      shortfalls.push(`${fmt.count(selection.protectedFavorites)} protected `
-        + `${fmt.plural(selection.protectedFavorites, 'favorite', 'favorites')} excluded`);
-    }
-    if (selection.unknownIdentifiers > 0) {
-      shortfalls.push(`${fmt.count(selection.unknownIdentifiers)} no longer in `
-        + 'PhotoCleaner');
-    }
-    if (shortfalls.length) {
-      const note = document.createElement('span');
-      note.className = 'muted';
-      note.style.marginLeft = '10px';
-      note.textContent = `· ${shortfalls.join(' · ')}`;
-      summary.appendChild(note);
-    }
-
-    // The Delete button destroys whatever is selected, so its state is a function
-    // of the selection and of whether a deletion is already in flight.
-    updateDeleteButton();
-    $('clearSelection').disabled = !selectionHasContent();
   }
 
   /**
@@ -2555,7 +2484,6 @@
   function clearSelection() {
     state.selection = emptySelection();
     refreshAllTiles();
-    updateSelectionBar();
   }
 
   /* --------------------------------------------------------------- delete UI */
@@ -2595,15 +2523,16 @@
   /**
    * Whether the selection may be destroyed right now.
    *
-   * One predicate, read by both the button's label and the action behind it, so
-   * the three can never disagree: what the button says it will destroy, what it
-   * lets you press, and what the keyboard does are the same question asked once.
+   * One predicate, read by the action behind ⌫ and by nothing else — the bar is gone,
+   * so there is no label or enabled state left for it to disagree with — and it is
+   * still the whole rule, so the refusal can be explained by asking it which clause
+   * failed rather than by re-deciding the question (`explainDeleteRefusal`).
    *
-   * `resolved > 0` is the load-bearing clause. The count comes from the server,
-   * so until that answer has landed the client does not know how many photos a
-   * press would destroy — and a deletion of unknown size is the one this button
-   * refuses rather than guesses at, exactly as it would if the server could not
-   * resolve the selection at all.
+   * `resolved > 0` is the load-bearing clause. The count comes from the server, so
+   * until that answer has landed the client does not know how many photos a press
+   * would destroy — and a deletion of unknown size is the one this refuses rather
+   * than guesses at, exactly as it would if the server could not resolve the
+   * selection at all.
    */
   function canDeleteSelection() {
     return !state.deleting
@@ -2613,50 +2542,35 @@
   }
 
   /**
-   * Repaints the Delete button.
+   * Why a deletion did not go ahead, in the words of whichever clause refused it.
    *
-   * One state, because there is only one step: the button destroys the selection
-   * now. The count on it is the server's own answer from
-   * `/api/selection/preview`, because it is the last thing read before an
-   * irreversible act and it must not be a number this client guessed. Favourites
-   * held back by protection are already out of it, so "Delete 12 photos" means
-   * twelve photos go.
+   * The bar used to carry this: a disabled button whose title said the selection was
+   * stale or whose label had not been born yet. With no bar, ⌫ over a selection this
+   * client cannot vouch for must not look like a key that does nothing — and the two
+   * ways out of that state are named, because they are the two gestures the reader has
+   * (`⌘A` re-snapshots the filter, `Esc` clears).
    */
-  function updateDeleteButton() {
-    const button = $('deleteButton');
-    if (state.deleting) {
-      button.disabled = true;
-      button.textContent = 'Deleting…';
-      button.title = 'Sending the deletion to Photos.';
+  function explainDeleteRefusal() {
+    if (state.deleting) return; // a deletion is already in flight; nothing to explain
+    if (selectionStale()) {
+      toast('The selection is out of date — the filter changed after you selected every '
+            + 'match. Press ⌘A to select the current filter, or Esc to clear it.', 'warning');
       return;
     }
-    const count = state.selection.resolved;
-    const live = canDeleteSelection();
-    button.disabled = !live;
-    // The noun follows the media filter, because this button is about to delete
-    // whatever the selection resolved to — and on the default mixed view that can
-    // be clips as well as photos. "Delete 4 photos" over a set that includes two
-    // videos is a miscount of what is about to be destroyed.
-    const noun = mediaNoun();
-    button.textContent = live
-      ? `Delete ${fmt.count(count)} ${fmt.plural(count, noun, `${noun}s`)}`
-      : 'Delete';
-    button.title = selectionStale()
-      ? 'Blocked: the saved filter is no longer the filter on screen.'
-      : 'Delete the selection through Photos. This cannot be undone.';
+    toast('Still counting the selection — try again in a moment.', 'info');
   }
 
   /**
    * Destroys whatever is selected, carrying the fingerprint the preview produced.
    *
-   * This is the one path that offers a `confirmToken`, and it is the one where it
-   * earns its keep: the bar is where a large count is printed, and the token is
-   * what makes that count binding. If the library resolves to something else by
-   * the time the button is pressed, the server refuses rather than destroying a
-   * set nobody was shown.
+   * This is the one path that offers a `confirmToken`, and it is the one where it earns
+   * its keep: a "select all matching" selection is a filter resolved on the server, and
+   * the token is what makes the count it resolved binding. If the library resolves to
+   * something else by the time the key is pressed, the server refuses rather than
+   * destroying a set nobody was shown.
    */
   function deleteSelection() {
-    if (!canDeleteSelection()) return;
+    if (!canDeleteSelection()) { explainDeleteRefusal(); return; }
     const spec = selectionSpec();
     if (state.selection.confirmToken) spec.confirmToken = state.selection.confirmToken;
     deletePhotos(spec);
@@ -2679,7 +2593,6 @@
     if (state.deleting) return;
     if (!spec || (spec.mode === 'ids' && (!spec.ids || spec.ids.length === 0))) return;
     state.deleting = true;
-    updateDeleteButton();
 
     const { ok, payload } = await api.post('/api/delete', spec);
     state.deleting = false;
@@ -2702,7 +2615,6 @@
       // the button becomes the server's current answer instead of the one the
       // refusal was about, and the user can decide again on a fresh count.
       refreshSelectionPreview();
-      updateDeleteButton();
       return;
     }
 
@@ -2761,6 +2673,12 @@
       toast('PhotoCleaner has not scored anything yet, so there is no timeline to show.', 'warning');
       return false;
     }
+    // Switching a view gives up the selection. A selection is a set of photographs the
+    // reader built while looking at something, and the next view is a different set of
+    // questions about them — carrying it across is how a photo ends up inside a
+    // deletion nobody meant to include it in. The same line is in the three other
+    // transitions below; the selection is made on one surface and lives on that one.
+    clearSelection();
     // The score grid is about to be hidden, so a menu anchored to a tile in it
     // would be left floating over a view it no longer belongs to.
     closeTileMenu();
@@ -2802,8 +2720,6 @@
     $('allPhotosBar').hidden = false;
     $('allPhotosView').hidden = false;
     $('allPhotosDays').replaceChildren();
-    $('selectionHint').textContent =
-      'Same selection as the grid · ⌘-click to add · Shift-click for a range · ⌫ deletes the selection · Esc goes back';
     window.scrollTo(0, 0);
     renderAllPhotosBar();
     renderAllPhotosStatus();
@@ -2852,6 +2768,7 @@
   function closeAllPhotos() {
     const all = state.all;
     if (!all.active) return;
+    clearSelection();
     closeLightbox();
     // The window is about to be torn down, so a menu anchored to one of its
     // tiles goes with it.
@@ -2869,7 +2786,6 @@
     $('sentinel').hidden = false;
     renderEmptyState();
     updateLoadMore();
-    updateSelectionBar();
     // Force the grid back into flow before scrolling: `scrollTo` is clamped to
     // the current document height, which is only correct once the layout is done.
     void $('grid').offsetHeight;
@@ -4404,7 +4320,6 @@
     // whenever the favourite flag does — including from the tile menu and the
     // lightbox, without a reload.
     renderEmptyState();
-    updateSelectionBar();
   }
 
   /** Reflects server-side settings without fighting the user mid-click. */
@@ -4755,7 +4670,6 @@
       state.pinned = false;
       followObservedBounds();
       syncRangeUI();
-      updateSelectionBar();
       scheduleReload(0);
     });
 
@@ -4808,13 +4722,10 @@
       toast('Re-queueing failed and unavailable assets…');
     });
 
-    $('selectAllMatching').addEventListener('click', () => selectAllMatching());
-    $('clearSelection').addEventListener('click', () => clearSelection());
     // One button, one meaning: it destroys the selection now. There is no modifier
     // to hold and no second step to reach, because the count it carries is the
     // server's own and the server refuses the deletion if that count no longer
     // holds — the safety lives where it can be enforced, not in a chord.
-    $('deleteButton').addEventListener('click', () => deleteSelection());
 
     $('loadMoreButton').addEventListener('click', () => loadNextPage());
 
@@ -4978,6 +4889,22 @@
         return;
       }
 
+      // ⌘A selects every photo the current filter matches — the snapshot the bar's
+      // "Select all matching" button used to make, and the same set the server counts
+      // and fingerprints before a deletion is allowed to carry it. `preventDefault`
+      // because without it the browser selects the page's *text*, which is not what
+      // "all" means here, and only from the grid's own surface: inside the preview
+      // the selection is not what a deletion would act on.
+      if ((event.key === 'a' || event.key === 'A') && event.metaKey && !event.ctrlKey
+          && !event.altKey && !state.lightbox.open) {
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || !/^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) {
+          event.preventDefault();
+          selectAllMatching();
+          return;
+        }
+      }
+
       // Delete and Backspace destroy the selection — with or without a modifier,
       // because on a Mac keyboard the "delete" key *is* Backspace, and ⌘⌫ is the
       // same gesture spelled with the wrong arrow. There is no ⌥⌫ variant and no
@@ -5017,11 +4944,18 @@
         && target instanceof HTMLElement
         && target.closest('#lightboxVideo') !== null;
       if (event.key === 'Escape') {
-        // Lightbox first, then whichever secondary view is open: the same "one level
-        // back per press" rule the rest of the interface already follows.
+        // Lightbox first, then whichever secondary view is open, and only then the
+        // selection: the same "one level back per press" rule the rest of the
+        // interface already follows. The selection is a level of its own — it is made
+        // by clicks and it is the thing a deletion would destroy — so it is given up
+        // by this key rather than by a control somewhere.
         if (state.lightbox.open) { closeLightbox(); return; }
+        const inAnotherView = state.all.active || state.groups.active;
         if (state.all.active) closeAllPhotos();
         if (state.groups.active) closeGroups();
+        // Only from the grid, and only when there is something to give up: pressing
+        // Esc to leave a view must not also reach past it into the selection.
+        if (!inAnotherView && selectionHasContent()) clearSelection();
         return;
       }
       if (onClipControls) return;
@@ -5180,6 +5114,7 @@
     // Already showing the list, and no group named: the button the user pressed is
     // asking for what is on screen.
     if (state.groups.active && !groupId) return;
+    clearSelection(); // a selection belongs to the view it was made in — see openAllPhotos
     // Reached from inside the group view itself — a cell in the list. Back then
     // belongs to the list, and the place to come back to is where it was, so the
     // context is replaced rather than stacked.
@@ -5313,6 +5248,7 @@
    */
   async function closeGroups({ leave = false } = {}) {
     if (!state.groups.active) return;
+    clearSelection();
     const back = {
       view: state.groups.returnView,
       scrollY: state.groups.returnScrollY,
@@ -5386,7 +5322,6 @@
     window.scrollTo(0, back.scrollY);
     updateLoadMore();
     renderEmptyState();
-    updateSelectionBar();
     requestAnimationFrame(() => {
       // Focus first, with scrolling suppressed, then place the scroll — the other
       // order lets `focus()` win and undo the restore.
@@ -6217,9 +6152,6 @@
     // field, so the first paint has to come from the one place they agree on.
     renderMediaBar();
     wireControls();
-    // One call: `updateSelectionBar` ends by repainting the Delete button, and it
-    // is the only writer of that button's state.
-    updateSelectionBar();
     syncRangeUI();
     renderEmptyState();
     // One status fetch for the first paint; everything after that arrives over

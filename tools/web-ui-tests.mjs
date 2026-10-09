@@ -48,6 +48,13 @@ function clickTile(app, id) {
   tile.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
 }
 
+/** The grid tile for `id`. `CSS.escape` is the window's, not this runner's. */
+function tileBy(app, id) {
+  const tile = app.window.document.querySelector(`#grid .tile[data-id="${app.window.CSS.escape(id)}"]`);
+  assert(tile, `no tile for ${id}`);
+  return tile;
+}
+
 /**
  * Clicks the tile whose data-id is `id` with ⌘ held, which is how a second photo is
  * added to a selection — a plain click replaces it.
@@ -139,25 +146,41 @@ async function serverFingerprint(spec) {
   return (await response.json()).confirmToken;
 }
 
-await check('there is no delete list, and no second control beside Delete', async (app) => {
-  assertEqual(app.$('deleteList'), null, 'the panel element is still in index.html');
-  assertEqual(app.$('deleteListCommit'), null, 'the Commit button is still in index.html');
-  assertEqual(app.$('clearTrash'), null, 'a Clear-list button is still in index.html');
-  assert(/deleteButton(?!\w)/.test(app.$('selectionBar').innerHTML), 'the Delete button moved out of the bar');
+await check('there is no selection bar, and nothing in it survived under a new id', async (app) => {
+  // The bar carried the count, the Delete button, "Select all matching", "Clear
+  // selection" and the gesture hint. All five are gone: ⌘A selects every match, Esc
+  // gives the selection up, ⌫ destroys it, and a right-click on a photo destroys that
+  // one. Asserted on the ids *and* on the container, because a control that survives
+  // under a new name is the regression this is here to catch.
+  for (const id of ['selectionBar', 'selectionSummary', 'selectionHint', 'deleteButton',
+                    'selectAllMatching', 'clearSelection']) {
+    assertEqual(app.$(id), null, `#${id} is still in index.html`);
+  }
+  assertEqual(app.window.document.querySelector('.selection-bar'), null,
+    'a selection bar is still rendered');
 });
 
-await check('Delete is armed with the count the server resolved', async (app) => {
+await check('the menu\'s Delete carries the count the server resolved for the selection', async (app) => {
+  // This is where the count survives now that the bar is gone: the item that starts a
+  // deletion of more than one photo prints it. Asked of the server rather than read off
+  // the client, so it asserts the *resolved* number and not one this client counted —
+  // protection and photos that have left the library are already out of the server's.
   const [first, second] = app.tileIds();
   clickTile(app, first);
   cmdClickTile(app, second); // ⌘ adds the second: a plain click would replace the first
-  await app.settle(500);
-  const button = app.$('deleteButton');
-  assertEqual(button.disabled, false, 'the button was disabled with a selection present');
-  // "assets", not "photos": the default media filter admits both, so the noun the
-  // button prints has to be able to name a clip. Asserting "photos" here would be
-  // asserting the inaccuracy.
-  assertEqual(button.textContent, 'Delete 2 assets',
-    'the button does not carry the count the server resolved');
+  await app.settle(600);
+
+  const items = await openMenuOn(app, tileBy(app, first));
+  const item = items.find((entry) => entry.label === 'Delete');
+  assert(item, 'the menu no longer offers Delete');
+
+  const response = await fetch(`${base}/api/selection/preview`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'ids', ids: [first, second] }),
+  });
+  const resolved = (await response.json()).resolved;
+  assertEqual(item.hint, `${resolved} ${resolved === 1 ? 'asset' : 'assets'}`,
+    'the menu printed a count the server did not resolve for that set');
 });
 
 await check('a plain click replaces the selection, and ⌘-click adds to it', async (app) => {
@@ -166,80 +189,141 @@ await check('a plain click replaces the selection, and ⌘-click adds to it', as
   // because the count is what a deletion is authorised against.
   const [first, second, third] = app.tileIds();
   assert(third, 'this page has fewer than three photos on it');
-  const summary = () => app.$('selectionSummary').textContent;
   const marked = () => [...app.window.document.querySelectorAll('#grid .tile.selected')]
-    .map((tile) => tile.dataset.id);
+    .map((tile) => tile.dataset.id).sort();
 
   clickTile(app, first);
-  await app.settle(400);
-  assert(/1 asset selected/.test(summary()), `a click did not select exactly one: ${summary()}`);
+  await app.settle(300);
+  assertEqual(marked(), [first], 'a click did not select exactly one photo');
 
   // ⌘ adds a photo that is not a neighbour — the whole point of the modifier.
   cmdClickTile(app, second);
-  await app.settle(400);
-  assert(/2 assets selected/.test(summary()), `⌘-click did not add: ${summary()}`);
-  assertEqual(marked().sort(), [first, second].sort(), 'the marks do not agree with the count');
+  await app.settle(300);
+  assertEqual(marked(), [first, second].sort(), '⌘-click did not add the second photo');
 
   // …and takes it away again, which is the same modifier meaning the same thing.
   cmdClickTile(app, second);
-  await app.settle(400);
-  assert(/1 asset selected/.test(summary()), `⌘-click did not remove: ${summary()}`);
+  await app.settle(300);
+  assertEqual(marked(), [first], '⌘-click did not take the second photo back out');
 
-  // A plain click is a fresh selection, not another addition: what is left selected
-  // is the photo that was clicked and nothing else.
+  // A plain click is a fresh selection, not another addition.
   cmdClickTile(app, second);
-  await app.settle(400);
+  await app.settle(300);
   clickTile(app, third);
-  await app.settle(400);
-  assert(/1 asset selected/.test(summary()), `a plain click kept the old selection: ${summary()}`);
-  assertEqual(marked(), [third], 'the wrong photo was left selected');
+  await app.settle(300);
+  assertEqual(marked(), [third], 'a plain click did not leave only the photo it clicked');
 });
 
-await check('a plain click replaces a "select all matching" snapshot', async (app) => {
-  // The risky reading of the same rule, and the one worth pinning: the set *is* a
+await check('⌘A selects every match, and a plain click replaces that snapshot', async (app) => {
+  // The risky reading of the click rule, and the one worth pinning: the set *is* a
   // filter here, so "select only this one" has to take the filter, the exclusions and
-  // the resolved count with it — a click that left the snapshot underneath would have
-  // the bar counting a set the reader is no longer looking at.
-  app.click('selectAllMatching');
+  // the resolved count with it. Observed through the deletion, which is the only thing
+  // the selection is *for*: after the click, ⌫ must carry one id and not a filter.
+  const sent = interceptDeletes(app);
+  app.key('a', { metaKey: true });
   await app.settle(700);
-  const snapshot = app.$('selectionSummary').textContent;
-  assert(!/^1 asset/.test(snapshot), `"select all matching" selected one asset: ${snapshot}`);
+  // Every *loaded* tile is marked, which is the point: the set is the filter, and what
+  // the reader can see of it is the page in front of them. (What it covers beyond that
+  // page is the server's answer, and the deletion is where that shows.)
+  assert(app.window.document.querySelectorAll('#grid .tile.selected').length > 0,
+    '⌘A marked nothing at all');
 
   const [tile] = app.tileIds();
   clickTile(app, tile);
   await app.settle(700);
-  assert(/1 asset selected/.test(app.$('selectionSummary').textContent),
-    `a click did not replace the snapshot with one photo: ${app.$('selectionSummary').textContent}`);
   assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 1,
     'the grid still marks more than the one photo that was clicked');
+
+  app.key('Backspace');
+  await app.settle(600);
+  assertEqual(sent.length, 1, 'the deletion did not go out');
+  assertEqual(sent[0].mode, 'ids', 'the click left the selection filter-shaped');
+  assertEqual(sent[0].ids, [tile], 'the deletion did not carry the one photo that was clicked');
 });
 
-await check('the count is the resolved one, and it is singular for one photo', async (app) => {
-  clickTile(app, app.tileIds()[0]);
+await check('⌘A selects every match, and Esc gives the selection up', async (app) => {
+  const sent = interceptDeletes(app);
+  // ⌘A is a filter-shaped selection, so it marks no tiles — what it covers is the
+  // server's own answer, and the deletion is where that shows. What this pins is the
+  // pairing: the key that makes the set, and the key that gives it up.
+  const selectAll = new app.window.KeyboardEvent('keydown',
+    { key: 'a', metaKey: true, bubbles: true, cancelable: true });
+  app.window.document.dispatchEvent(selectAll);
+  await app.settle(700);
+  assert(selectAll.defaultPrevented,
+    '⌘A was not claimed, so the browser would have selected the page text instead');
+  assert(app.window.document.querySelectorAll('#grid .tile.selected').length > 0,
+    '⌘A selected nothing');
+
+  app.key('Escape');
   await app.settle(500);
-  assert(/^Delete 1 asset$/.test(app.$('deleteButton').textContent),
-    `wrong singular/plural or count: ${app.$('deleteButton').textContent}`);
+  app.key('Backspace');
+  await app.settle(400);
+  assertEqual(sent.length, 0, 'Esc did not clear the ⌘A selection');
 });
 
-await check('Delete with nothing selected is inert, not armed over an empty set', async (app) => {
-  assertEqual(app.$('deleteButton').disabled, true, 'the button was live with nothing selected');
-  assertEqual(app.$('deleteButton').textContent, 'Delete', 'the button printed a count for nothing');
+await check('switching a view gives up the selection', async (app) => {
+  // A selection is a set of photographs built while looking at one thing, and the next
+  // view is a different set of questions about them: carrying it across is how a photo
+  // ends up inside a deletion nobody meant to include it in. Asserted through the
+  // deletion, because that is the only thing a selection is for.
+  const sent = interceptDeletes(app);
+  const [id] = app.tileIds();
+  clickTile(app, id);
+  await app.settle(300);
+  assert(tileBy(app, id).classList.contains('selected'), 'nothing was selected to begin with');
+
+  const card = await openGroups(app);
+  assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 0,
+    'the selection survived into the group view');
+
+  // And a selection made *inside* the group view does not survive the way back.
+  const cell = cellAt(app, card, 1);
+  cell.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  await app.settle(300);
+  assert(cell.classList.contains('selected'), 'the cell was not selected');
+  app.click('groupsBack');
+  await app.settle(700);
+  assertEqual(app.$('groupsView').hidden, true, 'the group view did not close');
+  app.key('Backspace');
+  await app.settle(500);
+  assertEqual(sent.length, 0, 'a selection made in another view was destroyed from this one');
 });
 
-await check('clicking Delete sends the selection to /api/delete, with a fingerprint', async (app) => {
+await check('the count is singular for one photo', async (app) => {
+  const [tile] = app.tileIds();
+  clickTile(app, tile);
+  await app.settle(600);
+  const items = await openMenuOn(app, tileBy(app, tile));
+  const item = items.find((entry) => entry.label === 'Delete');
+  // "assets", not "photos": the default media filter admits both, so the noun has to
+  // be able to name a clip. Asserting "photos" here would be asserting the inaccuracy.
+  assertEqual(item.hint, '1 asset', `wrong singular or count on the menu item: ${item.hint}`);
+});
+
+await check('⌫ with nothing selected destroys nothing', async (app) => {
+  const sent = interceptDeletes(app);
+  assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 0,
+    'something is selected before the key is pressed');
+  app.key('Backspace');
+  await app.settle(400);
+  assertEqual(sent.length, 0, 'a deletion went out with nothing selected');
+});
+
+await check('⌫ sends the selection to /api/delete, with a fingerprint', async (app) => {
   const sent = interceptDeletes(app);
   const [first, second] = app.tileIds();
   clickTile(app, first);
   cmdClickTile(app, second);
-  await app.settle(500);
-
-  app.click('deleteButton');
   await app.settle(600);
-  assertEqual(sent.length, 1, `Delete destroyed nothing (${sent.length} requests)`);
+
+  app.key('Backspace');
+  await app.settle(600);
+  assertEqual(sent.length, 1, `⌫ destroyed nothing (${sent.length} requests)`);
   assertEqual(sent[0].mode, 'ids', 'the request was not an explicit set of identifiers');
   assertEqual([...sent[0].ids].sort(), [first, second].sort(), 'the request did not carry the selection');
   assert(typeof sent[0].confirmToken === 'string' && sent[0].confirmToken.length > 0,
-    'the deletion carried no fingerprint, so the count on the button was not binding');
+    'the deletion carried no fingerprint, so the count it was authorised against was not binding');
 });
 
 await check('the fingerprint is the one the server resolved for that set', async (app) => {
@@ -249,47 +333,51 @@ await check('the fingerprint is the one the server resolved for that set', async
   const sent = interceptDeletes(app);
   const target = app.tileIds()[0];
   clickTile(app, target);
-  await app.settle(500);
+  await app.settle(600);
 
-  app.click('deleteButton');
+  app.key('Backspace');
   await app.settle(600);
   assertEqual(sent.length, 1, 'the deletion did not go out');
   assertEqual(sent[0].confirmToken, await serverFingerprint({ mode: 'ids', ids: [target] }),
     'the deletion carried a fingerprint the preview never produced');
 });
 
-await check('nothing is destroyed before the count is known', async (app) => {
+await check('nothing is destroyed before the count is known, and the key says so', async (app) => {
   const sent = interceptDeletes(app);
   const target = app.tileIds()[0];
   clickTile(app, target);
-  // The preview is debounced, so the button has not been resolved yet. Both the
-  // click and the keystroke must do nothing: this client cannot say how many
-  // photos it would destroy, so it does not destroy any.
-  assertEqual(app.$('deleteButton').disabled, true, 'the button was armed before the count arrived');
-  app.click('deleteButton');
+  // The preview is debounced, so the count has not landed yet. The press must do
+  // nothing — this client cannot say how many photos it would destroy, so it does not
+  // destroy any — and, with no bar to be disabled, it has to *say* that rather than
+  // look like a key that does not work.
   app.key('Backspace');
-  await app.settle(600);
+  await app.settle(300);
   assertEqual(sent.length, 0, 'a press destroyed photos before the count was known');
+  assert(/Still counting the selection/.test(app.$('toast').textContent),
+    `the refusal was silent: ${app.$('toast').textContent}`);
+
+  // …and the same key works as soon as the server has answered.
+  await app.settle(700);
+  app.key('Backspace');
   await app.settle(500);
-  assertEqual(app.$('deleteButton').disabled, false, 'the button never became live once resolved');
+  assertEqual(sent.length, 1, 'the deletion never became possible once the count resolved');
 });
 
-await check('⌫ deletes the selection, exactly as the button does', async (app) => {
+await check('⌫ deletes the selection, and the menu deletes the photo it was opened on', async (app) => {
   const sent = interceptDeletes(app);
   const target = app.tileIds()[0];
   clickTile(app, target);
-  await app.settle(500);
+  await app.settle(600);
   app.key('Backspace');
   await app.settle(600);
-  assertEqual(sent.length, 1, `⌘⌫ destroyed nothing (${sent.length} requests)`);
+  assertEqual(sent.length, 1, `⌫ destroyed nothing (${sent.length} requests)`);
   assertEqual(sent[0].ids, [target], 'the deletion did not carry the selection');
 });
 
-await check('a stale "all matching" selection cannot be deleted', async (app) => {
+await check('a stale "all matching" selection cannot be deleted, and ⌫ says why', async (app) => {
   const sent = interceptDeletes(app);
-  app.click('selectAllMatching');
-  await app.settle(600);
-  assertEqual(app.$('deleteButton').disabled, false, 'the button was dead with a resolvable selection');
+  app.key('a', { metaKey: true });
+  await app.settle(700);
 
   // Moving a bound is what makes the snapshot stale: the saved filter is no longer
   // the filter on screen, so "all" would now mean something else entirely.
@@ -297,11 +385,20 @@ await check('a stale "all matching" selection cannot be deleted', async (app) =>
   lower.value = String(Math.min(Number(lower.max), Number(lower.value) + 25));
   lower.dispatchEvent(new app.window.Event('input', { bubbles: true }));
   await app.settle(700);
-  assertEqual(app.$('deleteButton').disabled, true, 'the button was live over a stale selection');
-  app.click('deleteButton');
   app.key('Backspace');
-  await app.settle(600);
+  await app.settle(500);
   assertEqual(sent.length, 0, 'a stale selection was destroyed anyway');
+  assert(/out of date/.test(app.$('toast').textContent),
+    `the refusal did not say the selection was stale: ${app.$('toast').textContent}`);
+
+  // Esc gives it up, which is one of the two ways out the message names.
+  app.key('Escape');
+  await app.settle(500);
+  assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 0,
+    'Esc did not clear the selection');
+  app.key('Backspace');
+  await app.settle(400);
+  assertEqual(sent.length, 0, 'something was deleted after the selection was cleared');
 });
 
 console.log('preview: space is a toggle');
@@ -323,16 +420,15 @@ await check('Space no longer toggles the selection', async (app) => {
   const tile = app.window.document.querySelector('#grid .tile');
   tile.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
   await app.settle(150);
-  const summary = app.$('selectionSummary').textContent;
-  assert(/Nothing selected/.test(summary), `Space selected the photo instead of previewing it: ${summary}`);
+  assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 0,
+    'Space selected the photo instead of previewing it');
 });
 
 await check('click selects, double-click previews', async (app) => {
   const tile = app.window.document.querySelector('#grid .tile');
   tile.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true }));
-  await app.settle(120);
-  assert(!/Nothing selected/.test(app.$('selectionSummary').textContent),
-    'a single click did not select');
+  await app.settle(300);
+  assert(tile.classList.contains('selected'), 'a single click did not select the photo');
   assertEqual(app.$('lightbox').hidden, true, 'a single click opened the preview');
 
   tile.dispatchEvent(new app.window.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
@@ -1164,8 +1260,8 @@ await check('one click on a group cell selects instead of previewing', async (ap
   assertEqual(app.$('lightbox').hidden, true, 'a single click opened the preview');
   assert(cell.classList.contains('selected'), 'the clicked cell is not marked as selected');
   assertEqual(cell.getAttribute('aria-pressed'), 'true', 'the cell was not announced as selected');
-  assert(/1 asset selected/.test(app.$('selectionSummary').textContent),
-    `the selection bar did not count it: ${app.$('selectionSummary').textContent}`);
+  assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 0,
+    'a group cell marked a grid tile as selected');
 });
 
 await check('double click on a group cell opens the preview', async (app) => {
@@ -1240,11 +1336,10 @@ await check('shift-clicking a group cell selects the range between', async (app)
   last.dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: true }));
   await app.settle(250);
 
-  // "assets": the noun follows the media filter, and the default is "all", which
-  // admits clips as well as photographs. Group *members* are always stills today,
-  // but the bar counts what the selection resolved to rather than what a group is.
-  const summary = app.$('selectionSummary').textContent;
-  assert(/4 assets selected/.test(summary), `the range selected the wrong span: ${summary}`);
+  // Asserted on the marks, which is where a selection is visible now that the bar is
+  // gone: exactly the four cells between the two clicks, and nothing outside them.
+  assertEqual(card.querySelectorAll('.group-cell.selected').length, 4,
+    'the range did not select exactly the four cells between its ends');
   for (const index of [1, 2, 3, 4]) {
     assert(cellAt(app, card, index).classList.contains('selected'),
       `rank ${index + 1} is in the range but is not marked`);
@@ -1736,7 +1831,7 @@ await check('the chips follow the server\'s echo, not the click that asked', asy
     'the Videos chip is still marked as the filter in force');
 });
 
-await check('"Select all matching" pins the media dimension in the snapshot', async (app) => {
+await check('⌘A pins the filter it snapshotted, media dimension included', async (app) => {
   // The load-bearing safety property, and it is on the wire, not in the client's
   // head. The snapshot is what `/api/selection/preview` resolves and what
   // `/api/delete` re-resolves, so a snapshot missing `media` resolves to every
@@ -1750,7 +1845,7 @@ await check('"Select all matching" pins the media dimension in the snapshot', as
     if (path.endsWith('/api/selection/preview')) sent.push(JSON.parse(init.body || '{}'));
     return real(input, init);
   };
-  app.click('selectAllMatching');
+  app.key('a', { metaKey: true });
   // Poll for the request rather than sleeping a fixed interval. How long the
   // videos-filtered grid took to render depends on how many clips are scored and
   // how long the server takes to answer, and a fixed sleep that is long enough on
@@ -1769,18 +1864,17 @@ await check('"Select all matching" pins the media dimension in the snapshot', as
 
 await check('a snapshot taken under one media filter cannot be deleted under another', async (app) => {
   // The failure this exists to prevent: a selection snapshotted on a
-  // videos-filtered grid, then the reader switches to Photos, and the Delete
-  // button is still live over a set nobody agreed to.
+  // videos-filtered grid, then the reader switches to Photos, and a press still
+  // destroys a set nobody agreed to. A *view* switch clears the selection outright
+  // (`openAllPhotos` and its three siblings); a *filter* switch does not, and this is
+  // the check that says the two are different answers on purpose.
   const sent = interceptDeletes(app);
   await showVideos(app);
-  app.click('selectAllMatching');
+  app.key('a', { metaKey: true });
   await app.settle(700);
-  assertEqual(app.$('deleteButton').disabled, false, 'the button was dead with a resolvable selection');
 
   app.click('#mediaChips [data-media="images"]');
   await app.settle(700);
-  assertEqual(app.$('deleteButton').disabled, true, 'the button was live over a stale selection');
-  app.click('deleteButton');
   app.key('Backspace');
   await app.settle(600);
   assertEqual(sent.length, 0, 'a selection was destroyed under a different media filter');
@@ -1995,8 +2089,8 @@ await check('Space still toggles the preview on a clip tile, and Enter still ope
   tile.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
   await app.settle(300);
   assertEqual(app.$('lightbox').hidden, false, 'Space did not open the preview on a clip tile');
-  assert(/Nothing selected/.test(app.$('selectionSummary').textContent),
-    `Space selected the clip instead of previewing it: ${app.$('selectionSummary').textContent}`);
+  assertEqual(app.window.document.querySelectorAll('#grid .tile.selected').length, 0,
+    'Space selected the clip instead of previewing it');
 
   app.key(' ');
   await app.settle(300);

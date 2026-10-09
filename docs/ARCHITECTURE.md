@@ -710,14 +710,15 @@ bug, not a cleanup.
   DOM the events never fire at all. Every timer must have a cap, or a failed or silent
   async step leaves an element stranded on screen.
 - **A fresh count must never sit beside a stale token.** The selection holds the
-  `confirmToken` from the `/api/selection/preview` that produced the count printed on the
-  Delete button, and presents it on the deletion. With no staged list in between, the
+  `confirmToken` from the `/api/selection/preview` that resolved it, and presents it on
+  the deletion. With no staged list in between, the
   window is short — but it is the only thing standing between the count the user read
   and the set that is destroyed, so wherever a count is re-read (favourite protection
   toggled, a 409 refusal) the token has to be replaced in the same moment. A fresh
   number beside a stale token is a deletion that refuses itself; a stale number beside a
   fresh token is the failure this exists to prevent.
-- **Delete is the one control, and its guard is the resolved count.** `canDeleteSelection`
+- **A selection is the one thing a deletion acts on, and its guard is the resolved
+  count.** `canDeleteSelection`
   is read by the label, by the enabled state and by the keyboard alike, so the three
   cannot disagree. It requires `selection.resolved > 0`, which means the button is dead
   until the server has said how many photos a press would destroy — a deletion of
@@ -832,15 +833,27 @@ bug, not a cleanup.
   held down replaces the selection with it. The two modifiers are the two ways of
   *adding*, which is why the plain click is the one that cannot surprise: in a tool whose
   selection is a list of photographs about to be destroyed, a mis-click must not leave a
-  photo inside the set the bar counts. ⌘ and not ⌃ — ⌃-click is the platform's own
+  photo inside the set a deletion would destroy. ⌘ and not ⌃ — ⌃-click is the platform's own
   secondary click, and this client needs that for the context menu. The grid, All Photos
   and the group strips share the function and pass their own anchor accessors, because a
   second copy of this rule is a second answer to "what will Delete destroy".
 - **A plain click replaces a "select all matching" snapshot outright.** The snapshot sets
   `mode: 'matching'`; a click sets a fresh `emptySelection()` with one id, which drops the
   mode, the saved filter, the exclusions and the resolved count together. Leaving the
-  snapshot underneath would have the bar counting a set the reader is no longer looking
-  at — and the count is the thing a deletion is authorised against.
+  snapshot underneath would leave a deletion authorised against a set the reader is no
+  longer looking at.
+- **There is no selection bar, and nothing else carries a selection's state.** The bar's
+  count, its Delete button, "Select all matching", "Clear selection" and its gesture hint
+  were all removed on purpose: the selection is made by clicks and by `⌘A`, given up by
+  `Esc` and by leaving the view it was made in, and destroyed by `⌫` or by a menu item
+  that prints the count it will destroy. The one guarantee that had to survive the bar is
+  the count-before-the-act one, and it did, in two places: `canDeleteSelection` still
+  refuses an unresolved selection (`explainDeleteRefusal` says so, and which way out),
+  and `menuDeleteCount` prints the server's *resolved* number on the item that starts a
+  deletion of more than one photo — the only count read before an irreversible act now
+  that the bar is gone. The All Photos window and the group strips clear the selection on
+  the way in and on the way out, because a selection is a set of photographs built while
+  looking at one thing.
 - **Zoom belongs to the photograph, not to the view.** Paging resets it instantly (the
   reader did not ask for that change), closing resets it *before* the return travel starts
   (a shrinking photo underneath the copy flying the other way is two motions at once),
@@ -913,8 +926,8 @@ bug, not a cleanup.
 - No way to re-score the whole library. `analysisPixelSize` is exposed read-only over
   HTTP precisely so it cannot trigger a full run.
 - No writing to the Photos library other than deletions you ask for. Deletion is one
-  step: the Delete button, `⌫` or `Delete`, a tile menu's item and the preview's own
-  button all build a *spec* and send it to `/api/delete` through one function. Nothing
+  step: `⌫` or `Delete`, a tile menu's item and the preview's own button all build a
+  *spec* and send it to `/api/delete` through one function. Nothing
   else in the app calls that route. There is no staged list and no undo — the deletion
   goes to Recently Deleted, and the server refuses it outright if the set no longer
   resolves to the fingerprint the count was printed with.

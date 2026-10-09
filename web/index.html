@@ -251,21 +251,6 @@
 <div class="sentinel" id="sentinel" aria-hidden="true"></div>
 <div class="load-more" id="loadMore" hidden><button class="ghost" id="loadMoreButton">Load more</button></div>
 
-<footer class="selection-bar" id="selectionBar">
-  <!-- One control, one step: this button destroys the selection now, labelled with
-       the count the server itself resolved so the number read is the number that
-       goes. It is the only control that calls /api/delete. Nothing is held back
-       between choosing and doing, so there is no list, no panel and no undo. -->
-  <div class="selection-summary" id="selectionSummary" aria-live="polite">Nothing selected</div>
-  <div class="selection-hint" id="selectionHint">Click to select · ⌘-click to add · Shift-click for a range · ⌫ or Delete deletes the selection</div>
-  <div class="selection-actions">
-    <button class="ghost" id="selectAllMatching">Select all matching</button>
-    <button class="ghost" id="clearSelection" disabled>Clear selection</button>
-    <button class="danger" id="deleteButton" disabled
-            title="Delete the selection through Photos. This cannot be undone.">Delete</button>
-  </div>
-</footer>
-
 <!-- The tile context menu. One instance, reused: a right-click while one is open
      re-anchors it rather than leaving two on screen. Items are built in JS so
      they can be enabled, disabled and relabelled per photo; the container and
