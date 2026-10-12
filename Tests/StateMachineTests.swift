@@ -64,7 +64,7 @@ func registerStateMachineTests() {
         let fixture = try await Fixture.make("sm-record")
         try await fixture.seed([.init(id: "a", score: nil, date: 1, state: .pending)])
         _ = try await fixture.cache.claimJobs(limit: 1)
-        try await fixture.cache.record(score: -0.9959, for: "a")
+        try await fixture.cache.record(score: -0.9959, faceDefinition: nil, for: "a")
 
         checkEqual(try await fixture.analysisState(of: "a"), .done, "state")
         let row = checkNotNil(try await fixture.cache.photo(identifier: "a"), "the completed row")
@@ -243,7 +243,7 @@ func registerStateMachineTests() {
         let record = ScanRecord(identifier: "a", mediaType: 1, creationDate: 100, modificationDate: 500,
                                 width: 10, height: 10, favorite: false, mediaSubtype: 0, isScreenshot: false)
         try await fixture.cache.upsert(batch: [record], marker: 1)
-        try await fixture.cache.record(score: 0.25, for: "a")
+        try await fixture.cache.record(score: 0.25, faceDefinition: nil, for: "a")
         let scoredAt = checkNotNil(try await fixture.scoredAt(of: "a"), "scored_at before")
 
         try await fixture.cache.beginScan()
@@ -260,7 +260,7 @@ func registerStateMachineTests() {
                                                           modificationDate: 500, width: 10, height: 10,
                                                           favorite: false, mediaSubtype: 0, isScreenshot: false)],
                                        marker: 1)
-        try await fixture.cache.record(score: 0.25, for: "a")
+        try await fixture.cache.record(score: 0.25, faceDefinition: nil, for: "a")
 
         try await fixture.cache.upsert(batch: [ScanRecord(identifier: "a", mediaType: 1, creationDate: 100,
                                                           modificationDate: 900, width: 12, height: 12,
@@ -374,7 +374,7 @@ func registerStateMachineTests() {
             .init(id: "d", score: nil, date: 4, state: .unavailable),
         ])
         _ = try await fixture.cache.claimJobs(limit: 1)
-        try await fixture.cache.record(score: 0.1, for: "b")
+        try await fixture.cache.record(score: 0.1, faceDefinition: nil, for: "b")
         let distinct = try fixture.query("SELECT DISTINCT analysis_state FROM assets;") { statement -> [String] in
             var values: [String] = []
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -409,7 +409,7 @@ func registerStateMachineTests() {
             checkEqual(counts.values.reduce(0, +), stats.total, "\(label): the per-state counts add up to the total")
         }
         try await identity("after seeding")
-        try await fixture.cache.record(score: 0.2, for: "a-1")
+        try await fixture.cache.record(score: 0.2, faceDefinition: nil, for: "a-1")
         try await identity("after a completion")
         try await fixture.cache.recordFailure(for: "p-1", error: "boom")
         try await identity("after a failure")

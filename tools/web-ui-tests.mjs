@@ -1952,6 +1952,115 @@ await check('a snapshot taken under one media filter cannot be deleted under ano
   assertEqual(sent.length, 0, 'a selection was destroyed under a different media filter');
 });
 
+console.log('face definition: the second range is a real filter');
+
+/**
+ * The definition slider is dead until the first face is
+ * measured — the same cold start the score slider has — so
+ * the cases poll for it rather than sleeping.
+ */
+async function definitionUsable(app) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await app.settle(250);
+    if (!app.$('definitionLowerRange').disabled) return true;
+  }
+  return false;
+}
+
+await check('the definition row starts off, over observed bounds it did not choose', async (app) => {
+  assert(app.$('definitionRow'), 'there is no face definition control at all');
+  assert(await definitionUsable(app), 'the definition slider never became usable');
+  assertEqual(app.$('definitionReadout').textContent, 'all faces',
+    'the definition filter is on before anyone touched it');
+  assertEqual(app.$('definitionLowerRange').value, '0',
+    'an untouched definition slider does not rest at the observed minimum');
+  assertEqual(app.$('definitionUpperRange').value, '1000',
+    'an untouched definition slider does not rest at the observed maximum');
+});
+
+await check('dragging a handle sends the range, and Reset takes it back off', async (app) => {
+  assert(await definitionUsable(app), 'the definition slider never became usable');
+  const asked = [];
+  const real = app.window.fetch;
+  app.window.fetch = async (input, init) => {
+    const url = new URL(typeof input === 'string' ? input : input.url, app.window.location.href);
+    if (url.pathname.endsWith('/api/photos')) {
+      asked.push({
+        lo: url.searchParams.get('faceDefLo'),
+        hi: url.searchParams.get('faceDefHi'),
+      });
+    }
+    return real(input, init);
+  };
+
+  // Off sends nothing: absent means "no constraint", which is
+  // what keeps face-free photos on the grid. The Reset is
+  // clicked first to force a page through the interceptor —
+  // it is a no-op on an already-off filter.
+  app.click('#resetDefinition');
+  await app.settle(700);
+  assert(asked.length > 0, 'no page was requested');
+  assert(asked.every((p) => p.lo === null && p.hi === null),
+    `a page carried a definition filter nobody asked for: ${JSON.stringify(asked)}`);
+
+  // One drag on the lower handle pins the range, and the
+  // request carries both bounds — the range is one statement
+  // about one interval, never a single number. Polled, not
+  // slept: the drag's reload is debounced and the grid may
+  // be mid-page, so a fixed interval that suffices on a warm
+  // machine is a flake on a slow one.
+  const lower = app.$('definitionLowerRange');
+  lower.value = String(Math.min(Number(lower.max), Number(lower.value) + 25));
+  lower.dispatchEvent(new app.window.Event('input', { bubbles: true }));
+  for (let attempt = 0; attempt < 40 && asked[asked.length - 1]?.lo == null; attempt += 1) {
+    await app.settle(100);
+  }
+  const dragged = asked[asked.length - 1];
+  assert(dragged && dragged.lo !== null && dragged.hi !== null,
+    `the drag sent no definition range: ${JSON.stringify(asked.slice(-3))}`);
+  assert(Number(dragged.lo) <= Number(dragged.hi), 'the range arrived inverted');
+  assert(!/all faces/.test(app.$('definitionReadout').textContent),
+    `the readout still said the filter was off: ${app.$('definitionReadout').textContent}`);
+
+  // Reset un-pins, and the very next request carries no
+  // definition bounds at all — polled for the same reason.
+  app.click('#resetDefinition');
+  for (let attempt = 0; attempt < 40 && asked[asked.length - 1]?.lo != null; attempt += 1) {
+    await app.settle(100);
+  }
+  const reset = asked[asked.length - 1];
+  assertEqual(reset.lo, null, 'the range survived a Reset');
+  assertEqual(reset.hi, null, 'the range survived a Reset');
+  assertEqual(app.$('definitionReadout').textContent, 'all faces',
+    'the readout did not return to the off state');
+});
+
+await check('⌘A pins the face-definition range it snapshotted', async (app) => {
+  // The load-bearing safety property, on the wire: a snapshot
+  // taken on a definition-filtered grid that omitted the range
+  // would resolve against every photo in the score range —
+  // face-free ones included.
+  assert(await definitionUsable(app), 'the definition slider never became usable');
+  const lower = app.$('definitionLowerRange');
+  lower.value = String(Math.min(Number(lower.max), Number(lower.value) + 25));
+  lower.dispatchEvent(new app.window.Event('input', { bubbles: true }));
+  await app.settle(700);
+
+  const sent = [];
+  const real = app.window.fetch;
+  app.window.fetch = async (input, init) => {
+    const path = new URL(typeof input === 'string' ? input : input.url, app.window.location.href).pathname;
+    if (path.endsWith('/api/selection/preview')) sent.push(JSON.parse(init.body || '{}'));
+    return real(input, init);
+  };
+  app.key('a', { metaKey: true });
+  for (let attempt = 0; attempt < 40 && sent.length === 0; attempt += 1) await app.settle(100);
+
+  assertEqual(sent.length, 1, `the selection was not resolved (${sent.length} requests)`);
+  assert(sent[0].filter.faceDefLo !== undefined && sent[0].filter.faceDefHi !== undefined,
+    'the snapshot did not pin the face-definition dimension');
+});
+
 console.log('video: a tile is never mistaken for a photograph');
 
 await check('a clip\'s tile says what it is, where the tile no longer prints it', async (app) => {

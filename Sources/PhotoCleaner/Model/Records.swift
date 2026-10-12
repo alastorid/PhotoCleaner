@@ -287,6 +287,26 @@ struct PhotoFilter: Sendable, Equatable {
     /// pre-existing construction site, and every timeline route that builds the
     /// widest filter it can, keeps its exact old meaning.
     var media: MediaSelection = .all
+    /// The Face definition range the grid admits, or `nil` when the
+    /// filter is off.
+    ///
+    /// Two optionals that always travel together, set by the one
+    /// dual-handle slider that measures them. `nil` is the *off*
+    /// state, deliberately not a full observed range: a photo with
+    /// no measurable face has no definition at all, so any range —
+    /// even the whole observed one — would exclude every face-free
+    /// photo, and the default state of the grid must keep showing
+    /// every scored asset. The client keeps the two states apart
+    /// with its own "has the user dragged a handle" flag, and the
+    /// server refuses a half-set range at the parse rather than
+    /// interpreting one.
+    var faceDefinitionLower: Float? = nil
+    var faceDefinitionUpper: Float? = nil
+
+    /// Whether the Face definition filter is in force: both bounds
+    /// present. The parse guarantees they are present together, so
+    /// this is a state check, not a validation.
+    var hasFaceDefinitionFilter: Bool { faceDefinitionLower != nil && faceDefinitionUpper != nil }
     /// Set by the read-only timeline routes, which deliberately build the widest
     /// filter the cache can express out of the *observed* score extremes. Those
     /// extremes move as analysis progresses, so folding the live bounds into a
@@ -322,14 +342,24 @@ struct PhotoFilter: Sendable, Equatable {
         // that survived a media change would page a selection into the videos the
         // user had just filtered away. See `MediaSelection.fingerprint`.
         let dimensions = "fav:\(favorites.rawValue)|\(album.fingerprint)|\(media.fingerprint)"
+        // The definition bounds are part of the identity for the same
+        // reason the score bounds are: a token minted on a grid filtered
+        // to well-defined faces pages a selection into a different set of
+        // rows than the same question with the filter off. Off is part of
+        // the identity too, so a token from an unfiltered grid cannot be
+        // replayed against a filtered one — the two state the same query
+        // only when both say "off".
+        let definition = hasFaceDefinitionFilter
+            ? "def:\(faceDefinitionLower!.bitPattern)|\(faceDefinitionUpper!.bitPattern)"
+            : "def:off"
         if unboundedByScore {
             // The timeline's bound is "every asset that has a score", which is the
             // same query no matter where the observed extremes currently sit.
-            return "timeline:scored|\(dimensions)"
+            return "timeline:scored|\(definition)|\(dimensions)"
         }
         let low = lower.bitPattern
         let high = upper.bitPattern
-        return "lo:\(low)|hi:\(high)|\(dimensions)"
+        return "lo:\(low)|hi:\(high)|\(definition)|\(dimensions)"
     }
 }
 

@@ -23,7 +23,8 @@ Two rules govern everything below:
 Apple Photos ──PhotoKit──► PhotoLibrary ──► AnalysisEngine (4 bounded workers)
                               │  │                │
                               │  │                ├─► VisionAnalyzer (aesthetics
-                              │  │                │   + FeaturePrint + face quality)
+                              │  │                │   + FeaturePrint + face quality
+                              │  │                │   + face definition)
                               │  │                └─► CacheStore (SQLite actor)
                               │  │
                               │  ├─► VideoLibrary (clips: frames, export, playback)
@@ -217,14 +218,14 @@ Line Tools reinstall steps instead of a module dump.
 
 ## 3. Data model
 
-One SQLite database, schema version 5, in Application Support. Migration is
+One SQLite database, schema version 6, in Application Support. Migration is
 additive and idempotent: every step is `IF NOT EXISTS` or
 `addColumnIfMissing`, nothing is dropped or rewritten, and no existing row changes
 meaning, so an older cache upgrades in place.
 
 | Table | Holds |
 |---|---|
-| `assets` | one row per asset: media type, dates, dimensions, favourite, screenshot flag, clip duration (`NULL` for a still), aesthetics score, analysis state, attempts, last error, `scored_at`, analyzer version |
+| `assets` | one row per asset: media type, dates, dimensions, favourite, screenshot flag, clip duration (`NULL` for a still), aesthetics score, face-definition score, analysis state, attempts, last error, `scored_at`, analyzer version |
 | `asset_signals` | one row per (asset, signal kind) — FeaturePrint and per-face capture quality, zlib-compressed behind a one-byte codec marker |
 | `albums` / `asset_albums` | user-album membership, many-to-many. `asset_albums`' primary key *is* the index for the filter's correlated `EXISTS`, and it makes duplicate membership impossible. Foreign keys cascade, so a deletion takes its album rows with it. |
 | `similar_groups` / `similar_group_members` | materialised groups plus the settings they were built under, so "stale" can be told from "built with different rules" |
@@ -306,6 +307,14 @@ GET  /api/timeline/page
   SQL rather than bound. `claimJobs` takes the same shape as `IN (1, 2)` for the
   mirror-image reason: `!= 1` would start scoring an asset whose media type is
   `audio` or `unknown`, which this pass has no way to produce frames for.
+- **Face definition widens the parameter budget.** With the definition range
+  active the score bounds are still `?1`/`?2`, the album `?3`, and the
+  definition bounds take `?4`/`?5`; the keyset then starts at `?6` (no
+  cursor) or `?6`–`?8` with a `?9` limit (cursor). `whereSQLClause`,
+  `bindFilter`, `page()` and `identifiers(matching:)` move together — a
+  filter dimension that forgets one of them either binds the wrong index or
+  splices two sets into one list. The bounds are part of the pagination
+  fingerprint like every other dimension.
 
 ---
 
@@ -324,7 +333,10 @@ exactly the "one bad moment aborts the pass" failure the shared path avoids.
 
 **A clip's score is a median, and it has no vector.** `analyzeFrames` takes the median
 of the per-frame scores and returns `nil` for the FeaturePrint whenever there was more
-than one frame. Both facts are one function because "no vector for a clip" is a
+than one frame. It also measures **face definition** per frame and keeps the median of
+the frames that have a face — a clip's definition is the median over the frames where
+one could be measured, `nil` when no frame yielded one. Both facts are one function
+because "no vector for a clip" is a
 property of what a clip *is*, not of which pass is running. A clip can be deleted,
 filtered, sorted and previewed; it can never be a group member.
 
@@ -415,6 +427,43 @@ is never retried, which is the wrong fate for an asset nothing was learned about
 call, duplicated for fMP4 playback — and is *not* bounded. A clip whose request goes
 unanswered parks an HTTP handler rather than an analysis worker, which is a stalled
 player instead of a stalled pass.
+
+### 5.5 Face definition: relative detail, not rank
+
+`FaceDefinition` measures how much detail a face's **own pixels** carry:
+contrast-normalized Laplacian energy over the face's interior, discounted
+by the fraction of the interior that is native flat blocks (a blurred or
+compressed-away region carries no energy to begin with), then discounted
+by the uncertainty of the landmark placement the interior was measured
+through. It is a statement about **sharpness and pixel integrity at the
+face's own scale** — nothing about size, position, or identity.
+
+**All faces are compared at one scale.** The measurement runs on the same
+1024 px analysis frame the aesthetics score runs on, because "the same
+scale" is the contract that makes two faces' numbers comparable: a face
+measured at its native size would score higher merely for being larger.
+The interior is the bounding box shrunk by 20% on each side, so the
+hairline, jaw edge and background at the border do not vote.
+
+**Landmarks verify the detection; they do not grade it.**
+`DetectFaceLandmarksRequest(.revision3)` runs with the already-computed
+`inputFaceObservations`, and a face whose landmarks do not land inside
+its own box is treated as an uncertain placement and discounted — not
+dropped. The score is a *relative detail estimate*, so an uncertain
+measurement is worth less, never zero by fiat.
+
+**Definition is an optional signal.** A face that cannot be measured
+contributes nothing and fails nothing: `analyzeFrames` keeps the median
+of the frames that yielded a definition, `nil` when none did, and only
+cancellation propagates. The grid filter is the only consumer, and a
+photo with no measured definition is *outside* any set range — visible
+with the filter off, hidden with it on, never claimed as low-quality.
+
+**It is deliberately not a Best Shot input.** Best Shot ranks within a
+group on unit-free ranks; definition answers a different question ("how
+much detail is here?") for a different surface (the grid's filter), and
+mixing it into the group ordering would make the strip's order a lie
+about what the group is.
 
 ---
 
@@ -652,6 +701,17 @@ bug, not a cleanup.
 - **Never normalise, clamp or hard-code the score range.** `overallScore` is not
   0…1; the slider's limits come from `MIN`/`MAX(aesthetics_score)`.
 - **A FeaturePrint distance must never enter a quality score.** See §6.
+- **Face definition is relative detail — never size, position or identity.**
+  See §5.5: the same face measured at a larger scale must not score
+  higher for being larger, so the measurement always runs on the shared
+  analysis frame, and the interior excludes the box's border.
+- **Definition is an optional signal.** A face that cannot be measured
+  contributes nothing and fails nothing; only cancellation propagates.
+  A photo with no measured definition is outside any set range and
+  never counted as low-quality.
+- **Definition never enters Best Shot.** See §5.5: it answers the
+  filter's question, not the group's, and mixing it into the strip's
+  order would make that order a lie.
 - **Face capture quality is capture quality, not attractiveness.** See §6.2.
 - **Best Shot must not delete anything.** See §6.3.
 - **Group sizes are bounded** — `maximumGroupSize` and the chronological split exist
@@ -975,7 +1035,7 @@ improve either same-shot grouping or within-group ordering.
 |---|---|
 | image registration (translational, homographic) | a second-stage test for pairs already close in both time and distance, to tell "same shot" from "merely similar scene". Only worth adding if grouping shows false merges. |
 | saliency (attention / objectness) | compares *framing* between captures. Contextual only — never another score to add to the rank. |
-| face landmarks | supporting information at most, and only for near-identical portrait frames. |
+| face landmarks | supporting information at most, and only for near-identical portrait frames. (One narrow use exists outside grouping: `DetectFaceLandmarksRequest` verifies a face's placement for the definition filter — §5.5 — and nothing else.) |
 | lens-smudge detection | a technical capture penalty that could become a Best Shot adjustment. Must never affect grouping. |
 | human/hand pose, animal recognition, OCR, foreground masks, object tracking, optical flow, trajectories, contours | nothing showed they improve grouping or ordering. |
 
@@ -1133,9 +1193,13 @@ executable, because SwiftPM does not work here.
    itself reports pass, fail and known-bug counts. It covers selection resolution,
    the count contract, favourite protection, keyset pagination over tied values, the
    analysis state machine, HTTP parsing and single-response latching, timeline
-   ordering, confirm tokens, albums, similar groups, schema migration, the Photos
-   authorization gate, self-update, the icon, the window's launch-flag parsing,
-   shutdown relay and navigation policy, and — since schema version 5 — the video
+   ordering, confirm tokens, albums, similar groups, schema migration, the
+   Photos authorization gate, self-update, the icon, the window's
+   launch-flag parsing,
+   shutdown relay and navigation policy, face definition (sharpness beats
+   blur at any size, flat and clipped regions, pixelation boundaries,
+   readable features over uncertain placements, invalid landmark evidence),
+   and — since schema version 5 — the video
    route end to end over a real socket: `Range` handling, `206`/`416`, `HEAD`
    framing, keep-alive across a streamed body, the media filter and the
    identifier-before-PhotoKit refusal gate. It needs no Photos library and no network.

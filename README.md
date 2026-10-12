@@ -245,10 +245,14 @@ dependency-free local build can do.)
    still is one frame; a clip is sampled at 10%, 50% and 90% of its duration and
    takes the **median** of those scores. Clips are never grouped — a FeaturePrint
    is a statement about one photograph, not about a moving sequence.
-3. **Filters** by score range. The slider's limits are the **observed** minimum
-   and maximum in your library — the scores are *not* normalised to 0…1, and
-   PhotoCleaner never assumes they are. Drag either handle; **Reset** puts both
-   back on the observed bounds.
+3. **Filters** by score range, and by **face definition**. Each slider's
+   limits are the **observed** minimum and maximum in your library — the
+   scores are *not* normalised to 0…1, and PhotoCleaner never assumes
+   they are. Drag either handle; **Reset** puts both back on the observed
+   bounds. Face definition measures how much detail a face's own pixels
+   carry — a face that reads crisply at its size scores high, a blurred
+   or pixelated one low — so the filter separates sharp portraits from
+   soft ones without touching anything else about the photo.
 4. **Inspects** any photo in a large preview with keyboard navigation
    (`←` / `→`, `Space` to toggle the preview, `Esc` to close), **zoom** (pinch — or
    ⌘-scroll on a mouse — to magnify the photo itself, the panel does not move with
@@ -290,8 +294,9 @@ are looking at everything.
 Score ↑ (lowest first, the default), Score ↓, Newest, Oldest. Odd, dark,
 accidental and duplicated-looking shots surface immediately at the low end.
 
-The control panel reads in the order you use it: **Aesthetics** (the score range),
-then **Album**, then **Media** (All / Photos / Videos) — all three of which
+The control panel reads in the order you use it: **Aesthetics** (the score
+range), then **Face definition** (detail in a face's own pixels), then
+**Album**, then **Media** (All / Photos / Videos) — all four of which
 *narrow* 53,000 assets to something you would actually look at — and then **Sort**
 last, pushed to the far right, because it is the one control that changes no
 membership. It only reorders what is already on screen, so it is the final
@@ -568,7 +573,7 @@ GET  /                            embedded UI
 GET  /app.css, /app.js            the rest of the embedded UI
 GET  /favicon.ico                 204, nothing to serve
 GET  /api/status                  library + analysis status (also pushed over SSE)
-GET  /api/photos                  ?lo&hi&sort&favorites&album&media&limit&cursor&offset
+GET  /api/photos                  ?lo&hi&sort&favorites&album&media&limit&cursor&offset&faceDefLo&faceDefHi
 GET  /api/albums                  the album chips: indexed albums, unassigned count, smart albums
 GET  /api/timeline/around         ?id={anchor}&limit — one page either side of a photo
 GET  /api/timeline/page           ?direction=older|newer&cursor&limit — All Photos paging
@@ -614,6 +619,14 @@ Every `PhotoRow` on the wire carries:
 
 `filter.media` is echoed back on every page response, so a client can tell the
 filter it *asked for* from the one the server *applied*, and renders the latter.
+`filter.faceDefinition` echoes the applied definition range the same way (the
+key is simply absent when the filter is off), and `faceDefinition` on the
+response itself reports the **observed** definition bounds across the filtered
+set — the slider's limits, so the range the UI offers is what the library
+actually holds. `faceDefLo`/`faceDefHi` are accepted together or not at
+all, must be finite and ordered, and are otherwise a **400**; a photo with
+no measured face definition is *outside* any set range (never inside it),
+and still visible with the filter off.
 
 The two `/api/timeline/*` routes are read-only and take no body. They order by
 **date alone** — the score is used only as the widest bound the cache can express,
@@ -655,6 +668,7 @@ Sources/PhotoCleaner/
   Library/VideoLibrary.swift    PhotoKit frames, clip export, playback and the export cache
   Library/VideoStreaming.swift fMP4 re-mux streaming for clips (AVAssetReader/AVAssetWriter)
   Analysis/VisionAnalyzer.swift Apple's aesthetics, FeaturePrint and face requests
+  Analysis/FaceDefinition.swift  relative detail in a face's own pixels
   Analysis/CacheStore.swift     SQLite actor: schema, reconciliation, queries
   Analysis/AnalysisEngine.swift scan + bounded analysis run loop, progress
   Analysis/AlbumIndexer.swift  lazy album membership, one album at a time

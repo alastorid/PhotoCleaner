@@ -316,7 +316,7 @@ final class Fixture: @unchecked Sendable {
             switch asset.state {
             case .done:
                 guard let score = asset.score else { continue }
-                try await cache.record(score: score, for: asset.id)
+                try await cache.record(score: score, faceDefinition: nil, for: asset.id)
             case .failed:
                 // Two attempts: the first returns the row to `pending` (the single
                 // automatic retry), the second parks it in `failed`.

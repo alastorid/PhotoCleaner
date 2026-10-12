@@ -69,20 +69,28 @@ struct VisionAnalyzer: Sendable {
         return AestheticsResult(score: observation.overallScore)
     }
 
-    /// Tier 1: aesthetics *and* FeaturePrint from one decoded image.
+    /// Tier 1: aesthetics, FeaturePrint and face definition from one
+    /// decoded image.
     ///
     /// They run concurrently because they are independent models on the same
     /// pixels, and measured together they cost 7.2 ms against 5.0 ms for
     /// aesthetics alone — far less than the 9.4 ms of running them in sequence.
     /// The image is already decoded for the aesthetics pass, so a FeaturePrint
-    /// costs 2.2 ms of extra wall clock rather than another decode.
+    /// costs 2.2 ms of extra wall clock rather than another decode, and the
+    /// face definition — which reuses the face boxes `DetectFaceCaptureQualityRequest`
+    /// already found — costs its landmark refinement only when a face was
+    /// detected at all.
     ///
     /// A FeaturePrint failure does **not** fail the asset: the aesthetics score is
     /// the primary observation, and a photo that simply has no cached FeaturePrint
     /// is still perfectly browsable — it just cannot join a Similar Group.
-    func analyzeWithFeaturePrint(_ image: CGImage) async throws -> (AestheticsResult, Data?) {
+    /// A face definition failure does not fail it either: definition is a
+    /// filter signal, and a photo with no measurable face simply has none —
+    /// see `FaceDefinition` for what "measurable" means.
+    func analyzeWithFeaturePrint(_ image: CGImage) async throws -> (AestheticsResult, Data?, Float?) {
         async let aesthetics = analyze(image)
         async let featurePrint = featurePrint(image)
+        async let definition = faceDefinition(image)
         let result = try await aesthetics
         let encoded: Data?
         do {
@@ -92,11 +100,16 @@ struct VisionAnalyzer: Sendable {
             encoded = nil
             Log.warn("FeaturePrint unavailable for one asset: \(error)")
         }
-        return (result, encoded)
+        // Cancellation is the one error that escapes: an interrupted run
+        // must not record a half-scored asset. Everything else
+        // `faceDefinition` can meet — no face, an undecodable landmark
+        // pass — is already a `nil` answer rather than an error.
+        return (result, encoded, try await definition)
     }
 
-    /// Scores one asset's frames and returns its score, plus a FeaturePrint when
-    /// — and only when — the subject was a single image.
+    /// Scores one asset's frames and returns its score, the best face's
+    /// definition score, and a FeaturePrint when — and only when — the
+    /// subject was a single image.
     ///
     /// `PhotoLibrary.framesForAnalysis` hands over one frame for a still and one
     /// to three for a clip, and these two rules are why a clip is *not* simply
@@ -154,11 +167,13 @@ struct VisionAnalyzer: Sendable {
     /// other end in `CacheStore.refreshFeaturePrintQueue`, so a video cannot be
     /// given a vector by the backfill pass either.
     ///
-    /// A single frame — a still, or a clip so short that its moments collapse onto
-    /// one — takes the measured `analyzeWithFeaturePrint` path unchanged, including
-    /// running the two models concurrently and treating a FeaturePrint failure as
-    /// a missing vector rather than a failed asset. Exactly one frame is the only
-    /// case where the clip *is* the frame.
+    /// A single frame — a still, or a clip so short that its moments
+    /// collapse onto one — takes the measured `analyzeWithFeaturePrint`
+    /// path unchanged, including running the models concurrently and
+    /// treating a FeaturePrint failure as a missing vector rather than
+    /// a failed asset. Exactly one frame is the only case where the
+    /// clip *is* the frame, and the only case where a definition is
+    /// that frame's own rather than a median over samples.
     ///
     /// ## On failing
     ///
@@ -171,7 +186,7 @@ struct VisionAnalyzer: Sendable {
     /// a three-sample one, and hiding that would be worse than either. Only when
     /// every frame failed is the error rethrown, so a genuinely unanalysable asset
     /// is still reported and the scan is not quietly advancing over it.
-    func analyzeFrames(_ frames: [CGImage]) async throws -> (AestheticsResult, Data?) {
+    func analyzeFrames(_ frames: [CGImage]) async throws -> (AestheticsResult, Data?, Float?) {
         guard let first = frames.first else {
             // Unreachable from `framesForAnalysis`, which documents that it never
             // returns an empty array. Guarded anyway: a median of nothing is not a
@@ -181,30 +196,51 @@ struct VisionAnalyzer: Sendable {
         }
         guard frames.count > 1 else { return try await analyzeWithFeaturePrint(first) }
 
-        let scores = await withTaskGroup(of: Float?.self) { group in
+        // Each sample carries its aesthetics score and, when a face was
+        // measurable in it, that face's definition. A frame with no face
+        // contributes its score and no definition — the median below is
+        // taken over the frames that have one, so a clip of which one
+        // sampled frame is face-free is still a clip with a defined face,
+        // and a clip none of whose samples has a face has none.
+        let samples = await withTaskGroup(of: (Float, Float?)?.self) { group in
             for frame in frames {
                 group.addTask { [self] in
                     // Cancellation propagates through the group's own checks; a
                     // cancelled run must not be scored on the frames that did
                     // finish.
                     if Task.isCancelled { return nil }
-                    return try? await analyze(frame).score
+                    guard let score = try? await analyze(frame).score else { return nil }
+                    // Definition is optional per frame, so a frame whose face
+                    // could not be measured still counts towards the median
+                    // score; `faceDefinition` throws only cancellation, which
+                    // excludes the frame from the definition the same way an
+                    // unreadable one is excluded, without failing the pass.
+                    let definition: Float?
+                    do {
+                        definition = try await faceDefinition(frame)
+                    } catch {
+                        definition = nil
+                    }
+                    return (score, definition)
                 }
             }
-            var collected: [Float] = []
-            for await score in group {
-                if let score { collected.append(score) }
+            var collected: [(Float, Float?)] = []
+            for await sample in group {
+                if let sample { collected.append(sample) }
             }
             return collected
         }
-        guard !scores.isEmpty else {
+        guard !samples.isEmpty else {
             throw VisionAnalyzerError.noObservation("every frame of the clip failed to analyse")
         }
-        if scores.count < frames.count {
-            Log.warn("scored \(scores.count) of \(frames.count) frames; the median is taken over \(scores.count)")
+        if samples.count < frames.count {
+            Log.warn("scored \(samples.count) of \(frames.count) frames; the median is taken over \(samples.count)")
         }
+        let definitions = samples.compactMap { $0.1 }
         // No FeaturePrint: see above.
-        return (AestheticsResult(score: Self.median(of: scores)), nil)
+        return (AestheticsResult(score: Self.median(of: samples.map { $0.0 })),
+                nil,
+                definitions.isEmpty ? nil : Self.median(of: definitions))
     }
 
     /// The median of `values`, ascending. Odd counts take the middle value; even
@@ -256,5 +292,40 @@ struct VisionAnalyzer: Sendable {
         // Sorted largest-first so the "primary" face is `faces.first` without
         // every consumer re-deriving which one that is.
         return FaceCaptureResult(faces: faces.sorted { $0.areaFraction > $1.areaFraction })
+    }
+
+    /// The best face's definition score for one image, or `nil`
+    /// when no face could be measured.
+    ///
+    /// Runs in the ordinary analysis pass, not Tier 3: the filter it
+    /// feeds is a library-wide one, so every scored asset needs the
+    /// signal, and the face boxes come from the same
+    /// `DetectFaceCaptureQualityRequest` the definition refines —
+    /// one detection pass, not two. Measured on the analysis frame
+    /// every other Vision pass in this app runs on, which keeps the
+    /// comparison at one common scale (see `FaceDefinition`).
+    ///
+    /// Never fails an asset. A photo with no detectable face, or one
+    /// whose landmark refinement could not be performed, has no
+    /// definition — the Face definition filter then says nothing
+    /// about it, which is the same answer "no face" has always
+    /// given for face capture quality. Cancellation is the one error
+    /// that escapes, so an interrupted run does not record a
+    /// half-scored asset.
+    func faceDefinition(_ image: CGImage) async throws -> Float? {
+        guard #available(macOS 15.0, *) else { return nil }
+        let request = DetectFaceCaptureQualityRequest(.revision3)
+        let observations: [FaceObservation]
+        do {
+            observations = try await request.perform(on: image)
+        } catch {
+            // Detection is best-effort for this signal: a photo
+            // Vision cannot find a face in has no definition, and
+            // that is an answer about the photo, not a failure of
+            // the analysis.
+            try Task.checkCancellation()
+            return nil
+        }
+        return try await FaceDefinition.evaluate(image, observations: observations)
     }
 }

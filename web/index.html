@@ -93,6 +93,28 @@
             title="Follow the observed minimum and maximum again">Reset</button>
   </div>
 
+  <!-- Face definition is a second, independent dual-range over the
+       observed face-definition scores — how much detail the faces in a
+       photo hold, as measured during analysis. Unlike the score range it
+       is OFF until a handle is dragged: a photo with no face, or none
+       measured, stays visible until the user asks for a range, and
+       "Reset" means "stop filtering" rather than "follow the data".
+       `definition.pinned` is what keeps the two states apart, the same
+       flag the score slider uses for its own unpinned/pinned split. -->
+  <div class="range-row" id="definitionRow">
+    <span class="control-label">Face&nbsp;definition</span>
+    <span class="range-edge" id="definitionMinLabel">—</span>
+    <div class="dual-range" id="definitionDualRange">
+      <div class="range-track"><div class="range-fill" id="definitionFill"></div></div>
+      <input type="range" id="definitionLowerRange" min="0" max="1000" step="1" value="0" aria-label="Lowest face definition">
+      <input type="range" id="definitionUpperRange" min="0" max="1000" step="1" value="1000" aria-label="Highest face definition">
+    </div>
+    <span class="range-edge" id="definitionMaxLabel">—</span>
+    <span class="range-readout" id="definitionReadout">all faces</span>
+    <button class="ghost range-reset" id="resetDefinition"
+            title="Stop filtering by face definition">Reset</button>
+  </div>
+
   <!-- Albums come second, straight after the score range: both are *filters*, and
        they are what narrows 53,000 photos down to something you would actually
        look at. Sort comes last because it is the one control that changes no

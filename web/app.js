@@ -160,6 +160,20 @@
     pinned: false,
     lower: 0,
     upper: 0,
+    /**
+     * Face definition filter, the second dual-range. The bounds are
+     * `null` — and the filter OFF — until a handle is dragged: a
+     * photo with no face, or none measured, stays visible until the
+     * user asks for a range. `pinned` is the one flag that keeps
+     * "off, thumbs resting at the extremes" apart from "on, at the
+     * full range", the same split the score slider's `pinned`
+     * makes; without it a Reset and a never-touched slider would be
+     * indistinguishable, and the grid could not say which one it was
+     * showing.
+     */
+    definition: { lower: null, upper: null, pinned: false },
+    /** Observed face-definition extremes; both `null` until the first face is measured. */
+    observedDefinition: { min: null, max: null },
     
     sort: 'score_asc',
     /**
@@ -510,6 +524,27 @@
     return state.observed.min + (tick / SLIDER_TICKS) * span();
   };
 
+  /**
+   * The definition slider maps the observed definition range
+   * onto the same [0,SLIDER_TICKS] track the score slider
+   * uses, over its own observed extremes. Every helper is the
+   * score one with `observedDefinition` in place of
+   * `observed`: the two sliders are the same control over two
+   * independent measurements, and sharing the code would couple
+   * them — a definition value is not a score, and the ranges
+   * move independently.
+   */
+  const defBoundsUsable = () =>
+    state.observedDefinition.min !== null && state.observedDefinition.max !== null;
+  const defSpan = () => (defBoundsUsable() ? state.observedDefinition.max - state.observedDefinition.min : 0);
+  const defFraction = (value) => (defSpan() > 0 ? (value - state.observedDefinition.min) / defSpan() : 0);
+  const defValueToSlider = (value) => (defSpan() > 0 ? Math.round(defFraction(value) * SLIDER_TICKS) : 0);
+  const defSliderToValue = (tick) => {
+    if (tick <= 0) return state.observedDefinition.min;
+    if (tick >= SLIDER_TICKS) return state.observedDefinition.max;
+    return state.observedDefinition.min + (tick / SLIDER_TICKS) * defSpan();
+  };
+
   function currentFilter() {
     // `album` is part of the filter snapshot exactly as `lo`/`hi` are. Leaving it
     // out would mean "all matching" taken inside an album view silently widened
@@ -523,13 +558,43 @@
     // looking at with Videos filtered out, "Delete 1,204 assets" would be the
     // button they press. The selection is only safe if every dimension that
     // decides membership is one of the things it pins.
+    //
+    // The face-definition range rides the same rule while it is
+    // in force: a selection taken on a grid filtered to
+    // well-defined faces that omitted the range would resolve
+    // against every photo in the score range, face-free ones
+    // included. Absent means the filter is off — the server
+    // applies no definition constraint, and neither does the
+    // snapshot.
     return {
       lo: state.lower,
       hi: state.upper,
       favorites: 'include',
       album: state.album,
       media: state.media,
+      faceDefLo: state.definition.pinned ? state.definition.lower : undefined,
+      faceDefHi: state.definition.pinned ? state.definition.upper : undefined,
     };
+  }
+
+  /**
+   * The face-definition halves of two snapshots are the same
+   * filter exactly when both are off or both are on with the
+   * same bounds. Off-versus-on is never "close enough": the two
+   * states match different photos, so a deletion preview that
+   * treated them as equal would be authorised against a count
+   * the user never saw.
+   */
+  function sameDefinitionFilter(a, b) {
+    if (a.faceDefLo == null && a.faceDefHi == null &&
+        b.faceDefLo == null && b.faceDefHi == null) return true;
+    if (a.faceDefLo == null || a.faceDefHi == null ||
+        b.faceDefLo == null || b.faceDefHi == null) return false;
+    const scale = Math.max(1, Math.abs(a.faceDefLo), Math.abs(a.faceDefHi),
+                           Math.abs(b.faceDefLo), Math.abs(b.faceDefHi));
+    const epsilon = scale * 1e-6;
+    return Math.abs(a.faceDefLo - b.faceDefLo) <= epsilon &&
+      Math.abs(a.faceDefHi - b.faceDefHi) <= epsilon;
   }
 
   function sameFilter(a, b) {
@@ -543,7 +608,8 @@
       // media filter existed has no `media` key at all, and that is `all`, not a
       // filter that no longer matches. A comparison that read absence as a
       // mismatch would block deletion for a selection that is in fact current.
-      (a.media || 'all') === (b.media || 'all');
+      (a.media || 'all') === (b.media || 'all') &&
+      sameDefinitionFilter(a, b);
   }
 
   /**
@@ -726,6 +792,161 @@
     syncRangeUI();
   }
 
+  /**
+   * Paints the face-definition slider. The unpinned state
+   * rests both thumbs at the observed extremes — the
+   * position that says "everything admitted", which is
+   * what "off" means — and the readout says so, so the
+   * two states read differently at a glance instead of
+   * only in the request.
+   */
+  function syncDefinitionUI() {
+    const usable = defBoundsUsable() && defSpan() > 0;
+    const d = state.definition;
+    $('definitionDualRange').classList.toggle('disabled', !usable);
+    $('definitionLowerRange').disabled = !usable;
+    $('definitionUpperRange').disabled = !usable;
+    $('definitionMinLabel').textContent =
+      defBoundsUsable() ? fmt.score(state.observedDefinition.min, 2) : '—';
+    $('definitionMaxLabel').textContent =
+      defBoundsUsable() ? fmt.score(state.observedDefinition.max, 2) : '—';
+
+    if (!usable) {
+      $('definitionFill').style.left = '0px';
+      $('definitionFill').style.width = '0px';
+      $('definitionReadout').textContent = defBoundsUsable()
+        ? 'Only one face definition so far — the range widens as analysis proceeds.'
+        : 'no faces measured yet';
+      return;
+    }
+
+    const lower = d.pinned ? d.lower : state.observedDefinition.min;
+    const upper = d.pinned ? d.upper : state.observedDefinition.max;
+    $('definitionLowerRange').value = String(defValueToSlider(lower));
+    $('definitionUpperRange').value = String(defValueToSlider(upper));
+
+    // The same overlap rule as the score slider: whichever
+    // thumb is above the midpoint is raised, or the lower
+    // one would swallow every drag.
+    const midpoint = state.observedDefinition.min + defSpan() / 2;
+    $('definitionLowerRange').style.zIndex = lower > midpoint ? '3' : '1';
+    $('definitionUpperRange').style.zIndex = lower > midpoint ? '1' : '3';
+
+    // The thumbs are 18px wide and travel inset by 9px at each end of the track.
+    const start = defFraction(lower);
+    const end = defFraction(upper);
+    $('definitionFill').style.left = `calc(9px + (100% - 18px) * ${start})`;
+    $('definitionFill').style.width = `calc((100% - 18px) * ${Math.max(0, end - start)})`;
+
+    $('definitionReadout').textContent = d.pinned
+      ? `${fmt.score(lower, 2)} ≤ DEF ≤ ${fmt.score(upper, 2)}`
+      : 'all faces';
+  }
+
+  /**
+   * Moves one or both face-definition bounds, enforcing the
+   * invariants the API depends on: inside the observed
+   * range, lower ≤ upper, and at least one slider step
+   * wide. The first drag off the unpinned state seeds the
+   * untouched bound at the observed extreme its thumb was
+   * resting on, so one drag makes a one-sided cut ("faces
+   * at least this defined") rather than a point.
+   */
+  function setDefinitionBounds(nextLower, nextUpper) {
+    if (!defBoundsUsable()) return;
+    const d = state.definition;
+    const step = defSpan() > 0 ? defSpan() / SLIDER_TICKS : 0.001;
+    // The untouched bound is null only while unpinned; seed
+    // it from the extreme the corresponding thumb rests on.
+    const previousLower = d.lower ?? state.observedDefinition.min;
+    const previousUpper = d.upper ?? state.observedDefinition.max;
+    let lower = nextLower ?? previousLower;
+    let upper = nextUpper ?? previousUpper;
+    if (lower > upper) [lower, upper] = [upper, lower];
+    if (upper - lower < step) {
+      // Widen against whichever bound the user actually moved. On
+      // the first drag only one argument is non-null, so that is
+      // the moved one by construction.
+      const movedLower = nextLower != null &&
+        (nextUpper == null ||
+         Math.abs(nextLower - previousLower) >= Math.abs(nextUpper - previousUpper));
+      if (movedLower) {
+        lower = upper - step;
+      } else {
+        upper = lower + step;
+      }
+    }
+    d.lower = Math.min(Math.max(lower, state.observedDefinition.min), state.observedDefinition.max);
+    d.upper = Math.min(Math.max(upper, state.observedDefinition.min), state.observedDefinition.max);
+    if (d.upper - d.lower < step) {
+      // The clamp collapsed the window: push the other bound out
+      // by one step rather than serving an empty range.
+      if (d.upper - state.observedDefinition.min >= step) d.lower = d.upper - step;
+      else d.upper = d.lower + step;
+    }
+    d.pinned = true;
+    syncDefinitionUI();
+  }
+
+  /** The observed definition extremes, from the page response. */
+  function adoptObservedDefinitionBounds(observed) {
+    const nextMin = observed && typeof observed.lower === 'number' ? observed.lower : null;
+    const nextMax = observed && typeof observed.upper === 'number' ? observed.upper : null;
+    if (nextMin === null || nextMax === null) {
+      if (state.observedDefinition.min === nextMin &&
+          state.observedDefinition.max === nextMax) return false;
+      state.observedDefinition.min = nextMin;
+      state.observedDefinition.max = nextMax;
+      return true;
+    }
+    const changed = state.observedDefinition.min !== nextMin ||
+      state.observedDefinition.max !== nextMax;
+    state.observedDefinition.min = Math.min(nextMin, nextMax);
+    state.observedDefinition.max = Math.max(nextMin, nextMax);
+    return changed;
+  }
+
+  /**
+   * Whether the filter the client holds now is the one a
+   * page was requested with. `null` is the off state.
+   */
+  function definitionStateMatches(requested) {
+    const d = state.definition;
+    if (requested === null) return !d.pinned;
+    return d.pinned && d.lower === requested.lower && d.upper === requested.upper;
+  }
+
+  /**
+   * Adopts the face-definition range the server applied.
+   *
+   * The echo has exactly one state that must change
+   * something: absent. A server that predates the
+   * parameter has no `faceDefinition` field at all,
+   * so the range the client asked for was ignored
+   * and the grid is not filtered — the filter is
+   * off, whatever the client believes, and the
+   * readout must say so.
+   *
+   * A `null` or range echo is the new server
+   * confirming the request it just served, which by
+   * construction equals the client's own state:
+   * adopting it is a no-op at best, and a response
+   * that predates a drag the client has already made
+   * would undo that drag at worst — the drag's
+   * reload is debounced, so a page requested *before*
+   * the drag is always still in flight when it
+   * happens, and its echo describes the filter as it
+   * was, not as it is now.
+   */
+  function adoptAppliedDefinition(echoed) {
+    if (echoed !== undefined) return false;
+    const d = state.definition;
+    if (!d.pinned && d.lower === null && d.upper === null) return false;
+    state.definition = { lower: null, upper: null, pinned: false };
+    syncDefinitionUI();
+    return true;
+  }
+
   /* --------------------------------------------------------------------- grid */
 
   function scheduleReload(delay = 200) {
@@ -786,6 +1007,16 @@
     // decide that; it just has to not leave the dimension out.
     params.set('album', state.album);
     params.set('media', state.media);
+    // The definition range rides the request only while it is
+    // in force: absent means off, and the server treats an
+    // absent pair as "no constraint" — face-free photos
+    // stay visible. Sending the null bounds instead would be
+    // a different request: `faceDefLo=null` is not a
+    // number, and the server would refuse it.
+    if (state.definition.pinned) {
+      params.set('faceDefLo', String(state.definition.lower));
+      params.set('faceDefHi', String(state.definition.upper));
+    }
     if (cursor) params.set('cursor', cursor);
     return params;
   }
@@ -801,6 +1032,14 @@
     if (state.loading && state.inflightGeneration === generation) return;
     state.loading = true;
     state.inflightGeneration = generation;
+    // The definition filter as this request carries
+    // it, captured before the await: the drag's
+    // reload is debounced, so a page requested
+    // *before* a change is always still in flight
+    // when the change happens.
+    const requestedDefinition = state.definition.pinned
+      ? { lower: state.definition.lower, upper: state.definition.upper }
+      : null;
     try {
       const data = await api.get('/api/photos?' + pageQuery(cursor).toString());
       if (generation !== state.generation) return; // a newer filter owns the grid now
@@ -810,9 +1049,23 @@
       // also the cheapest notice this client gets that it and the server are on
       // different builds; on a later page it would otherwise go unnoticed.
       adoptAppliedMedia(data.filter && data.filter.media);
+      // The definition range the server applied, and the
+      // observed extremes it measured over. Both ride the
+      // same page response the score bounds do; neither
+      // moves the grid on its own — the grid already shows
+      // the server's answer — they only keep the slider and
+      // its readout honest about it. The echo is adopted
+      // only from a page whose request matches the filter
+      // the client holds now: one that predates a drag
+      // describes the filter as it *was*, and adopting it
+      // would undo that drag.
+      const definitionEchoChanged = definitionStateMatches(requestedDefinition)
+        ? adoptAppliedDefinition(data.filter && data.filter.faceDefinition)
+        : false;
+      const definitionBoundsChanged =
+        adoptObservedDefinitionBounds(data.faceDefinition);
+      if (definitionEchoChanged || definitionBoundsChanged) syncDefinitionUI();
       const rows = Array.isArray(data.items) ? data.items : [];
-      state.total = Number(data.total) || 0;
-      state.nextCursor = data.nextCursor || null;
       // Album names for this page only. Kept in a map keyed by identifier rather
       // than on the rows so the rows stay exactly what the cache holds, and so an
       // absent map entry reads as "no name known" rather than "not in an album".
@@ -4652,12 +4905,18 @@
         + 'one frame for a photograph, three for a video. Nothing is shown until the first scores exist, '
         + 'which takes a minute or two for a large library.';
     } else if (state.total === 0) {
-      // The filter, named: "nothing here" has to say *which* nothing, or a Videos
-      // filter that happens to match nothing reads as a library with no videos in
-      // it. Three separate facts produce this one screen — no scores, nothing in
-      // range, or a library of nothing but audio — and only the first is
-      // recoverable by widening.
-      if (state.media === 'videos') {
+      // The filter, named: "nothing here" has to say *which* nothing, or a
+      // filter that happens to match nothing reads as a library with none of
+      // that thing in it. Separate facts produce this one screen — no
+      // scores, nothing in range, or a library of nothing but audio — and
+      // only the first is recoverable by widening. The face-definition
+      // range is named first when it is on, because it is the constraint
+      // the score message does not mention, and its recovery is its own
+      // Reset, not the score one.
+      if (state.definition.pinned) {
+        title = 'No photos match this face-definition range';
+        detail = 'Widen the range, or press “Reset” to stop filtering by face definition.';
+      } else if (state.media === 'videos') {
         title = 'No videos match this score range';
         detail = 'Widen the range, or choose “All” or “Photos” — PhotoCleaner can only show videos it has scored.';
       } else if (state.media === 'images') {
@@ -4754,6 +5013,27 @@
       state.pinned = false;
       followObservedBounds();
       syncRangeUI();
+      scheduleReload(0);
+    });
+
+    // The face-definition slider. Same shape as the score
+    // handlers: a drag moves the bound and re-requests; Reset
+    // un-pins, which for this slider means the filter is off
+    // rather than "follow the data" — there is no data to
+    // follow, only the user's range to stop applying.
+    $('definitionLowerRange').addEventListener('input', (event) => {
+      const value = defSliderToValue(Number(event.target.value));
+      setDefinitionBounds(value, state.definition.upper);
+      scheduleReload();
+    });
+    $('definitionUpperRange').addEventListener('input', (event) => {
+      const value = defSliderToValue(Number(event.target.value));
+      setDefinitionBounds(state.definition.lower, value);
+      scheduleReload();
+    });
+    $('resetDefinition').addEventListener('click', () => {
+      state.definition = { lower: null, upper: null, pinned: false };
+      syncDefinitionUI();
       scheduleReload(0);
     });
 
@@ -6237,6 +6517,7 @@
     renderMediaBar();
     wireControls();
     syncRangeUI();
+    syncDefinitionUI();
     renderEmptyState();
     // One status fetch for the first paint; everything after that arrives over
     // SSE, so the UI never polls.

@@ -298,7 +298,21 @@ struct Router: Sendable {
         let items: [PhotoRow]
         let nextCursor: String?
         let bounds: Bounds
+        /// The observed face-definition range, over the photos that
+        /// have one. `nil` until the first face is measured — the
+        /// Face definition slider then reports "no scores yet"
+        /// rather than a range that is not the data's.
+        let faceDefinition: FaceDefinitionBounds?
         let filter: FilterEcho
+
+        /// One face-definition range, as the server measured it and
+        /// as the client asked for it. The same shape in `bounds`
+        /// (the observed extremes) and `filter` (the range in
+        /// force), so the client renders both with one reader.
+        struct FaceDefinitionBounds: Encodable {
+            let lower: Float
+            let upper: Float
+        }
 
         struct Bounds: Encodable {
             let min: Float?
@@ -323,6 +337,14 @@ struct Router: Sendable {
             /// videos-only grid without one badge. Absent means nothing is filtered,
             /// which is exactly what an older server meant.
             let media: String
+            /// The Face definition range the grid was filtered to, or
+            /// `null` when the filter is off. Echoed for the same
+            /// reason as `album`: the client must be able to tell
+            /// "the range I asked for" from "the range the server
+            /// applied", and the two differ exactly when a request
+            /// was refused — which is also when the client most
+            /// needs to know what is on screen.
+            let faceDefinition: FaceDefinitionBounds?
             /// The albums each row in this page belongs to, keyed by asset
             /// identifier. `[{id, title}]`, so a tag can be rendered *and* filtered
             /// without matching titles back to identifiers. Omitted entirely when
@@ -369,9 +391,30 @@ struct Router: Sendable {
         case .refused(let response): return .response(response)
         case .resolved(let selection): media = selection
         }
+        // The Face definition range is validated rather than
+        // defaulted: the two bounds arrive as one unit from the one
+        // slider that sets them, so a half-set range is a client
+        // bug. Quietly ignoring one half would show a grid the
+        // range readout above it does not describe — the same lie
+        // a refused album prevents.
+        let faceDefinition: PhotosResponse.FaceDefinitionBounds?
+        switch (request.queryFloat("faceDefLo"), request.queryFloat("faceDefHi")) {
+        case (nil, nil):
+            faceDefinition = nil
+        case let (lo?, hi?):
+            guard lo.isFinite, hi.isFinite, lo <= hi else {
+                return .response(.error("invalid face definition range \(lo)…\(hi); faceDefLo must not exceed faceDefHi",
+                                       status: 400))
+            }
+            faceDefinition = PhotosResponse.FaceDefinitionBounds(lower: lo, upper: hi)
+        default:
+            return .response(.error("face definition range needs both faceDefLo and faceDefHi", status: 400))
+        }
         var filter = base
         filter.album = album
         filter.media = media
+        filter.faceDefinitionLower = faceDefinition?.lower
+        filter.faceDefinitionUpper = faceDefinition?.upper
 
         do {
             let page = try await cache.page(filter: filter, sort: sort, cursor: cursor, limit: limit, offset: offset)
@@ -383,15 +426,26 @@ struct Router: Sendable {
             let tags = membership.mapValues { entries in
                 entries.map { PhotosResponse.AlbumTag(id: $0.identifier, title: $0.title) }
             }
+            // The observed definition range is nil until the first face
+            // is measured; MIN and MAX are null together or not at all,
+            // so one guard covers both.
+            let observedDefinition: PhotosResponse.FaceDefinitionBounds?
+            if let lower = stats.minFaceDefinition, let upper = stats.maxFaceDefinition {
+                observedDefinition = .init(lower: lower, upper: upper)
+            } else {
+                observedDefinition = nil
+            }
             return .response(.json(PhotosResponse(
                 total: page.total,
                 items: page.rows,
                 nextCursor: page.nextCursor,
                 bounds: .init(min: stats.minScore, max: stats.maxScore),
+                faceDefinition: observedDefinition,
                 filter: .init(lower: filter.lower, upper: filter.upper, sort: sort.rawValue,
                               favorites: filter.favorites.rawValue,
                               album: album.wireValue,
                               media: media.wireValue,
+                              faceDefinition: faceDefinition,
                               albums: tags.isEmpty ? nil : tags)
             )))
         } catch let error as CacheError {
@@ -680,6 +734,16 @@ struct Router: Sendable {
         /// against that count. The selection is only safe if the dimension the user
         /// filtered by is part of what it pins.
         var media: String?
+        /// The Face definition range the selection was taken at, as
+        /// `faceDefLo`/`faceDefHi`. Absent means the filter was
+        /// off — the same load-bearing rule as `album` and `media`:
+        /// an "all matching" selection snapshotted on a grid
+        /// filtered to well-defined faces that omitted the range
+        /// would resolve against every photo in the score range,
+        /// face-free ones included, and the deletion would be
+        /// authorised against a count the user never saw.
+        var faceDefLo: Float?
+        var faceDefHi: Float?
 
         /// An unrecognised value is an error, never a fallback.
         ///
@@ -718,6 +782,23 @@ struct Router: Sendable {
             }
             if let media, let selection = MediaSelection(rawValue: media) {
                 filter.media = selection
+            }
+            // The definition range is present as a pair or not at
+            // all, and is validated rather than defaulted: the two
+            // bounds are one statement about one range, so a
+            // half-set range is a client bug, and substituting a
+            // default for the missing half would resolve the
+            // selection against a range the user never stated.
+            if let lo = faceDefLo, let hi = faceDefHi {
+                guard lo.isFinite, hi.isFinite, lo <= hi else {
+                    throw SelectionError.invalidFilter(
+                        "invalid face definition range \(lo)…\(hi); faceDefLo must not exceed faceDefHi")
+                }
+                filter.faceDefinitionLower = lo
+                filter.faceDefinitionUpper = hi
+            } else if faceDefLo != nil || faceDefHi != nil {
+                throw SelectionError.invalidFilter(
+                    "face definition range needs both faceDefLo and faceDefHi")
             }
             return filter
         }

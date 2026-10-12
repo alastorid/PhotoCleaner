@@ -358,14 +358,16 @@ actor AnalysisEngine {
                     maxPixelSize: snapshot.analysisPixelSize,
                     allowNetwork: snapshot.downloadFromICloud
                 )
-                // `analyzeFrames` takes the median of the per-frame scores and yields a
-                // FeaturePrint only for a single-frame subject, so a video scores
-                // without ever entering the Similar Group machinery. Both facts live in
-                // that one call rather than in this worker, because the "no vector for a
-                // video" rule is a property of what a video *is* and belongs beside the
-                // median, not beside the queue.
-                let (result, featurePrint) = try await analyzer.analyzeFrames(frames)
-                try await cache.record(score: result.score, for: job.identifier)
+                // `analyzeFrames` takes the median of the per-frame scores,
+                // the best face's definition over the frames that have one,
+                // and yields a FeaturePrint only for a single-frame subject,
+                // so a video scores without ever entering the Similar Group
+                // machinery. All three facts live in that one call rather
+                // than in this worker, because the "no vector for a video"
+                // rule is a property of what a video *is* and belongs beside
+                // the median, not beside the queue.
+                let (result, featurePrint, faceDefinition) = try await analyzer.analyzeFrames(frames)
+                try await cache.record(score: result.score, faceDefinition: faceDefinition, for: job.identifier)
                 // A missing FeaturePrint is not a failure — the score is the primary
                 // observation, and an asset without one simply cannot join a group.
                 if let featurePrint {

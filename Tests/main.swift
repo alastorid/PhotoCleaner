@@ -66,6 +66,7 @@ registerAuthorizationTests()
 registerUpdateTests()
 registerIconTests()
 registerVideoTests()
+registerFaceDefinitionTests()
 
 if listOnly {
     print("\(Registry.shared.count) cases registered")

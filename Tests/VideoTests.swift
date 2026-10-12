@@ -442,14 +442,16 @@ func registerVideoTests() {
         let image = try TestPattern.verticalBands.draw()
 
         let single = try await analyzer.analyze(image)
-        let (clip, clipVector) = try await analyzer.analyzeFrames([image, image, image])
+        let (clip, clipVector, clipDefinition) = try await analyzer.analyzeFrames([image, image, image])
         checkNil(clipVector, "three frames mean no FeaturePrint: a clip is not one photograph")
+        checkNil(clipDefinition, "and the test pattern has no face to measure")
         checkEqual(clip.score, single.score,
                    "and three samples of the same frame take the median of that frame, so the score is unchanged")
 
-        let (still, stillVector) = try await analyzer.analyzeFrames([image])
+        let (still, stillVector, stillDefinition) = try await analyzer.analyzeFrames([image])
         checkEqual(still.score, single.score, "one frame takes the measured single-image path unchanged")
         checkNotNil(stillVector, "and it does get a FeaturePrint — exactly one frame is the only case where the clip *is* the frame")
+        checkNil(stillDefinition, "and the test pattern has no face to measure")
 
         // **Three genuinely different frames**, which is the only way to reach the
         // aggregation rather than just the vector rule. Three copies of one image
@@ -465,8 +467,9 @@ func registerVideoTests() {
         check(observed[0] != observed[1] || observed[1] != observed[2],
               "the three frames score differently, so median and mean can be told apart: \(observed)")
 
-        let (sampled, sampledVector) = try await analyzer.analyzeFrames(moments)
+        let (sampled, sampledVector, sampledDefinition) = try await analyzer.analyzeFrames(moments)
         checkNil(sampledVector, "three distinct frames still mean no FeaturePrint")
+        checkNil(sampledDefinition, "and no face to measure on a test pattern")
         let midpoint = VisionAnalyzer.median(of: observed)
         check(abs(sampled.score - midpoint) < 0.0001,
               "the clip takes the median of its frames' real scores \(observed), expected \(midpoint), got \(sampled.score)")
@@ -485,8 +488,9 @@ func registerVideoTests() {
         // `count > 2`, a two-frame clip would take the single-image path and be given a
         // FeaturePrint, which is precisely the thing this feature exists to prevent.
         let twoFrames = [moments[0], moments[1]]
-        let (pair, pairVector) = try await analyzer.analyzeFrames(twoFrames)
+        let (pair, pairVector, pairDefinition) = try await analyzer.analyzeFrames(twoFrames)
         checkNil(pairVector, "two frames are still more than one frame, so still no FeaturePrint")
+        checkNil(pairDefinition, "and no face to measure on a test pattern")
         let pairMean = (observed[0] + observed[1]) / 2
         let pairMedian = (observed[0] + observed[1]) / 2
         check(abs(pair.score - pairMedian) < 0.0001,

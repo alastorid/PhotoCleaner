@@ -40,6 +40,12 @@ struct CacheStats: Sendable {
     var videos = 0
     var minScore: Float?
     var maxScore: Float?
+    /// Observed extremes of `face_definition`, over the photos that
+    /// have one. Both `nil` until the first face is measured — the
+    /// Face definition slider then reports "no scores yet" rather
+    /// than a 0…1 range that is not the data's.
+    var minFaceDefinition: Float?
+    var maxFaceDefinition: Float?
 }
 
 struct PhotoPage: Sendable {
@@ -84,7 +90,14 @@ struct AssetJob: Sendable {
 actor CacheStore {
     /// Bump when the meaning of a stored score changes. Assets scored by an
     /// older version are re-queued on the next scan.
-    static let analyzerVersion = 1
+    ///
+    /// Version 2 adds the face definition to the pass, so a score stored
+    /// without one is a score whose *analysis* no longer matches what this
+    /// build produces: the re-queue is what gives every already-scanned
+    /// photo a definition, which is what makes the Face definition filter
+    /// answer for a library it has not analysed yet rather than only for
+    /// photos modified since the upgrade.
+    static let analyzerVersion = 2
 
     /// Owns the `sqlite3` handle.
     ///
@@ -143,7 +156,7 @@ actor CacheStore {
     /// Covered by `SchemaTests`, which rewinds a database to an older version and
     /// upgrades it — the one guarantee here that cannot be checked on a fresh file,
     /// because a fresh file is already at the current version.
-    static let schemaVersion = 5
+    static let schemaVersion = 6
 
     /// Creates or upgrades the schema. Idempotent, and safe to run against a
     /// database an older build wrote: every step is `IF NOT EXISTS` or is guarded
@@ -188,6 +201,7 @@ actor CacheStore {
             media_subtype     INTEGER NOT NULL DEFAULT 0,
             is_screenshot     INTEGER NOT NULL DEFAULT 0,
             aesthetics_score  REAL,
+            face_definition   REAL,
             analysis_state    TEXT NOT NULL DEFAULT 'pending',
             attempts          INTEGER NOT NULL DEFAULT 0,
             last_error        TEXT,
@@ -348,6 +362,16 @@ actor CacheStore {
         // `0` would be a claim about the asset, and this codebase never writes a
         // claim it cannot source.
         try addColumnIfMissing("assets", name: "duration_seconds", type: "REAL")
+
+        // ---- version 6: face definition --------------------------------
+        // The best face's definition score, measured during the ordinary
+        // analysis pass (see `FaceDefinition`). Additive like version 5's
+        // duration, and `NULL`, not `0`, for every row written before this
+        // version: a photo that has not been re-analysed has no definition,
+        // and `0` would claim a face was measured and found textureless.
+        // The Face definition filter treats the absence as "cannot say",
+        // exactly as the grid treats an unscored asset.
+        try addColumnIfMissing("assets", name: "face_definition", type: "REAL")
 
         try execute("PRAGMA user_version = \(Self.schemaVersion);")
     }
@@ -542,6 +566,13 @@ actor CacheStore {
                      THEN NULL
                 ELSE assets.aesthetics_score
             END,
+            face_definition   = CASE
+                WHEN assets.analysis_state = 'done'
+                     AND (assets.modification_date IS NOT excluded.modification_date
+                          OR assets.analyzer_version < excluded.analyzer_version)
+                     THEN NULL
+                ELSE assets.face_definition
+            END,
             scored_at         = CASE
                 WHEN assets.analysis_state = 'done'
                      AND (assets.modification_date IS NOT excluded.modification_date
@@ -672,16 +703,31 @@ actor CacheStore {
         invalidateStats()
     }
 
-    func record(score: Float, for identifier: String) throws {
+    /// Records a finished analysis. The definition is written in the
+    /// same statement as the score because both are produced by the
+    /// same pass over the same decoded image: a photo that was
+    /// re-analysed cannot end up with a new score and a definition
+    /// measured from the pixels it no longer has.
+    ///
+    /// `faceDefinition` is `nil` for a photo with no measurable
+    /// face, and that `NULL` is written rather than left alone, so
+    /// a re-analysis of a photo that *had* a face clears the stale
+    /// score instead of keeping it.
+    func record(score: Float, faceDefinition: Float?, for identifier: String) throws {
         try withStatement("""
-        UPDATE assets SET aesthetics_score = ?, analysis_state = 'done',
+        UPDATE assets SET aesthetics_score = ?, face_definition = ?, analysis_state = 'done',
                           scored_at = ?, analyzer_version = ?, last_error = NULL
         WHERE asset_identifier = ?;
         """) { statement in
             sqlite3_bind_double(statement, 1, Double(score))
-            sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
-            sqlite3_bind_int(statement, 3, Int32(Self.analyzerVersion))
-            bind(statement, 4, identifier)
+            if let faceDefinition {
+                sqlite3_bind_double(statement, 2, Double(faceDefinition))
+            } else {
+                sqlite3_bind_null(statement, 2)
+            }
+            sqlite3_bind_double(statement, 3, Date().timeIntervalSince1970)
+            sqlite3_bind_int(statement, 4, Int32(Self.analyzerVersion))
+            bind(statement, 5, identifier)
             try run(statement)
         }
         invalidateStats()
@@ -1729,8 +1775,6 @@ actor CacheStore {
         // nil.
         //
         // `media_type = 2` is a literal, matching `claimJobs`: no placeholder, so
-        // the existing numbering (and therefore the callers' bind indices) is
-        // untouched.
         try withStatement("""
         SELECT COUNT(*),
                COALESCE(SUM(CASE WHEN aesthetics_score IS NOT NULL THEN 1 ELSE 0 END), 0),
@@ -1739,7 +1783,8 @@ actor CacheStore {
                COALESCE(SUM(CASE WHEN analysis_state IN ('pending', 'analyzing') THEN 1 ELSE 0 END), 0),
                COALESCE(SUM(favorite), 0),
                COALESCE(SUM(CASE WHEN media_type = 2 THEN 1 ELSE 0 END), 0),
-               MIN(aesthetics_score), MAX(aesthetics_score)
+               MIN(aesthetics_score), MAX(aesthetics_score),
+               MIN(face_definition), MAX(face_definition)
         FROM assets;
         """) { statement in
             guard sqlite3_step(statement) == SQLITE_ROW else { return }
@@ -1755,6 +1800,12 @@ actor CacheStore {
             }
             if sqlite3_column_type(statement, 8) != SQLITE_NULL {
                 stats.maxScore = Float(sqlite3_column_double(statement, 8))
+            }
+            if sqlite3_column_type(statement, 9) != SQLITE_NULL {
+                stats.minFaceDefinition = Float(sqlite3_column_double(statement, 9))
+            }
+            if sqlite3_column_type(statement, 10) != SQLITE_NULL {
+                stats.maxFaceDefinition = Float(sqlite3_column_double(statement, 10))
             }
         }
         cachedStats = stats
@@ -1846,8 +1897,18 @@ actor CacheStore {
         // rather than interpolated so a crafted one can never reach the SQL text;
         // it has already been validated against the `albums` table, and binding it
         // makes that belt-and-braces.
-        let keysetSQL = cursor.map { _ in Self.keysetClause(sort: sort, parameterIndex: 4) } ?? ""
-        let limitIndex: Int32 = cursor == nil ? 4 : 7
+        //
+        // The Face definition predicate, when in force, binds `?4`/`?5`, so every
+        // parameter after it moves by two: the keyset starts at `?6`, and the
+        // limit lands on `?6` without a cursor or `?9` with one (keyset
+        // `?6`/`?7`/`?8`). The positions are computed from the filter's own
+        // state rather than assumed, because both states of the one filter that
+        // can add parameters are reachable from the UI, and a statement whose
+        // placeholders were numbered for the other state would bind the limit
+        // into a keyset position or leave a placeholder unbound.
+        let keysetStart: Int32 = filter.hasFaceDefinitionFilter ? 6 : 4
+        let keysetSQL = cursor.map { _ in Self.keysetClause(sort: sort, parameterIndex: Int(keysetStart)) } ?? ""
+        let limitIndex: Int32 = cursor == nil ? keysetStart : keysetStart + 3
         let offsetSQL = cursor == nil && offset > 0 ? " OFFSET \(max(0, offset))" : ""
         // Ask for one row more than the caller asked for. Without the extra row a
         // full page is indistinguishable from "the last page", so `nextCursor`
@@ -1864,13 +1925,13 @@ actor CacheStore {
             if let cursor {
                 switch sort {
                 case .scoreAscending, .scoreDescending:
-                    sqlite3_bind_double(statement, 4, Double(cursor.score))
-                    sqlite3_bind_double(statement, 5, Double(cursor.score))
+                    sqlite3_bind_double(statement, keysetStart, Double(cursor.score))
+                    sqlite3_bind_double(statement, keysetStart + 1, Double(cursor.score))
                 case .newestFirst, .oldestFirst, .timelineNewer:
-                    sqlite3_bind_double(statement, 4, cursor.date)
-                    sqlite3_bind_double(statement, 5, cursor.date)
+                    sqlite3_bind_double(statement, keysetStart, cursor.date)
+                    sqlite3_bind_double(statement, keysetStart + 1, cursor.date)
                 }
-                bind(statement, 6, cursor.id)
+                bind(statement, keysetStart + 2, cursor.id)
             }
             sqlite3_bind_int(statement, limitIndex, Int32(fetchLimit))
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -1896,12 +1957,15 @@ actor CacheStore {
     func identifiers(matching filter: PhotoFilter, limit: Int = 200_000) throws -> [String] {
         var identifiers: [String] = []
         let whereSQL = filter.whereSQLClause()
+        // The definition predicate takes `?4`/`?5` when in force, so the
+        // limit moves with it — the same computation `page` makes.
+        let limitIndex: Int32 = filter.hasFaceDefinitionFilter ? 6 : 4
         try withStatement("""
         SELECT asset_identifier FROM assets WHERE \(whereSQL)
-        ORDER BY \(SortOrder.scoreAscending.orderByClause) LIMIT ?4;
+        ORDER BY \(SortOrder.scoreAscending.orderByClause) LIMIT ?\(limitIndex);
         """) { statement in
             bindFilter(statement, filter)
-            sqlite3_bind_int(statement, 4, Int32(limit))
+            sqlite3_bind_int(statement, limitIndex, Int32(limit))
             while sqlite3_step(statement) == SQLITE_ROW {
                 identifiers.append(text(statement, 0))
             }
@@ -1917,13 +1981,18 @@ actor CacheStore {
     ///
     /// There is deliberately nothing to bind for the favourite or media
     /// predicates: both are literals, which is what keeps `?4` free for keyset
-    /// pagination. A caller adding a fourth bound filter would have to extend this
-    /// and `keysetClause(parameterIndex:)` together.
+    /// pagination when the definition filter is off. When it is on, its
+    /// bounds take `?4`/`?5` and every keyset position moves by two —
+    /// see `page`, which computes those positions from the filter.
     private func bindFilter(_ statement: OpaquePointer, _ filter: PhotoFilter) {
         sqlite3_bind_double(statement, 1, Double(filter.lower))
         sqlite3_bind_double(statement, 2, Double(filter.upper))
         if let identifier = filter.album.albumIdentifier {
             bind(statement, 3, identifier)
+        }
+        if let lower = filter.faceDefinitionLower, let upper = filter.faceDefinitionUpper {
+            sqlite3_bind_double(statement, 4, Double(lower))
+            sqlite3_bind_double(statement, 5, Double(upper))
         }
     }
 
@@ -2135,6 +2204,19 @@ extension PhotoFilter {
         if !albumClause.isEmpty { conditions.append(albumClause) }
         let mediaClause = media.whereSQLClause()
         if !mediaClause.isEmpty { conditions.append(mediaClause) }
+        // The definition bounds are **bound parameters**, for the
+        // opposite reason the media one is a literal: the bounds are
+        // continuous values the user chose, not a closed set. When the
+        // filter is in force they occupy `?4`/`?5`, which moves keyset
+        // pagination from `?4` to `?6` — `page` computes its keyset
+        // and limit positions from the filter's own state rather than
+        // assuming, and `bindFilter` binds the pair only when the
+        // predicate is present, so the numbering is stable across both
+        // states of the one filter that can add them.
+        if hasFaceDefinitionFilter {
+            conditions.append("face_definition >= ?4")
+            conditions.append("face_definition <= ?5")
+        }
         return conditions.joined(separator: " AND ")
     }
 }
