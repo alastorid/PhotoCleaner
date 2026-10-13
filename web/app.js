@@ -87,6 +87,18 @@
    * checked here rather than trusted from the DOM.
    */
   const MEDIA_CHOICES = ['all', 'images', 'videos'];
+  /**
+   * The two favourite filters this client offers, spelled as the server spells them.
+   *
+   * `only` is deliberately missing. The server has always accepted
+   * `include | exclude | only` and refuses nothing, so "Favourites only" is one
+   * click away in the API and is not offered here: this is a cleaner, not a
+   * favourites browser. Held as a closed set for the same reason `MEDIA_CHOICES`
+   * is one — `adoptAppliedFavorites` only adopts an echo it can name, so a server
+   * that applied a filter this client does not have leaves the chips alone instead
+   * of moving them to a control that does not exist.
+   */
+  const FAVORITE_CHOICES = ['include', 'exclude'];
   /** `PHAssetMediaType.video` raw value. Stored raw on the wire so a row and the
    *  cache's `assets` table cannot disagree about what an asset is. */
   const MEDIA_TYPE_VIDEO = 2;
@@ -193,6 +205,21 @@
      * is a lie. Exactly the rule the album filter already follows.
      */
     media: 'images',
+    /**
+     * Favourite filter: 'include' (every photo) or 'exclude' (favourites hidden).
+     *
+     * `include` because a cleaner that hid your favourites by default would be
+     * hiding the photos you have already decided about — and, worse, would read as
+     * though those photos were gone. The filter is a *request* to put them aside.
+     *
+     * Written by two things and read by neither blindly, exactly like `media`:
+     * `selectFavorites` sets it from a click, and `adoptAppliedFavorites` overwrites
+     * it with the `filter.favorites` the server echoes back. The second writer is
+     * load-bearing — the chips render from this field, so a client that drew its
+     * own request over a page the server had filtered differently would claim to
+     * be hiding favourites over a grid full of them.
+     */
+    favorites: 'include',
     /** Album filter: 'all', 'none' (in no album), or an album identifier. */
     album: 'all',
     /** Albums the server has read, plus the indexing state behind them. */
@@ -566,10 +593,20 @@
     // included. Absent means the filter is off — the server
     // applies no definition constraint, and neither does the
     // snapshot.
+    //
+    // `favorites` rides it for the same reason, and the default it
+    // replaces was the one hardcoded value in this snapshot: a
+    // ⌘A taken on the "Not favourites" grid that sent `include`
+    // would resolve against *every* photo in the score range,
+    // favourites included. Protection still keeps those out of the
+    // deletion, so nothing destroyed would have been wrong — but
+    // the count on the Delete button, which is the number the
+    // reader agreed to, would have been a count of a set nobody
+    // was looking at.
     return {
       lo: state.lower,
       hi: state.upper,
-      favorites: 'include',
+      favorites: state.favorites,
       album: state.album,
       media: state.media,
       faceDefLo: state.definition.pinned ? state.definition.lower : undefined,
@@ -602,7 +639,12 @@
     const scale = Math.max(1, Math.abs(a.lo), Math.abs(a.hi), Math.abs(b.lo), Math.abs(b.hi));
     const epsilon = scale * 1e-6;
     return Math.abs(a.lo - b.lo) <= epsilon && Math.abs(a.hi - b.hi) <= epsilon &&
-      a.favorites === b.favorites &&
+      // `(x || 'include')` on both sides, like `album` and `media` below: an
+      // absent `favorites` is what the server itself reads as `include`
+      // (`FilterPayload.resolved`), so a snapshot that predates the control must
+      // compare equal to one taken on an unfiltered grid rather than blocking a
+      // deletion that is in fact current.
+      (a.favorites || 'include') === (b.favorites || 'include') &&
       (a.album || 'all') === (b.album || 'all') &&
       // `(x || 'all')` on both sides, like `album`: a snapshot taken before the
       // media filter existed has no `media` key at all, and that is `all`, not a
@@ -662,6 +704,49 @@
     state.media = echoed;
     renderMediaBar();
     return true;
+  }
+
+  /**
+   * Adopts the favourite filter the server *applied*, from a page response's
+   * `filter.favorites` echo.
+   *
+   * The same rule as `adoptAppliedMedia`, and for the same reason: the chips render
+   * from this field, so drawing the client's own request over a page the server had
+   * filtered differently would put "Not favourites" above a grid full of favourites
+   * — which is the more dangerous of the two lies available here, because a reader
+   * who believes it is looking at unfavourited photos would select all and delete
+   * on a count they have been shown for the wrong set.
+   *
+   * `only` is in `FavoriteFilter` on the server and deliberately not in
+   * `FAVORITE_CHOICES` here, so an echo of it is *ignored* rather than adopted: the
+   * control has no chip to press and no bucket to show, and moving the control to
+   * some third state would leave it describing a filter with nothing behind it. The
+   * grid is still correct — it is the server's answer, not the chips, that draws the
+   * tiles — so ignoring the echo costs the reader a control rather than a lie.
+   */
+  function adoptAppliedFavorites(echoed) {
+    if (typeof echoed !== 'string' || !FAVORITE_CHOICES.includes(echoed)) return false;
+    if (state.favorites === echoed) return false;
+    state.favorites = echoed;
+    renderFavoritesBar();
+    return true;
+  }
+
+  /**
+   * How many photos the favourites filter is putting aside, for the chip that hides
+   * them.
+   *
+   * The server's own count (`/api/status`'s `library.favorites`), not a count of the
+   * favourites this client happens to have loaded — a grid holding forty tiles says
+   * nothing about a library with 4,000 favourites, and the reader asking "how much
+   * am I not looking at?" is asking about the library. It is a count of the *scored*
+   * assets, which is what the filter can actually hide: `library.total` counts what
+   * this instance has scanned, and a photo it has never scored is in neither bucket
+   * on screen. Zero therefore reads as "none of the scored photos", not "your
+   * library has nothing marked" — the chip says which.
+   */
+  function hiddenFavoriteCount() {
+    return Number((state.status && state.status.library && state.status.library.favorites) || 0);
   }
 
   /** Snap the live bounds back onto the real observed extremes. */
@@ -991,7 +1076,15 @@
       lo: String(state.lower),
       hi: String(state.upper),
       sort: state.sort,
-      favorites: 'include',
+      // Always sent, `include` included. The dimension is part of the pagination
+      // fingerprint, so a token minted on a grid that was hiding favourites
+      // describes a position inside the *unfavourited* photos; replayed with the
+      // dimension dropped it would be a position in the whole library, and the
+      // server refusing it (§4.2) is the only thing keeping page two from
+      // splicing a row back that the filter exists to hide. This was the last
+      // hardcoded `include` in the client, which is why nothing ever tripped that
+      // check: there was no control to trip it with.
+      favorites: state.favorites,
       limit: String(PAGE_SIZE),
     });
     // Always sent, including 'all', so the query the client runs is the query the
@@ -1049,6 +1142,11 @@
       // also the cheapest notice this client gets that it and the server are on
       // different builds; on a later page it would otherwise go unnoticed.
       adoptAppliedMedia(data.filter && data.filter.media);
+      // Same echo, same reason, for the favourite filter. The generation check
+      // above is what makes it safe to read on every page: a page requested
+      // before the chip was pressed is dropped whole, so its echo describes a
+      // filter the client has already left and cannot undo the click.
+      adoptAppliedFavorites(data.filter && data.filter.favorites);
       // The definition range the server applied, and the
       // observed extremes it measured over. Both ride the
       // same page response the score bounds do; neither
@@ -1357,6 +1455,42 @@
   }
 
   /**
+   * Paints the two favourites chips: All, Not favourites.
+   *
+   * The same job `renderMediaBar` does for the media group and for the same reason:
+   * the pressed state is read from `state.favorites` rather than tracked from the
+   * click, because the server's echo writes that field too — see
+   * `adoptAppliedFavorites`. A control that painted from the last click could put
+   * its own idea of the filter over somebody else's grid.
+   *
+   * The tooltip is the count of what the filter hides, and it is the only place
+   * that count appears: the header reports the library's assets and its clips, and
+   * "not favourites" is a third number about a different question — how much of
+   * the library you are *not* being shown right now. It belongs where a reader goes
+   * when the grid looks emptier than it should.
+   */
+  function renderFavoritesBar() {
+    const holder = $('favoriteChips');
+    if (!holder) return;
+    for (const chip of holder.querySelectorAll('[data-favorites]')) {
+      const active = chip.dataset.favorites === state.favorites;
+      chip.classList.toggle('active', active);
+      chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+      if (chip.dataset.favorites === 'exclude') {
+        const hidden = hiddenFavoriteCount();
+        const title = hidden > 0
+          ? `Hide the ${fmt.count(hidden)} ${fmt.plural(hidden, 'favourite', 'favourites')} PhotoCleaner has scored`
+          : 'None of the photos PhotoCleaner has scored is a favourite, so this hides nothing';
+        chip.title = title;
+        // The count goes in the accessible name too: a `title` is a hover
+        // affordance and nothing more, and the album row makes the same point about
+        // the sentence a reader would otherwise pass without hearing.
+        chip.setAttribute('aria-label', title);
+      }
+    }
+  }
+
+  /**
    * Filters the grid to one media type.
    *
    * Three things happen, and each has a reason that the album filter's identical
@@ -1389,6 +1523,34 @@
     state.media = next;
     renderMediaBar();
     if (state.groups.active) resetGroupsWindow();
+    scheduleReload(0);
+  }
+
+  /**
+   * Shows every photo, or every photo that is *not* a favourite.
+   *
+   * The three things `selectMedia` does, minus the second: the grid resets, because
+   * the keyset cursor names a position inside one result set and this changes which
+   * set that is; a "matching" selection goes stale, handled by `sameFilter` reading
+   * `favorites` rather than by clearing anything, so the deletion is refused until
+   * the reader re-snapshots with ⌘A or gives the selection up with Esc; and an
+   * explicit id selection is untouched by a filter change by design.
+   *
+   * The Similar Groups window is *not* reset, unlike the media filter's path, and
+   * the reason is that the dimension does not reach it: `/api/groups` and
+   * `/api/group` filter by album and media and have never taken `favorites`, so
+   * there is no group list being narrowed by this and no offset that moved. The
+   * group browser therefore shows favourites whatever this chip says — visibly so,
+   * because a favourite in a strip carries the same heart the grid gives them, so
+   * the contradiction is on screen rather than hidden. That is the same shape as the
+   * All Photos window, which the README documents as deliberately ignoring `lo`,
+   * `hi` and `favorites` for the same reason.
+   */
+  function selectFavorites(value) {
+    const next = FAVORITE_CHOICES.includes(value) ? value : 'include';
+    if (state.favorites === next) return;
+    state.favorites = next;
+    renderFavoritesBar();
     scheduleReload(0);
   }
 
@@ -2508,6 +2670,11 @@
     } else if (confirmed === 0) {
       toast('Photos did not confirm any of those photos.', 'warning');
     }
+    // After the lightbox repaint and the toast, and only once Photos has confirmed
+    // something: a photo that was refused its flag change never left the filter, and
+    // reloading the grid for a change that did not happen would throw away a scroll
+    // position over nothing.
+    if (applied.length) await reconcileFavoritesWithFilter(applied, favorite);
     refreshSelectionPreview();
   }
 
@@ -2552,6 +2719,54 @@
     for (const group of state.groups.rows) patch(groupItems(group));
     refreshTilesById(wanted);
     return ids;
+  }
+
+  /**
+   * Re-reads the grid when a heart has just moved a photo across the favourites
+   * filter the grid is showing.
+   *
+   * ## The invariant this protects
+   *
+   * With "Not favourites" in force, every row the server has paged into
+   * `state.items` was unfavourited when it arrived. Marking one of them is
+   * therefore not a flag change but a *membership* change: the photo has just left
+   * the set the grid claims to be showing, and leaving its tile on screen would
+   * make the grid describe a set the server would never return. That matters more
+   * here than for any other filter, because the reader's next move is a selection:
+   * ⌘A would resolve to the unfavourited photos while the hearts on screen said
+   * something else, and a hand-picked selection would name a photo the filter no
+   * longer admits.
+   *
+   * ## Why the whole grid reloads rather than the tile being patched out
+   *
+   * Removing one row means renumbering every tile after it and every index the open
+   * lightbox walks by — and the live lightbox's queue *is* `state.items` by
+   * reference, so splicing the row the preview is showing out from under it would
+   * leave the next repaint showing a different photograph on the stage. The
+   * deletion path has the same shape of problem and the same answer: `resetGrid`
+   * closes the live preview and reloads from page one, which costs a scroll
+   * position on a press that, in a grid deliberately showing only the photos you
+   * have not decided about yet, is rare.
+   *
+   * ## The other direction needs nothing
+   *
+   * Un-marking cannot put a row on the grid that the filter excludes; it can only
+   * make a photo eligible that was never loaded, and the next page the reader pulls
+   * — or the sentinel pulls for them — brings it in. Nothing to reconcile, so
+   * nothing is done.
+   *
+   * @return true when a reload was started.
+   */
+  async function reconcileFavoritesWithFilter(ids, favorite) {
+    if (state.favorites !== 'exclude' || !favorite) return false;
+    // Only the score grid is filtered by this dimension: the All Photos window
+    // deliberately ignores `favorites`, and the group routes have never taken it,
+    // so a change made in either of those surfaces cannot have left the grid wrong.
+    if (state.all.active || state.groups.active) return false;
+    const crossed = ids.some((id) => state.items.some((row) => row.id === id));
+    if (!crossed) return false;
+    await resetGrid();
+    return true;
   }
 
   /**
@@ -4872,6 +5087,12 @@
     const videos = Number(library.videos) || 0;
     $('headerVideosWrap').hidden = videos === 0;
     if (videos > 0) $('headerVideos').textContent = fmt.count(videos);
+    // The favourites filter's own count, repainted from the status frame rather than
+    // read once at boot: this client's own heart presses move `library.favorites`,
+    // and a chip that still said "Hide the 3 favourites" after the reader has just
+    // marked a fourth would be reporting a number about the filter they are looking
+    // at, which is the one number on this row that is not about the library.
+    renderFavoritesBar();
 
     const problems = [];
     if (analysis.failed > 0) problems.push(`${fmt.count(analysis.failed)} failed`);
@@ -4918,6 +5139,14 @@
       if (state.definition.pinned) {
         title = 'No photos match this face-definition range';
         detail = 'Widen the range, or press “Reset” to stop filtering by face definition.';
+      } else if (state.favorites === 'exclude') {
+        // The recovery is named before the score's own, because it is the narrower
+        // of the two: a grid that is empty because everything left in it is a
+        // favourite says something true about *this filter* and nothing at all
+        // about the score range, and a reader told only to widen the slider would
+        // widen it against a library that has already given up all it has.
+        title = 'Every photo in this score range is a favourite';
+        detail = 'Choose “All” under Favourites to see the ones you have marked.';
       } else if (state.media === 'videos') {
         title = 'No videos match this score range';
         detail = 'Widen the range, or choose “All” or “Photos” — PhotoCleaner can only show videos it has scored.';
@@ -5056,6 +5285,14 @@
     // that field too — see `adoptAppliedMedia`.
     for (const chip of document.querySelectorAll('[data-media]')) {
       chip.addEventListener('click', () => selectMedia(chip.dataset.media));
+    }
+
+    // The favourites filter. Same two rules as the media chips above and for the
+    // same reasons: no clear-on-second-click, because "All" is a bucket rather than
+    // the absence of a filter, and the pressed state is painted from the field the
+    // server's echo writes rather than from the click.
+    for (const chip of document.querySelectorAll('[data-favorites]')) {
+      chip.addEventListener('click', () => selectFavorites(chip.dataset.favorites));
     }
 
     $('icloudDownloads').addEventListener('change', async (event) => {
@@ -6517,6 +6754,10 @@
     // one in the markup: `selectMedia` and `adoptAppliedMedia` both write that
     // field, so the first paint has to come from the one place they agree on.
     renderMediaBar();
+    // And the favourites chips, from `state.favorites` for the same reason: the
+    // first paint has to come from the one field `selectFavorites` and
+    // `adoptAppliedFavorites` agree on, not from a chip marked in the markup.
+    renderFavoritesBar();
     wireControls();
     syncRangeUI();
     syncDefinitionUI();

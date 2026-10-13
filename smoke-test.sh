@@ -198,6 +198,32 @@ else
   ok "the media filter offers All / Photos / Videos and the client reads it"
 fi
 
+# The favourites *filter* is a different control from favourites *protection*, and
+# the two must not be confused: this one hides the marked photos from the grid and
+# has nothing to do with deletion. Both buckets are required rather than one of
+# them, because checking only that some `data-favorites` exists passes just as well
+# with the "Not favourites" chip stripped out — which would leave the dimension
+# unreachable, the same failure mode as the media filter above.
+#
+# `only` is listed as *forbidden* rather than required: the server accepts it and the
+# panel deliberately does not offer it, and a chip that appeared would be a control
+# the README and ARCHITECTURE both say is not there.
+missing_favorites=""
+for choice in include exclude; do
+  grep -qF "data-favorites=\"$choice\"" "$ROOT/web/index.html" 2>/dev/null \
+    || missing_favorites="$missing_favorites $choice"
+done
+if [ -n "$missing_favorites" ] || ! grep -qF 'favoriteChips' "$ROOT/web/index.html" 2>/dev/null; then
+  bad "the favourites filter is incomplete (missing:${missing_favorites:- the container}) —"
+  bad "  there may be no way to get the marked photos out of the way"
+elif grep -qF 'data-favorites="only"' "$ROOT/web/index.html" 2>/dev/null; then
+  bad "web/ offers a \"Favourites only\" chip — a cleaner is not a favourites browser"
+elif ! grep -qF 'favoriteChips' "$ROOT/web/app.js" 2>/dev/null; then
+  bad "the favourites filter is in the markup but the client never reads it"
+else
+  ok "the favourites filter offers All / Not favourites and the client reads it"
+fi
+
 # The guarantee still has to be *stated* somewhere, or removing the control would
 # just have deleted the information rather than relocated it. Checked against the
 # heart's own surfaces, which is where the user acts on a favourite.

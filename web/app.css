@@ -379,7 +379,7 @@ button { font: inherit; cursor: pointer; }
   padding-top: 12px;
   border-top: 1px solid var(--panel-border);
 }
-.sort-group, .toggle-group, .media-group {
+.sort-group, .toggle-group, .media-group, .favorites-group {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
 }
 /* Sort is the last thing in the panel, and it is pushed to the far right so that
@@ -435,6 +435,14 @@ button { font: inherit; cursor: pointer; }
    pushes only the last child to the far edge and Media has to stay attached to it
    as the row's final pair of decisions. */
 .media-group { gap: 6px; }
+
+/* The favourites filter rides the same two rules as Media: `.chip` for the pressed
+   state, and this group's own gap so its labels sit as tightly as Media's. It
+   needs no rule of its own beyond the gap — a chip that says "Not favourites" is
+   not a heart and must not grow one, because the heart on the tiles means "this
+   photo is protected from deletion" and a heart on a control that hides those very
+   photos would be saying the opposite of what it does. */
+.favorites-group { gap: 6px; }
 
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
 .check input { accent-color: var(--accent); }

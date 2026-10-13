@@ -88,6 +88,19 @@ album change does: `sameFilter` reads `media`, and deletion is blocked until the
 user re-snapshots or clears it. An explicit id selection is unaffected — those are
 assets the reader pointed at.
 
+**The favourites filter does *not* reach this view,** and that is a decision rather
+than an omission. `/api/groups` and `/api/group` take `album` and `media` and have
+never taken `favorites`; `groupMemberClause` builds the member predicate and
+`rankingInputs` reads `favorite` off each row for the Best Shot ranker, but nothing
+constrains on it. Adding it would mean filtering members *inside* a group, which is
+a different question from filtering groups: a burst whose best shot is a favourite
+would become a two-photo strip, and the card would then be about a group the reader
+can no longer compare. So `selectFavorites` resets the grid and does not call
+`resetGroupsWindow()`, and the group browser shows favourites whatever the chip
+says. That contradiction is visible rather than hidden — a favourite in a strip
+carries the same heart the grid gives them — which is the same standard §1 applies
+to a list narrowed by a filter the reader cannot see.
+
 Two decisions, deliberately different:
 
 - **A group qualifies if *any* member is in the album.** Requiring all of them
@@ -297,6 +310,20 @@ GET  /api/timeline/page
 - **Every filter dimension is in the pagination fingerprint**, media included: a
   cursor issued under `media=images` replayed under `media=videos` would splice the
   two sets together, in a list whose positions no longer mean what they did.
+- **`favorites` is a grid dimension, and a `PhotoFilter` one.** `include | exclude |
+  only` has been a first-class dimension since the filter was introduced, but the
+  grid spent its whole life with `include` hardcoded at both call sites because no
+  control existed to change it — the dimension was in the fingerprint and on the wire
+  the entire time, so the server was always ready and the client was the only thing
+  not asking. The client now sends `state.favorites` on every request, in the
+  selection snapshot and on every page, for the reason the fingerprint exists: a
+  token minted while favourites were hidden describes a position inside the
+  *unfavourited* rows, and replaying it without the dimension would splice back a
+  row the filter exists to hide. `FAVORITE_CHOICES` in the client is
+  `include | exclude` — **`only` is accepted by the server and deliberately not
+  offered**, because a cleaner is not a favourites browser. A server that echoed
+  `only` to this client would find the echo *ignored* rather than adopted, since the
+  control has no chip to represent it.
 - **`/api/photo/{id}/video` is the one route that answers 409.** A clip that exists
   but is iCloud-only is not a 404 — that would read as "this video is gone" and send
   the user looking for a file that is sitting in iCloud. It says which preference
