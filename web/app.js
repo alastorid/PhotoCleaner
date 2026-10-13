@@ -88,10 +88,10 @@
    */
   const MEDIA_CHOICES = ['all', 'images', 'videos'];
   /**
-   * The two states the favourites tag can hold, spelled as the server spells them.
+   * The two states the favorites tag can hold, spelled as the server spells them.
    *
    * `only` is deliberately missing. The server has always accepted
-   * `include | exclude | only` and refuses nothing, so "Favourites only" is one
+   * `include | exclude | only` and refuses nothing, so "Favorites only" is one
    * request away in the API and is not a state this control can be in: this is a
    * cleaner, not a favorites browser. Held as a closed set for the same reason
    * `MEDIA_CHOICES` is one — `adoptAppliedFavorites` only adopts an echo it can
@@ -99,8 +99,24 @@
    * control alone instead of pointing it at something that does not exist.
    */
   const FAVORITE_CHOICES = ['include', 'exclude'];
-  /** The tag's label in each state. The label states the state, not the action. */
-  const FAVORITE_LABELS = { include: 'All', exclude: 'Not favorite' };
+  /**
+   * The tag's label in each state.
+   *
+   * The word "Favorite" beside the tag names the dimension, so these two only have
+   * to answer the one question it leaves open: does this filter care about them?
+   * `don’t care` while every photo is on screen, `no` while the marked ones are off
+   * the grid.
+   *
+   * They are not "All" / "Not favorite", which would say the same thing twice on one
+   * row, and they are not "Hide favorites" / "Show all" because an action label
+   * inverts with the state and would need a third value to stay honest. Nor are they a
+   * glyph: a dash said nothing about which photos were involved, which is the one
+   * thing a reader needs to know without hovering.
+   *
+   * What they are is an answer that can be checked against the grid at a glance:
+   * everything is on screen, or nothing marked is.
+   */
+  const FAVORITE_LABELS = { include: 'don’t care', exclude: 'no' };
   /** `PHAssetMediaType.video` raw value. Stored raw on the wire so a row and the
    *  cache's `assets` table cannot disagree about what an asset is. */
   const MEDIA_TYPE_VIDEO = 2;
@@ -1457,27 +1473,23 @@
   }
 
   /**
-   * Paints the favourites tag: the label for the state in force, and the sentence
-   * that says what that word means in this library.
+   * Paints the favorites tag: the answer it gives, and the sentence behind it.
    *
-   * The label states the **state**, not the action, which is what lets one control
-   * carry two states without a group around it: "All" means favorites are on screen,
-   * "Not favorite" means they are not. A label that named the action instead would
-   * have to be a third value, because the action inverts with the state — a tag
-   * reading "Hide favorites" while the favorites are already hidden is a control
-   * that lies about its own state for as long as it is on screen.
+   * The word "Favorite" beside the tag names the dimension, so the tag itself only
+   * answers the question it leaves open — `don’t care` while everything is on screen,
+   * `no` while the favorites are hidden. One button carries both states because the
+   * label is a *state*, and `aria-pressed` says the same for a screen reader; neither
+   * is an action, so neither inverts when the state does.
    *
    * Read from `state.favorites` rather than tracked from the click, for the same
    * reason the media chips read from `state.media`: the server's echo writes that
    * field too, and a tag painting from the last click could put its own idea of the
    * filter over somebody else's grid.
    *
-   * The count of what is hidden goes in the tooltip and the accessible name, and
-   * nowhere else: the header reports the library's assets and its clips, and "what
-   * am I not being shown" is a third question, answered where a reader goes when the
-   * grid looks emptier than it should. The accessible name *leads with the label*, so
-   * the sentence a screen reader hears still contains the word on the button — which
-   * is what keeps the visible text findable by the name it is printed under.
+   * The tooltip and the accessible name carry the sentence the two words cannot — what
+   * the state means for the grid, and how many favorites it is holding back, which is
+   * the only place that count appears. Both lead with the word beside the tag, so the
+   * name a screen reader hears contains the words printed on and next to the control.
    */
   function renderFavoritesToggle() {
     const button = $('favoriteToggle');
@@ -1490,9 +1502,11 @@
     const hidden = hiddenFavoriteCount();
     const sentence = hiding
       ? (hidden > 0
-        ? `${label} — the ${fmt.count(hidden)} ${fmt.plural(hidden, 'favorite', 'favorites')} PhotoCleaner has scored are hidden`
-        : `${label} — none of the photos PhotoCleaner has scored is a favorite, so nothing is hidden`)
-      : `${label} — every photo is shown, favorites included`;
+        ? `Favorite: ${label} — the ${fmt.count(hidden)} ${fmt.plural(hidden, 'favorite', 'favorites')} `
+          + 'PhotoCleaner has scored are not on the grid'
+        : `Favorite: ${label} — none of the photos PhotoCleaner has scored is a favorite, `
+          + 'so nothing is hidden')
+      : `Favorite: ${label} — every photo is on screen, favorites included`;
     button.title = sentence;
     button.setAttribute('aria-label', sentence);
   }
@@ -5161,10 +5175,10 @@
         // of the two: a grid that is empty because everything left in it is a favorite
         // says something true about *this filter* and nothing at all about the score
         // range, and a reader told only to widen the slider would widen it against a
-        // library that has already given up all it has. The tag has no label of its
-        // own to name, so the sentence points at it by what it reads on screen.
+        // library that has already given up all it has. The recovery quotes the tag's
+        // own two answers rather than naming the dimension, so it is a press away.
         title = 'Every photo in this score range is a favorite';
-        detail = 'The favorites tag reads “Not favorite” — press it for “All” to see the ones you have marked.';
+        detail = 'The Favorite tag reads “no” — press it for “don’t care” to see the ones you have marked.';
       } else if (state.media === 'videos') {
         title = 'No videos match this score range';
         detail = 'Widen the range, or choose “All” or “Photos” — PhotoCleaner can only show videos it has scored.';
@@ -5305,10 +5319,10 @@
       chip.addEventListener('click', () => selectMedia(chip.dataset.media));
     }
 
-    // The favourites filter: one tag, two states, so one listener and no `active`
-    // bookkeeping here — `renderFavoritesToggle` reads `state.favorites`, which the
-    // server's echo also writes, and painting from the click would let the tag
-    // disagree with the grid it is over.
+    // The favorites filter: the word beside the tag names the dimension and the tag
+    // answers whether it matters, so one listener and no `active` bookkeeping here —
+    // `renderFavoritesToggle` reads `state.favorites`, which the server's echo also
+    // writes, and painting from the click would let the tag disagree with the grid.
     $('favoriteToggle').addEventListener('click', () => toggleFavorites());
 
     $('icloudDownloads').addEventListener('change', async (event) => {
@@ -6770,10 +6784,11 @@
     // one in the markup: `selectMedia` and `adoptAppliedMedia` both write that
     // field, so the first paint has to come from the one place they agree on.
     renderMediaBar();
-    // And the favourites tag, from `state.favorites` for the same reason: the first
+    // And the favorites tag, from `state.favorites` for the same reason: the first
     // paint has to come from the one field `selectFavorites` and
-    // `adoptAppliedFavorites` agree on, not from the label in the markup — which is
-    // the off state, and would be the right first paint only by coincidence.
+    // `adoptAppliedFavorites` agree on, not from the two words in the markup — which
+    // are the unfiltered state, and would be the right first paint only by
+    // coincidence.
     renderFavoritesToggle();
     wireControls();
     syncRangeUI();

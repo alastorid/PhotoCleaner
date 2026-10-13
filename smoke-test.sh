@@ -198,30 +198,33 @@ else
   ok "the media filter offers All / Photos / Videos and the client reads it"
 fi
 
-# The favourites *filter* is a different control from favourites *protection*, and
-# the two must not be confused: this one hides the marked photos from the grid and
-# has nothing to do with deletion.
+# The favorites *filter* is a different control from favorites *protection*, and the
+# two must not be confused: this one hides the marked photos from the grid and has
+# nothing to do with deletion.
 #
-# It is one tag with two states, and both halves of that are decisions worth holding:
+# It is one tag under one label, and both halves of that are decisions worth holding:
 # a group of buckets spent a fifth of the panel's width on a third chip nobody wanted,
-# and the tag has no label of its own to name — the button reads the state it is in.
-# So the *absence* is asserted here (no `data-favorites`, no "Favorites only") and the
-# presence of the tag and of its two labels is asserted by the jsdom suite. That is the
-# pairing that stops the control quietly growing back into a group, the same way the
-# media filter's pairing above stops video support becoming "not implemented again".
+# and the tag answers its label ("don't care" / "no") rather than naming an action,
+# because an action label inverts with the state. So the *absence* is asserted here (no
+# `data-favorites`, no "Favorites only") and the presence of the label, the tag and its
+# two answers is asserted by the jsdom suite. That is the pairing that stops the control
+# quietly growing back into a group, the same way the media filter's pairing above
+# stops video support becoming "not implemented again".
 if ! grep -qF 'id="favoriteToggle"' "$ROOT/web/index.html" 2>/dev/null; then
-  bad "the favourites filter is not in the control panel — there may be no way to"
+  bad "the favorites filter is not in the control panel — there may be no way to"
   bad "  get the marked photos out of the way"
 elif ! grep -qF 'favoriteToggle' "$ROOT/web/app.js" 2>/dev/null; then
-  bad "the favourites filter is in the markup but the client never reads it"
+  bad "the favorites filter is in the markup but the client never reads it"
+elif ! grep -qF '<span class="control-label">Favorite</span>' "$ROOT/web/index.html" 2>/dev/null; then
+  bad "the favorites filter has no label naming the dimension it acts on"
 elif strip_html_comments "$ROOT/web/index.html" | grep -qF 'data-favorites'; then
-  bad "web/ turned the favourites tag back into a group of buckets"
+  bad "web/ turned the favorites tag back into a group of buckets"
 elif strip_html_comments "$ROOT/web/index.html" | grep -qiF 'Favorites only'; then
   bad "web/ offers a \"Favorites only\" state — a cleaner is not a favorites browser"
-elif ! grep -qF "'Not favorite'" "$ROOT/web/app.js" 2>/dev/null; then
-  bad "no \"Not favorite\" label in web/app.js — the tag needs its second state"
+elif ! grep -qF "don’t care" "$ROOT/web/app.js" 2>/dev/null; then
+  bad "no “don’t care” answer in web/app.js — the tag needs its second state"
 else
-  ok "the favourites filter is a single two-state tag and the client reads it"
+  ok "the favorites filter is one two-state tag under a Favorite label, and the client reads it"
 fi
 
 # The guarantee still has to be *stated* somewhere, or removing the control would

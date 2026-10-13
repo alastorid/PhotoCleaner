@@ -379,7 +379,7 @@ button { font: inherit; cursor: pointer; }
   padding-top: 12px;
   border-top: 1px solid var(--panel-border);
 }
-.sort-group, .toggle-group, .media-group {
+.sort-group, .toggle-group, .media-group, .favorites-group {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
 }
 /* Sort is the last thing in the panel, and it is pushed to the far right so that

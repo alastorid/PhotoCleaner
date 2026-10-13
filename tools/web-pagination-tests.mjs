@@ -81,37 +81,40 @@ try {
   assert.equal(app.$('emptyState').hidden, false);
   console.log('PASS an empty filtered page clears the previous count');
 
-  // The favourites filter, on the grid it belongs to. One tag, two states, and the
-  // label states the state rather than the action — so it reads "All" while the
-  // favorites are on screen and "Not favorite" while they are not. The server's third
-  // state (`only`) has no label here at all: a cleaner is not a favorites browser.
+  // The favorites filter, on the grid it belongs to. A "Favorite" label names the
+  // dimension and one tag answers it in two states — "don’t care" while everything is
+  // on screen, "no" while the marked ones are hidden. The server's third state
+  // (`only`) has no answer here at all: a cleaner is not a favorites browser.
   app.click('#mediaChips [data-media="images"]');
   await until(() => app.tileIds().length === 3);
   const tag = app.$('favoriteToggle');
-  assert.equal(tag.textContent, 'All', 'the tag does not start reading the state it is in');
+  assert.equal(app.$('favoritesGroup').querySelector('.control-label').textContent, 'Favorite',
+    'the control no longer names the dimension it acts on');
+  assert.equal(tag.textContent, 'don’t care', 'the tag does not start answering for its state');
   assert.equal(tag.getAttribute('aria-pressed'), 'false');
   assert.equal(app.window.document.querySelectorAll('#favoriteToggle').length, 1,
-    'there is more than one favourites control on the panel');
-  console.log('PASS the favourites filter is one tag, reading All');
+    'there is more than one favorites control on the panel');
+  assert.equal(tag.querySelectorAll('*').length, 0, 'the tag grew a label or a glyph inside it');
+  console.log('PASS one tag under a Favorite label, answering “don’t care”');
 
   app.click('#favoriteToggle');
   await until(() => requests[requests.length - 1].searchParams.get('favorites') === 'exclude');
   assert.equal(requests[requests.length - 1].searchParams.get('favorites'), 'exclude',
     'the filter was not sent on the wire, so the grid is the whole library');
-  assert.deepEqual(app.tileIds(), ['first', 'second'], 'the favourites filter did not reach the page');
+  assert.deepEqual(app.tileIds(), ['first', 'second'], 'the favorites filter did not reach the page');
   assert.equal(app.$('matchCount').textContent, '2', 'the count did not follow the filter');
-  assert.equal(tag.textContent, 'Not favorite', 'the tag did not repaint itself for the new state');
+  assert.equal(tag.textContent, 'no', 'the tag did not repaint itself for the new state');
   assert.equal(tag.getAttribute('aria-pressed'), 'true');
   // The hidden count is in the tooltip and the accessible name, and nowhere else: the
   // header reports the library's assets and its clips, not what this filter withholds.
-  assert.match(tag.title, /1 favorite/);
-  assert.match(tag.getAttribute('aria-label'), /^Not favorite/,
-    'the accessible name no longer leads with the label on the button');
-  console.log('PASS one press hides the favorites: label, aria-pressed, grid and count');
+  assert.match(tag.title, /^Favorite: no — the 1 favorite PhotoCleaner has scored/);
+  assert.match(tag.getAttribute('aria-label'), /^Favorite: no/,
+    'the accessible name no longer leads with the label beside the tag');
+  console.log('PASS one press hides the favorites: tag, aria-pressed, grid and count');
 
   app.click('#favoriteToggle');
   await until(() => app.tileIds().length === 3);
-  assert.equal(tag.textContent, 'All', 'the tag did not come back to its other label');
+  assert.equal(tag.textContent, 'don’t care', 'the tag did not come back to its other answer');
   assert.equal(tag.getAttribute('aria-pressed'), 'false');
   assert.equal(requests[requests.length - 1].searchParams.get('favorites'), 'include',
     'the default is omitted rather than sent, and a cursor minted under "exclude" '

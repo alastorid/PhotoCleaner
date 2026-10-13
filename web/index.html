@@ -187,17 +187,21 @@
       <button class="chip" data-media="videos">Videos</button>
     </div>
 
-    <!-- Favorites: one tag, between Media and Sort, for the same reason Media is —
-         both filter the same grid, and Sort stays last because it changes no
-         membership. It is a single `.chip` and nothing else, with no label of its own,
-         because it has only two states to hold: it reads **All**, or it reads **Not
-         favorite**, and a label plus two chips spent a fifth of the panel's width on a
-         control whose third chip was never wanted.
+    <!-- Favorites, between Media and Sort, for the same reason Media is — both
+         filter the same grid, and Sort stays last because it changes no membership.
 
-         The label states the state, not the action, so the tag never reads as a promise
-         about what pressing it will do. `aria-pressed` carries the same two states for a
-         screen reader, and the tooltip — the sentence that says what the word means in
-         this library, including how many favorites are being hidden — carries the rest.
+         The word beside the tag names the dimension; the tag is only the state, and so it
+         answers one question: does this filter care about favorites at all?
+         `don’t care` while everything is on screen, `no` while the marked ones are off
+         the grid. A tag that spelled the same answer out — "All" / "Not favorite" —
+         would be repeating the word beside it in a second hand's width of panel, and a
+         bare dash would have said nothing at all about which photos were involved.
+
+         The tag answers rather than acting: an action label inverts with the state,
+         so it would need a third value to stay honest. `aria-pressed` carries the
+         same two states, and the tooltip carries the sentence the tag cannot —
+         including how many favorites are being hidden, which is the only place that
+         count appears.
 
          There is no "Favorites only" state. The server has always accepted
          `favorites=include | exclude | only` and still does, so the API can do it in
@@ -209,8 +213,11 @@
          And no heart: the heart on a tile means "this photo is protected from deletion",
          so a heart on the control that hides those very photos would be saying the
          opposite of what it does. -->
-    <button class="chip" id="favoriteToggle" aria-pressed="false"
-            title="Every photo is shown, favorites included">All</button>
+    <div class="favorites-group" id="favoritesGroup">
+      <span class="control-label">Favorite</span>
+      <button class="chip" id="favoriteToggle" aria-pressed="false"
+              title="Favorite: don’t care — every photo is on screen, favorites included">don’t care</button>
+    </div>
 
     <div class="sort-group">
       <span class="control-label">Sort</span>

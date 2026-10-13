@@ -2090,16 +2090,19 @@ await check('the filter is one tag reading its own state', async (app) => {
   // rather than a group of buckets, and a label that states the state rather than
   // the action. The server has always accepted `only` as well, and this pins that it
   // has no label here — a cleaner is not a favorites browser.
-  assertEqual(app.$('favoriteToggle').textContent, 'All',
-    'the tag does not start reading the state it is in');
+  assertEqual(app.$('favoritesGroup').querySelector('.control-label').textContent, 'Favorite',
+    'the control no longer names the dimension it acts on');
+  assertEqual(app.$('favoriteToggle').textContent, 'don’t care',
+    'the tag does not start answering for the state it is in');
   assertEqual(app.$('favoriteToggle').getAttribute('aria-pressed'), 'false',
     'the grid starts with the favorites on screen');
-  assertEqual(app.$('favoriteChips'), null, 'the tag is a group of buckets again');
+  assertEqual(app.$('favoritesGroup').querySelectorAll('button').length, 1,
+    'the tag is a group of buckets again');
   assertEqual(app.$('favoriteToggle').querySelectorAll('*').length, 0,
     'the tag grew a label or a glyph inside it');
 });
 
-await check('“Not favorite” asks the server for the unfavorited photos', async (app) => {
+await check('the tag answering “no” asks the server for the unfavorited photos', async (app) => {
   const asked = [];
   const real = app.window.fetch;
   app.window.fetch = async (input, init) => {
@@ -2116,7 +2119,7 @@ await check('“Not favorite” asks the server for the unfavorited photos', asy
   assert(asked.every((value) => value === 'exclude'),
     `a page was fetched without the favorites filter in force: ${JSON.stringify(asked)}`);
   assert(tiles.length > 0, 'the unfavorited page is empty');
-  assertEqual(app.$('favoriteToggle').textContent, 'Not favorite',
+  assertEqual(app.$('favoriteToggle').textContent, 'no',
     'the tag did not repaint itself for the state the server answered');
   for (const tile of tiles) {
     assert(!/, favorite/.test(tile.getAttribute('aria-label') || ''),
@@ -2150,10 +2153,10 @@ await check('the tag follows the server\'s echo, not the click that asked', asyn
   app.click('#favoriteToggle');
   for (let attempt = 0; attempt < 40 && rewrote === 0; attempt += 1) await app.settle(100);
   assert(rewrote > 0, 'the filtered page carrying the echo was never fetched');
-  assertEqual(app.$('favoriteToggle').textContent, 'All',
+  assertEqual(app.$('favoriteToggle').textContent, 'don’t care',
     'the tag still shows the click rather than the filter the server applied');
   assertEqual(app.$('favoriteToggle').getAttribute('aria-pressed'), 'false',
-    '“Not favorite” is still marked as the state in force');
+    '“no” is still marked as the state in force');
 });
 
 await check('⌘A pins the favorite filter it snapshotted', async (app) => {
@@ -2179,7 +2182,7 @@ await check('⌘A pins the favorite filter it snapshotted', async (app) => {
 });
 
 await check('a snapshot taken with favorites hidden cannot be deleted once they are back', async (app) => {
-  // The failure this exists to prevent: a ⌘A on the "Not favorite" grid, then the
+  // The failure this exists to prevent: a ⌘A on the "no" grid, then the
   // reader presses the tag back to All, and a press still destroys a set that includes
   // the favorites the grid was deliberately not showing.
   const sent = interceptDeletes(app);

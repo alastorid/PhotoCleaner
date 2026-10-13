@@ -323,16 +323,17 @@ GET  /api/timeline/page
   `include | exclude` — **`only` is accepted by the server and deliberately not
   offered**, because a cleaner is not a favorites browser. A server that echoed
   `only` to this client would find the echo *ignored* rather than adopted, since the
-  tag has no label for that state.
-- **The favorites control is one tag, not a group of buckets, and its label states
-  the state.** A third chip was never wanted, and a label + two chips spent a fifth
-  of the panel's width on the one dimension with two states. The label is therefore
-  the state (`All` / `Not favorite`) rather than the action, which is what lets a
-  single button carry both without a group: an action label inverts with the state,
-  so it would need a third value to stay honest. `aria-pressed` carries the same two
-  states, and the tooltip — which leads with the label, so the accessible name still
-  contains the visible text — carries the count of what is hidden, which is the only
-  place that number appears.
+  tag has no answer for that state.
+- **The favorites control is one tag under one label, and the tag answers its label.**
+  A group of three chips spent a fifth of the panel's width on a dimension with two
+  states, and the third chip was never wanted. What is there now is the word
+  `Favorite`, which names the dimension, and one `.chip` that answers it: `don’t
+  care` while every photo is on screen, `no` while the marked ones are off the grid.
+  The tag **answers** rather than acting, which is what lets a single button hold
+  both states — an action label inverts with the state, so it would need a third
+  value to stay honest. `aria-pressed` carries the same two states, and the tooltip
+  carries the sentence the two words cannot, including the count of what is hidden,
+  which is the only place that number appears.
 - **`/api/photo/{id}/video` is the one route that answers 409.** A clip that exists
   but is iCloud-only is not a 404 — that would read as "this video is gone" and send
   the user looking for a file that is sitting in iCloud. It says which preference
