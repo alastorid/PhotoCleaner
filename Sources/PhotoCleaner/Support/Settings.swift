@@ -63,29 +63,6 @@ struct SettingsSnapshot: Sendable, Equatable, Codable {
     /// no full-resolution HEIC/RAW decode.
     var analysisPixelSize: Int = 1024
 
-    /// Look for a new release on launch.
-    ///
-    /// On by default, because a released build is a released artifact: the whole
-    /// point of a tag is that something changed, and a user left on 1.0.0 with a
-    /// security fix in 1.0.1 has no other way to find out. What it costs is one
-    /// HTTPS request that reads a public JSON document, at most once a day.
-    ///
-    /// It never blocks anything. The check is deferred a couple of seconds past
-    /// launch, its result is a state the window draws, and a failure is one line
-    /// in the log — the app does not wait for GitHub to start working.
-    var checkForUpdates: Bool = true
-
-    /// When the last update check ran, at all — automatic or manual.
-    ///
-    /// Stored so "check on launch" is really "check on launch, but not more than
-    /// once a day", and so a manual check resets the interval: someone who just
-    /// checked by hand has done what the launch check would have done.
-    ///
-    /// Not clamped or validated: a clock that jumps backwards produces a
-    /// timestamp in the future, which `Updater.checkOnLaunch` reads as "checked
-    /// very recently" and simply skips once. That is the harmless direction.
-    var lastUpdateCheck: Date?
-
     /// Every preference at its declared default.
     ///
     /// Explicit because writing `init(from:)` below suppresses the synthesized
@@ -137,9 +114,6 @@ struct SettingsSnapshot: Sendable, Equatable, Codable {
             ?? fallback.analysisConcurrency
         analysisPixelSize = try container.decodeIfPresent(Int.self, forKey: .analysisPixelSize)
             ?? fallback.analysisPixelSize
-        checkForUpdates = try container.decodeIfPresent(Bool.self, forKey: .checkForUpdates)
-            ?? fallback.checkForUpdates
-        lastUpdateCheck = try container.decodeIfPresent(Date.self, forKey: .lastUpdateCheck)
     }
 }
 

@@ -65,7 +65,6 @@ the runner says so and the marker should be deleted.
 | `AuthorizationTests.swift` | the Photos gate: which routes refuse, and the routes that must not |
 | `SchemaTests.swift` | the cache schema and its migrations |
 | `PresentationTests.swift` | launch flags, the shutdown relay, the window's navigation policy |
-| `UpdateTests.swift` | self-update: version comparison, the release feed, the install target, the phases |
 | `IconTests.swift` | the drawn icon: it renders, its body separates from every shipped desktop by luminance, it stays neutral, and its tile grid is countable at 32px |
 | `ThumbnailTests.swift` | the thumbnail size ladder: nearest rung, and ties downwards |
 | `SimilarGroupTests.swift` | FeaturePrint storage, the group builder, face aggregation, the Best Shot ranker, the group cache and routes |

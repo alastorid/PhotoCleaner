@@ -84,16 +84,6 @@ struct AppHooks: Sendable {
     /// only because a windowed app must not call `exit` from under itself.
     var didStop: @MainActor @Sendable () -> Void
 
-    /// The updater, once it exists.
-    ///
-    /// A callback rather than a stored property, and that is forced by the
-    /// construction order rather than chosen for tidiness: the hooks are built
-    /// before the object graph, and the updater needs the `Settings` instance
-    /// built with it. Handing it over here is what lets the windowed host draw it
-    /// while `--browser` and `--no-browser` — which pass `serverOnly` and get the
-    /// no-op default — still run the check and record the result in the log.
-    var didBuild: @MainActor @Sendable (Updater) -> Void = { _ in }
-
     /// A host that shows nothing and cannot be asked to stop: the server alone.
     static let serverOnly = AppHooks(
         present: { _ in },

@@ -31,52 +31,6 @@ enum AppPaths {
         return base.appendingPathComponent("PhotoCleaner", isDirectory: true)
     }
 
-    /// The GitHub repository releases are published to.
-    ///
-    /// One constant rather than something assembled from a build-time variable:
-    /// `release.yml` publishes to the repository this URL names, and a build
-    /// pointed at a feed that is not the one it was released from would install
-    /// an unrelated app over the running one. A fork that publishes elsewhere
-    /// should change it here, in the same commit that changes `make-dmg.sh`'s
-    /// `gh release` target.
-    static let releaseRepository = "alastorid/PhotoCleaner"
-
-    /// `GET /repos/{owner}/{repo}/releases/latest` — the newest non-draft,
-    /// non-prerelease release, which is exactly the one the update flow is
-    /// allowed to install.
-    static var updateFeedURL: URL? {
-        URL(string: "https://api.github.com/repos/\(releaseRepository)/releases/latest")
-    }
-
-    /// The architecture this binary was built for, which is what decides which
-    /// published asset can be installed.
-    ///
-    /// Decided at compile time rather than by asking `uname`, because a
-    /// Rosetta-translated process reports `x86_64` while the app bundle on disk
-    /// contains both slices — and asking for the `x86_64` DMG would then be
-    /// answering a question about the translation rather than about the app.
-    static var architecture: String {
-        #if arch(arm64)
-        return "arm64"
-        #elseif arch(x86_64)
-        return "x86_64"
-        #else
-        return "unknown"
-        #endif
-    }
-
-    /// `~/Library/Application Support/PhotoCleaner/update`
-    ///
-    /// Everything the updater writes lives under here, including the downloaded
-    /// image and the outgoing bundle it moves aside. Application Support rather
-    /// than `/tmp` because this is a resumable, user-visible amount of data; and
-    /// under PhotoCleaner's own directory rather than anywhere else so that
-    /// "PhotoCleaner writes nothing outside Application Support and Logs" —
-    /// which `smoke-test.sh` checks — stays true with the updater in the app.
-    static var updateDirectory: URL {
-        supportDirectory.appendingPathComponent("update", isDirectory: true)
-    }
-
     /// `~/Library/Application Support/PhotoCleaner/cache.sqlite`
     static var cacheDatabase: URL {
         supportDirectory.appendingPathComponent("cache.sqlite")

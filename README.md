@@ -141,21 +141,12 @@ one-time right-click → **Open** described in [Install](#install). Signing with
 real Developer ID and notarizing would fix that, at the cost of secrets in the
 workflow.
 
-### Staying up to date
+### Updating PhotoCleaner
 
-A build in `/Applications` can replace itself. **PhotoCleaner › Check for
-Updates…** (⌘U) checks the release feed, downloads the DMG for this
-architecture, verifies the app inside it, swaps it over the running bundle and
-relaunches. The title-bar arc does the same thing with one click, and is also
-where the progress is drawn. **Check for Updates Automatically** turns the
-once-a-day check on and off; turning it on checks immediately rather than waiting
-for the next launch.
-
-Two things it will not do. It refuses to install while it is running from a
-mounted disk image — move it to `/Applications` first — or into a folder this
-process cannot write. And the app it installs is ad-hoc signed like any other
-build, so macOS may ask for Photos access again after an update, for the same
-reason it does after a rebuild.
+Updates are installed manually. Download the latest DMG from
+[Releases](https://github.com/alastorid/PhotoCleaner/releases), quit
+PhotoCleaner, and replace the existing app in `/Applications` with the one from
+the DMG.
 
 ## Run
 
@@ -231,8 +222,7 @@ If access is denied the interface still loads and explains the problem; nothing
 is scanned.
 
 Because a rebuild produces a new ad-hoc signature, macOS may ask again after you
-rebuild — or after a self-update, which installs a freshly signed bundle. (A
-Developer ID signature would keep the grant stable; ad-hoc is what a
+rebuild. (A Developer ID signature would keep the grant stable; ad-hoc is what a
 dependency-free local build can do.)
 
 ## What it does
@@ -474,14 +464,10 @@ stray request cannot reach an arbitrary asset.
 - **No telemetry, no analytics, no crash reporting, no external fonts, no CDN,
   no remote icons, no image uploads.** The interface has no external resources of
   any kind and works with the network disconnected.
-- The process holds exactly one listening socket, `127.0.0.1:8765`, and the
-  only address it will ever open is that one.
-- There is exactly one outbound request, and it is the update check: a single
-  HTTPS `GET` of this repository's public release feed, at most once a day, off
-  an in-memory session with no cache or cookie storage. **PhotoCleaner ›
-  Check for Updates Automatically** turns it off. Nothing is uploaded with it.
-- The only authenticated network access is the one you opt into: PhotoKit
-  fetching an iCloud-stored original (see below).
+- The process listens on `127.0.0.1:8765` and makes no requests to release feeds
+  or other external services.
+- PhotoKit can fetch an iCloud-stored original when you explicitly enable that
+  setting (see below).
 
 ## iCloud behaviour
 
@@ -524,7 +510,6 @@ not local.
 |---|---|
 | Score cache | `~/Library/Application Support/PhotoCleaner/cache.sqlite` (plus `-wal`/`-shm`) |
 | Preferences | `~/Library/Application Support/PhotoCleaner/settings.json` |
-| Update scratch | `~/Library/Application Support/PhotoCleaner/update/` (only while an update is running) |
 | Clip exports | `~/Library/Application Support/PhotoCleaner/video-cache/` (bounded; every file is reproducible from Photos) |
 | Log | `~/Library/Logs/PhotoCleaner/PhotoCleaner.log` (rotates at 5 MB) |
 
@@ -542,8 +527,8 @@ assets are queued.
 rm -rf ~/Library/Application\ Support/PhotoCleaner ~/Library/Logs/PhotoCleaner
 ```
 
-That removes the score cache, the preferences, any update scratch and every cached
-clip export: they are all under Application Support, and the log (with its rotated
+That removes the score cache, the preferences and every cached clip export: they
+are all under Application Support, and the log (with its rotated
 `PhotoCleaner.log.1`) lives in Logs. Clip exports are worth naming explicitly
 because they are the largest thing the app can leave behind and the least
 interesting — every one of them is reproducible from Photos, and the next play of
@@ -712,7 +697,6 @@ Sources/PhotoCleaner/
   App/AppWindow.swift       NSWindow + WKWebView, navigation policy
   App/AppDelegate.swift     NSApplication lifecycle, menu, terminate handshake
   App/MainMenu.swift        the menu bar
-  App/UpdateIndicator.swift the title-bar arc that drives the updater
   Support/                  paths, logging, preferences, SSE fan-out
   Model/Records.swift       asset/filter/sort/cursor types
   Library/PhotoLibrary.swift    all PhotoKit access (auth, enumerate, images, delete)
@@ -727,7 +711,6 @@ Sources/PhotoCleaner/
   Analysis/SimilarGroupEngine.swift  the background grouping pass and Tier 3 faces
   Analysis/SignalCompression.swift    zlib + Codable for the cached Vision payloads
   HTTP/                     Network.framework server, router, API
-  Update/                   self-update: release feed, install target, installer, actor
   Web/                      embedded-asset accessor + generated file
 web/                        index.html, app.css, app.js (the editable UI source)
 Tests/                      the regression suite, one file per area; see Tests/README.md

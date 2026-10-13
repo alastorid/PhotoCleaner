@@ -227,7 +227,6 @@ func registerSettingsTests() {
         let partial = Settings(url: url)
         checkEqual(partial.snapshot().analysisConcurrency, 9,
                    "a partial file keeps what it states rather than discarding it")
-        checkEqual(partial.snapshot().checkForUpdates, true, "and defaults only what it omits")
         checkEqual(partial.snapshot().protectFavorites, true,
                    "and favourite protection is on whichever way the file is written")
     })

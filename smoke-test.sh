@@ -239,44 +239,16 @@ else
 fi
 
 head_ "Binary: no external resources"
-# Every URL the process can construct is either a loopback one or the release
-# feed.
-#
-# That second exception is real and narrow, so it is spelled out rather than
-# generalised: self-update has to ask somewhere which version is newest. The
-# allowance is one exact URL, listed here, so that any *other* non-loopback URL —
-# a telemetry endpoint, an analytics host, a CDN, a typo'd mirror — is still a
-# FAIL. Broadening the pattern to "api.github.com" or to "https:" would make this
-# check worthless exactly when it matters.
-ALLOWED_OFFSITE='https://api.github.com/repos/alastorid/PhotoCleaner/releases/latest'
+# The interface is served locally. Any external URL in the app binary could
+# create a network dependency, so only loopback URLs are allowed.
 URLS="$(strings -a "$BINARY" 2>/dev/null | grep -oE 'https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+' | sort -u)"
 BAD_URLS="$(printf '%s\n' "$URLS" | grep -v '^http://127\.0\.0\.1:' \
-            | grep -v "^${ALLOWED_OFFSITE}\$" | grep -v '^$' || true)"
+            | grep -v '^$' || true)"
 if [ -z "$BAD_URLS" ]; then
-  ok "the binary reaches only loopback and the release feed"
-  printf '        %s\n' "$ALLOWED_OFFSITE"
+  ok "the binary contains no non-loopback URLs"
 else
-  bad "the binary contains non-loopback URL(s) that are not the release feed:"
+  bad "the binary contains non-loopback URL(s):"
   printf '%s\n' "$BAD_URLS" | sed 's/^/        /'
-fi
-
-# The feed URL is built from a repository constant, so the literal in the binary
-# is only half the story. Confirm the constant the app uses is the one allowed
-# here — otherwise this check would pass for a fork pointed at its own releases
-# while claiming the audit above is about this repository.
-FEED_SOURCE="$(grep -oE 'static let releaseRepository = "[^"]+"' \
-              "$ROOT/Sources/PhotoCleaner/Support/AppPaths.swift" 2>/dev/null \
-              | sed -n 's/.*"\(.*\)"/\1/p' || true)"
-if [ -n "$FEED_SOURCE" ]; then
-  EXPECTED_FEED="https://api.github.com/repos/$FEED_SOURCE/releases/latest"
-  if [ "$EXPECTED_FEED" = "$ALLOWED_OFFSITE" ]; then
-    ok "AppPaths.releaseRepository is $FEED_SOURCE, matching the allowed feed"
-  else
-    bad "AppPaths.releaseRepository is '$FEED_SOURCE', so the update feed is"
-    printf '        %s\n' "$EXPECTED_FEED"
-    printf '        which is not the allowed feed. Update ALLOWED_OFFSITE above only\n'
-    printf '        if that is intended, and say so in the README.\n'
-  fi
 fi
 
 # ---------------------------------------------------------------- running server
@@ -359,16 +331,12 @@ else
 
     # The offline claim, checked without touching network configuration.
     #
-    # A connection to the release feed is the one permitted outbound socket: the
-    # update check runs at most once a day, is deferred past launch, and is not
-    # something a page load triggers. Anything else off-loopback still fails.
+    # The process should have no external sockets. Allow its loopback listener
+    # and established connections to clients on this Mac only.
     OFFSITE="$(lsof -nP -a -p "$PID" -i 2>/dev/null | tail -n +2 | awk '{print $9}' \
-               | grep -v "^127\.0\.0\.1:$PORT" \
-               | grep -vE '(:443$|->)' | sort -u || true)"
-    GITHUB="$(lsof -nP -a -p "$PID" -i 2>/dev/null | tail -n +2 | awk '{print $9}' \
-               | grep -E 'api\.github\.com.*:443|->.*:443' | sort -u || true)"
+               | grep -vE '^127\.0\.0\.1:[0-9]+(->127\.0\.0\.1:[0-9]+)?$' | sort -u || true)"
     if [ -z "$OFFSITE" ]; then
-      ok "every socket the process holds is $PORT on 127.0.0.1${GITHUB:+ or the release feed}"
+      ok "every socket the process holds is on loopback"
     else
       bad "the process holds a non-loopback endpoint:"
       printf '%s\n' "$OFFSITE" | sed 's/^/        /'

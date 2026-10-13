@@ -85,18 +85,6 @@ final class PhotoCleanerApp: Sendable {
         }
 
         let settings = Settings()
-        // The updater is built here rather than by the host because it needs the
-        // same `Settings` the rest of the graph uses, and it is handed over
-        // straight away. Every presentation mode gets one: `--no-browser` has no
-        // window to draw it in, but it can still find out there is a fix.
-        //
-        // Handed over *before* the server starts, not after. `requestAuthorization`
-        // below can put a system dialog in front of the user for as long as they
-        // take to answer it, and the menu's "Check for Updates Automatically"
-        // checkmark is a setting read from `settings.json` — the one thing about
-        // the updater a user can see before the window even exists.
-        let updater = Updater(settings: settings)
-        await hooks.didBuild(updater)
         let bus = EventBus()
         let library = PhotoLibrary.shared
         let engine = AnalysisEngine(cache: cacheStore, library: library, settings: settings, bus: bus)
@@ -144,15 +132,6 @@ final class PhotoCleanerApp: Sendable {
         let heartbeat = startHeartbeat(bus: bus)
         let signals = installSignalHandlers()
         hooks.shutdown.add { signals.trigger() }
-
-        // The updater was built above, with `settings`; what is left is the check
-        // itself. Detached, deliberately. This is the one thing in the launch
-        // sequence that must not be able to delay the window: the check is
-        // deferred a couple of seconds, needs no UI thread, and ends by `exit`ing
-        // on success. Nothing else here may wait on it.
-        Task.detached(priority: .background) { [updater] in
-            await updater.checkOnLaunch()
-        }
 
         // Run until the user interrupts the process or the window closes.
         // Analysis state is persisted continuously, so an abrupt exit loses at
@@ -258,8 +237,7 @@ final class PhotoCleanerApp: Sendable {
         exit(1)
     }
 
-    /// Probes loopback only — the sole network request this tool ever makes, and
-    /// it never leaves the machine. Used purely to make a second launch behave
+    /// Probes the loopback API only. Used purely to make a second launch behave
     /// like focusing the already-running instance.
     ///
     /// On its own session rather than `URLSession.shared`, because the shared one
@@ -267,8 +245,7 @@ final class PhotoCleanerApp: Sendable {
     /// `~/Library/Caches`: `smoke-test.sh` holds the app to storing no HTTP
     /// response outside Application Support, and a stale one here would be worse
     /// than the disk write anyway — a cached 200 for a port whose server has since
-    /// quit would report "already running" and focus nothing. Same reasoning, and
-    /// the same session shape, as the updater's.
+    /// quit would report "already running" and focus nothing.
     private static func isRunningAt(port: UInt16) async -> Bool {
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/status") else { return false }
         var request = URLRequest(url: url)

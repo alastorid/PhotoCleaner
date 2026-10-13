@@ -35,10 +35,6 @@ Apple Photos ──PhotoKit──► PhotoLibrary ──► AnalysisEngine (4 bo
                               │
                               └──► Router ──► HTTPServer (NWListener, 127.0.0.1)
                                               EventBus (SSE) ──► AppWindow (WKWebView)
-                                                                    │
-                                                              UpdateIndicator
-                                                                    │
-                                               Updater ──► release feed ──► UpdateInstaller
 ```
 
 Three views sit over the same cache:
@@ -709,42 +705,6 @@ Each of these is load-bearing:
     `Tests/IconTests.swift` is set to catch a tile disappearing altogether, not
     to police this particular number.
 
-### The title-bar arc
-
-The window carries one accessory view: `UpdateIndicatorController`, added at
-construction as an `NSTitlebarAccessoryViewController`, which draws the updater's
-state and posts a click back to `AppDelegate`. Several properties of it are
-deliberate:
-
-- **The window draws and starts nothing.** It holds no `Updater` and never touches
-  the network. The one place in the app that can replace the running bundle is
-  `PhotoCleanerApp`, which owns the process; a view controller that could start a
-  download would be a second owner of that.
-- **The arc is a control, and its title says what a click will do** — "Update to
-  1.2.4…" when there is an update, "Check for Updates…" when there is not, and the
-  phase while one is in flight. A fixed label next to a known version is a question
-  the user has to answer mentally.
-- **A click is not confirmed.** The affordance is labelled with what it does and
-  the app replaces itself; a confirmation sheet on the app's own title bar would be
-  a dialog it had already answered.
-- **A failure is shown; success is not.** Success ends in the window being replaced,
-  so an alert then would race the restart. A failure has to be loud, because an app
-  that silently stays on the old version is worse than one that says why.
-- **The flow is one actor.** `Updater` is an actor because the flow is a state
-  machine with exactly one writer: a second check arriving mid-download must not
-  start a second one. `Phase.isBusy` is what refuses it.
-- **The session is ephemeral, with no cache and no cookie storage.** That is not
-  tidiness — it is what keeps `smoke-test.sh`'s check that the URL cache holds no
-  response true now that the app makes a request off the machine. A cached release
-  feed would also mean a user on a plane could be told they were up to date for as
-  long as the cache entry lived.
-
-`UpdateTarget.plan` decides where the update goes *before* anything is downloaded,
-and the install is verified twice: once on the copy staged inside Application
-Support and once on the bundle that is actually installed afterwards, with the
-outgoing bundle moved aside first so a failed swap rolls back rather than leaving no
-app.
-
 ---
 
 ## 8. Constraints that look like style but are not
@@ -1101,10 +1061,9 @@ within-group ordering? If neither, it does not belong.
 
 ## 10. Known limitations
 
-- Ad-hoc signing means a rebuilt app may re-prompt for Photos permission, and a
-  self-update installs a freshly signed bundle, so it does the same. A Developer
-  ID signature would keep the grant stable; ad-hoc is what a dependency-free local
-  build can do.
+- Ad-hoc signing means a rebuilt app may re-prompt for Photos permission. A
+  Developer ID signature would keep the grant stable; ad-hoc is what a
+  dependency-free local build can do.
 - **The cache grows by ~90 MB** once FeaturePrints are computed, and there is **no
   eviction** (§6.4).
 - The ~30% of the library that is cloud-only can be neither grouped nor
@@ -1220,22 +1179,6 @@ within-group ordering? If neither, it does not belong.
   because a stall there costs a player, not the pass.
 - A scan is not a consistent snapshot: the library can mutate mid-enumeration. That is
   handled, but not prevented.
-- **Self-update cannot install everything.** `UpdateTarget.plan` refuses a bundle that
-  is not an `.app`, one running from a mounted disk image (the write would vanish on
-  eject, whatever the volume's own flag says), and one in a folder this process cannot
-  write — which includes `/Applications` on a Mac where it needs authentication. Each
-  refusal is reported in the title bar's arc rather than discovered after a 15 MB
-  download.
-- **Self-update replaces the running bundle.** There is no way to launch the new copy
-  from inside the process that is about to be replaced, so the install schedules a
-  relaunch against the old pid and exits. The outgoing bundle is moved aside first and
-  put back if the swap cannot be verified, so a failed update leaves the previous
-  version installed rather than no app at all.
-- The updater downloads over HTTPS from one exact feed — this repository's
-  `releases/latest` — and refuses any asset URL whose scheme is not `https`.
-  `smoke-test.sh` holds the binary to that one URL, so a second outbound host cannot
-  be introduced quietly.
-
 ---
 
 ## 11. How this is verified
@@ -1249,7 +1192,7 @@ executable, because SwiftPM does not work here.
    the count contract, favourite protection, keyset pagination over tied values, the
    analysis state machine, HTTP parsing and single-response latching, timeline
    ordering, confirm tokens, albums, similar groups, schema migration, the
-   Photos authorization gate, self-update, the icon, the window's
+   Photos authorization gate, the icon, the window's
    launch-flag parsing,
    shutdown relay and navigation policy, face definition (sharpness beats
    blur at any size, flat and clipped regions, pixelation boundaries,

@@ -16,7 +16,7 @@ import AppKit
 enum MainMenu {
     static func install(target: AppDelegate) {
         let mainMenu = NSMenu()
-        mainMenu.addItem(applicationMenuItem(target: target))
+        mainMenu.addItem(applicationMenuItem())
         mainMenu.addItem(editMenuItem())
         mainMenu.addItem(viewMenuItem(target: target))
         mainMenu.addItem(windowMenuItem())
@@ -29,7 +29,7 @@ enum MainMenu {
 
     // MARK: - PhotoCleaner
 
-    private static func applicationMenuItem(target: AppDelegate) -> NSMenuItem {
+    private static func applicationMenuItem() -> NSMenuItem {
         let menu = NSMenu(title: "PhotoCleaner")
 
         let about = menu.addItem(withTitle: "About PhotoCleaner",
@@ -38,33 +38,6 @@ enum MainMenu {
         about.target = nil // NSApplication owns this one.
 
         menu.addItem(.separator())
-
-        // Updates, in the application menu where "Check for Updates…" belongs: it
-        // is about the app rather than about the window or a document.
-        //
-        // Left enabled while a download runs. Greying it out would be tidier, but
-        // the title bar arc in the same state swaps its own pointer for an arrow,
-        // and having the two affordances answer differently sends someone hunting
-        // for whichever one still works. The updater ignores a second press, and
-        // it is the one place that can tell.
-        let check = menu.addItem(withTitle: "Check for Updates…",
-                                 action: #selector(AppDelegate.checkForUpdates(_:)),
-                                 keyEquivalent: "u")
-        check.target = target
-        updateItem = check
-
-        // No initial state here. The checkmark is not this file's to guess: it
-        // belongs to `Settings.checkForUpdates`, and `MainMenu.updateItem(for:)`
-        // writes the one value the updater will actually act on. Guessing `on`
-        // would put a tick next to a user who had deliberately turned the check
-        // off, and it would survive until the first updater status arrived —
-        // which is not instant, because the Photos permission prompt can sit in
-        // front of it.
-        let automatic = menu.addItem(withTitle: "Check for Updates Automatically",
-                                     action: #selector(AppDelegate.toggleAutomaticUpdateChecks(_:)),
-                                     keyEquivalent: "")
-        automatic.target = target
-        automaticItem = automatic
 
         menu.addItem(.separator())
 
@@ -91,46 +64,6 @@ enum MainMenu {
                      keyEquivalent: "q")
 
         return wrap("PhotoCleaner", menu)
-    }
-
-    // MARK: - Update items
-
-    /// The two update items, held so one value can drive both.
-    ///
-    /// `nonisolated(unsafe)` rather than a lock: `install` and `updateItem(for:)`
-    /// are both `@MainActor`, so these are only ever touched from the main thread
-    /// and a lock would be ceremony around a guarantee the isolation already gives.
-    private nonisolated(unsafe) static var updateItem: NSMenuItem?
-    private nonisolated(unsafe) static var automaticItem: NSMenuItem?
-
-    /// Reflect one updater state in the menu.
-    ///
-    /// The item's *title* carries what will happen, because a fixed "Check for
-    /// Updates…" sitting next to a known 1.2.3 is a question the user has to
-    /// answer mentally. It never becomes an error message: what happened to the
-    /// last attempt belongs in the window and the log, not in a menu that is
-    /// re-read every time it opens.
-    ///
-    /// `.checking` deliberately reads as "Check for Updates…" rather than
-    /// "Checking…": the menu is left enabled while the updater works, because the
-    /// title bar arc in the same state swaps its own pointer for an arrow, and two
-    /// affordances that answer differently send someone hunting for whichever one
-    /// still works.
-    static func updateItem(for status: Updater.Status) {
-        automaticItem?.state = status.automaticChecks ? .on : .off
-        guard let item = updateItem else { return }
-        switch status.phase {
-        case .available:
-            item.title = status.offered.map { "Update to \($0.version)…" } ?? "Check for Updates…"
-        case .downloading:
-            item.title = "Downloading Update…"
-        case .installing:
-            item.title = "Installing Update…"
-        case .restarting:
-            item.title = "Restarting…"
-        default:
-            item.title = "Check for Updates…"
-        }
     }
 
     // MARK: - Edit

@@ -20,7 +20,6 @@ final class AppWindow: NSObject, WKUIDelegate, WKNavigationDelegate {
     private let url: URL
     private let window: NSWindow
     private let webView: WKWebView
-    private let updateIndicator = UpdateIndicatorController()
 
     init(url: URL) {
         let configuration = WKWebViewConfiguration()
@@ -53,11 +52,6 @@ final class AppWindow: NSObject, WKUIDelegate, WKNavigationDelegate {
         window.minSize = NSSize(width: 760, height: 540)
         window.setFrameAutosaveName(AppWindow.frameAutosaveName)
 
-        // The update control goes in beside the title. Added once, at construction:
-        // the accessory has to exist before the first update status arrives, and
-        // the flow it drives replaces this very bundle.
-        window.addTitlebarAccessoryViewController(updateIndicator)
-
         self.url = url
         self.webView = webView
         self.window = window
@@ -83,37 +77,6 @@ final class AppWindow: NSObject, WKUIDelegate, WKNavigationDelegate {
     /// ⌘R: reload the interface and throw away the current page state.
     func reload() {
         webView.reloadFromOrigin()
-    }
-
-    // MARK: - Update control
-
-    /// Show the updater's state in the title bar.
-    ///
-    /// The window draws and nothing else: it holds no `Updater` and starts no
-    /// work, so the one place the app can replace itself is still
-    /// `PhotoCleanerApp`, which owns the process.
-    func showUpdateStatus(_ status: Updater.Status) {
-        updateIndicator.apply(status)
-    }
-
-    /// Show `alert` as a sheet on this window, or modally if the window is not
-    /// on screen.
-    ///
-    /// The wrapping lives here rather than in `AppDelegate` because `AppWindow`
-    /// deliberately does not expose its `NSWindow` — nothing else in the app has a
-    /// reason to hold it, and one method that shows a sheet is a much smaller hole
-    /// than the window itself.
-    ///
-    /// The modal fallback is for the case where the window exists but has not been
-    /// shown, which is what a second launch that focused an existing instance sees.
-    /// `beginSheetModal` against an off-screen window never presents, so the
-    /// fallback is not defensive padding: without it that alert is never seen.
-    func present(_ alert: NSAlert) {
-        guard window.isVisible else {
-            alert.runModal()
-            return
-        }
-        alert.beginSheetModal(for: window) { _ in }
     }
 
     // MARK: - Navigation policy
