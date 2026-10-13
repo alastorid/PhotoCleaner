@@ -95,7 +95,7 @@ never taken `favorites`; `groupMemberClause` builds the member predicate and
 constrains on it. Adding it would mean filtering members *inside* a group, which is
 a different question from filtering groups: a burst whose best shot is a favorite
 would become a two-photo strip, and the card would then be about a group the reader
-can no longer compare. So `selectFavorites` resets the grid and does not call
+can no longer compare. So `selectFavorites` reloads the grid and does not call
 `resetGroupsWindow()`, and the group browser shows favorites whatever the tag says.
 That contradiction is visible rather than hidden — a favorite in a strip carries the
 same heart the grid gives them — which is the same standard §1 applies to a list
@@ -324,6 +324,24 @@ GET  /api/timeline/page
   offered**, because a cleaner is not a favorites browser. A server that echoed
   `only` to this client would find the echo *ignored* rather than adopted, since the
   tag has no answer for that state.
+- **The favorites filter does not disturb a review.** `reloadGridKeepingPreview` is
+  the odd one out among the grid's filter paths: `resetGrid` closes a live preview
+  and starts again from page one, which is right for a filter that changes what the
+  grid *is*, and wrong for this one — a reader reaches for the tag while a photograph
+  is on the stage. Three things are therefore kept. The **preview**, because a live
+  preview's queue *is* `state.items` by reference, which is why the reload empties the
+  rows *in place* (`absorbPage`'s `replace`) rather than into a new array — a new array
+  would leave the preview paging through a window with nothing to do with the grid
+  behind it. The **tiles**, cleared only once the answer is in hand, so the sheet does
+  not flash empty at a reader who only moved a filter. And the **scroll position**.
+  The photograph on the stage is re-pointed at its new index and repainted, which is a
+  no-op for the image, the zoom and a playing clip; if it has genuinely left the set
+  (favourited while the tag read `no`) the preview moves to the photograph that took
+  its place instead of closing, and only an empty grid closes it. The reload returns
+  `ok` / `failed` / `superseded`, and only `failed` puts the tag back — losing a race
+  to a newer press is not a failure, and undoing that press would leave the control
+  disagreeing with the grid. `loadPage`'s page adoption was extracted into
+  `absorbPage` so both paths adopt a response through the same code.
 - **The favorites control is one tag under one label, and the tag answers its label.**
   A group of three chips spent a fifth of the panel's width on a dimension with two
   states, and the third chip was never wanted. What is there now is the word

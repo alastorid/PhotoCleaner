@@ -41,6 +41,10 @@ function assertEqual(actual, expected, message) {
   if (a !== b) throw new Error(`${message}\n            expected ${b}\n            actual   ${a}`);
 }
 
+function assertMatch(actual, pattern, message) {
+  if (!pattern.test(actual)) throw new Error(`${message}\n            expected to match ${pattern}\n            actual   ${actual}`);
+}
+
 /** Clicks the tile whose data-id is `id`. */
 function clickTile(app, id) {
   const tile = app.window.document.querySelector(`#grid .tile[data-id="${id}"]`);
@@ -2124,6 +2128,72 @@ await check('the tag answering “no” asks the server for the unfavorited phot
   for (const tile of tiles) {
     assert(!/, favorite/.test(tile.getAttribute('aria-label') || ''),
       `a tile on a page that hides favorites is announced as one: ${tile.getAttribute('aria-label')}`);
+  }
+});
+
+await check('the preview survives the switch, on the same photograph', async (app) => {
+  // The headline reason this filter reloads the way it does. A reader reaches for the
+  // tag in the middle of a review, so pressing it with a photograph on the stage must
+  // not close the stage and empty the contact sheet.
+  //
+  // Asserted on the preview's own `src`, before and after, rather than on a row
+  // identity: the reload empties `state.items` and re-fills it, so the photograph is
+  // looked up again and the question is whether the *stage* changed — a re-fetch of the
+  // same photograph would be a flicker the reader sees as the preview reloading.
+  await showUnfavorited(app);
+  const tiles = [...app.window.document.querySelectorAll('#grid .tile')];
+  const tile = tiles[Math.min(1, tiles.length - 1)];
+  tile.dispatchEvent(new app.window.KeyboardEvent('keydown',
+    { key: ' ', bubbles: true, cancelable: true }));
+  for (let attempt = 0; attempt < 40 && app.$('lightbox').hidden; attempt += 1) await app.settle(100);
+  assertEqual(app.$('lightbox').hidden, false, 'Space did not open the preview');
+  const stage = app.$('lightboxImage').getAttribute('src');
+
+  app.click('#favoriteToggle');            // back to `don't care`
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await app.settle(100);
+    if (app.$('favoriteToggle').getAttribute('aria-pressed') === 'false'
+        && !app.$('lightbox').hidden && app.$('lightboxImage').getAttribute('src')) break;
+  }
+  assertEqual(app.$('lightbox').hidden, false, 'the preview closed on a favorites switch');
+  assertEqual(app.$('lightboxImage').getAttribute('src'), stage,
+    'the preview re-fetched the photograph it was already showing');
+  assertMatch(app.$('lightboxPosition').textContent, /of \d+ loaded/,
+    `the preview is not walking the reloaded grid: ${app.$('lightboxPosition').textContent}`);
+});
+
+await check('favouriting the photograph on the stage moves the preview rather than closing it', async (app) => {
+  // The other half of the same promise: the press that makes a photograph leave the
+  // filter is most often taken on the photograph being looked at, so the preview has to
+  // survive it too — moving to the photograph that took the departed one's place.
+  //
+  // Writes to the library, so it restores the flag afterwards.
+  const tiles = await showUnfavorited(app);
+  const target = tiles[0].dataset.id;
+  const tile = app.window.document.querySelector(`#grid .tile[data-id="${app.window.CSS.escape(target)}"]`);
+  tile.dispatchEvent(new app.window.KeyboardEvent('keydown',
+    { key: ' ', bubbles: true, cancelable: true }));
+  for (let attempt = 0; attempt < 40 && app.$('lightbox').hidden; attempt += 1) await app.settle(100);
+  assertEqual(app.$('lightbox').hidden, false, 'Space did not open the preview');
+  const stage = app.$('lightboxImage').getAttribute('src');
+
+  try {
+    app.click('#lightboxFavoriteToggle');
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await app.settle(150);
+      if (!app.window.document.querySelector(
+        `#grid .tile[data-id="${app.window.CSS.escape(target)}"]`)) break;
+    }
+    assertEqual(app.$('lightbox').hidden, false,
+      'favouriting the photograph on the stage closed the preview');
+    assert(app.$('lightboxImage').getAttribute('src') !== stage,
+      'the preview kept showing a photograph the filter now hides');
+  } finally {
+    await fetch(`${base}/api/favorites`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: [target], favorite: false }),
+    });
   }
 });
 

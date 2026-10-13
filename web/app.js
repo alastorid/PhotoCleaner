@@ -1154,46 +1154,7 @@
     try {
       const data = await api.get('/api/photos?' + pageQuery(cursor).toString());
       if (generation !== state.generation) return; // a newer filter owns the grid now
-      adoptObservedBounds(data.bounds?.min, data.bounds?.max, false);
-      // What the server applied, not what was asked for — see `adoptAppliedMedia`.
-      // Read on *every* page rather than only the first, because the echo is
-      // also the cheapest notice this client gets that it and the server are on
-      // different builds; on a later page it would otherwise go unnoticed.
-      adoptAppliedMedia(data.filter && data.filter.media);
-      // Same echo, same reason, for the favourite filter. The generation check
-      // above is what makes it safe to read on every page: a page requested
-      // before the chip was pressed is dropped whole, so its echo describes a
-      // filter the client has already left and cannot undo the click.
-      adoptAppliedFavorites(data.filter && data.filter.favorites);
-      // The definition range the server applied, and the
-      // observed extremes it measured over. Both ride the
-      // same page response the score bounds do; neither
-      // moves the grid on its own — the grid already shows
-      // the server's answer — they only keep the slider and
-      // its readout honest about it. The echo is adopted
-      // only from a page whose request matches the filter
-      // the client holds now: one that predates a drag
-      // describes the filter as it *was*, and adopting it
-      // would undo that drag.
-      const definitionEchoChanged = definitionStateMatches(requestedDefinition)
-        ? adoptAppliedDefinition(data.filter && data.filter.faceDefinition)
-        : false;
-      const definitionBoundsChanged =
-        adoptObservedDefinitionBounds(data.faceDefinition);
-      if (definitionEchoChanged || definitionBoundsChanged) syncDefinitionUI();
-      const rows = Array.isArray(data.items) ? data.items : [];
-      state.total = Number(data.total) || 0;
-      state.nextCursor = data.nextCursor || null;
-      // Album names for this page only. Kept in a map keyed by identifier rather
-      // than on the rows so the rows stay exactly what the cache holds, and so an
-      // absent map entry reads as "no name known" rather than "not in an album".
-      absorbAlbumTitles(data.filter && data.filter.albums);
-      const offset = state.items.length;
-      state.items.push(...rows);
-      renderTiles(rows, offset);
-      updateCounts();
-      updateLoadMore();
-      renderEmptyState();
+      absorbPage(data, requestedDefinition);
       // IntersectionObserver only reports threshold crossings: if one page was
       // not enough to push the sentinel out of the margin, ask for the next.
       if (state.nextCursor) {
@@ -1210,6 +1171,70 @@
         state.inflightGeneration = -1;
       }
     }
+  }
+
+  /**
+   * Absorbs one page response: every field it carries, then the tiles that carry them.
+   *
+   * Extracted from `loadPage` so the favorites filter's own reload adopts a page
+   * through the *same* code rather than a second copy of it. That is not tidiness for
+   * its own sake: the two paths have to agree about which echo to adopt, where the
+   * score bounds come from and when the count is written, and a client that adopted a
+   * page slightly differently depending on which control asked for it would show a
+   * grid disagreeing with its own panel — the one state in which every number on
+   * screen is a lie.
+   *
+   * `requestedDefinition` is the definition range *as this request carried it*,
+   * captured before the await, because the drag's reload is debounced and a page
+   * requested before a change is always still in flight when the change happens. The
+   * echo is adopted only from a page that matches it: one that predates a drag
+   * describes the filter as it *was*, and adopting it would undo that drag.
+   *
+   * `replace` empties the loaded window first, for the reload that changes which rows
+   * exist rather than adding to them. It empties `state.items` **in place** rather than
+   * assigning a new array, and that is load-bearing: a live preview's queue *is*
+   * `state.items` by reference (`openLightbox` records `live: queue === state.items`),
+   * so a fresh array would leave the preview paging through a window that no longer
+   * had anything to do with the grid behind it.
+   */
+  function absorbPage(data, requestedDefinition, { replace = false } = {}) {
+    adoptObservedBounds(data.bounds?.min, data.bounds?.max, false);
+    // What the server applied, not what was asked for — see `adoptAppliedMedia`.
+    // Read on *every* page rather than only the first, because the echo is
+    // also the cheapest notice this client gets that it and the server are on
+    // different builds; on a later page it would otherwise go unnoticed.
+    adoptAppliedMedia(data.filter && data.filter.media);
+    // Same echo, same reason, for the favourite filter. The caller's generation check
+    // is what makes it safe on every page: one requested before the tag was pressed is
+    // dropped whole, so its echo describes a filter the client has already left.
+    adoptAppliedFavorites(data.filter && data.filter.favorites);
+    // The definition range the server applied, and the
+    // observed extremes it measured over. Both ride the
+    // same page response the score bounds do; neither
+    // moves the grid on its own — the grid already shows
+    // the server's answer — they only keep the slider and
+    // its readout honest about it.
+    const definitionEchoChanged = definitionStateMatches(requestedDefinition)
+      ? adoptAppliedDefinition(data.filter && data.filter.faceDefinition)
+      : false;
+    const definitionBoundsChanged =
+      adoptObservedDefinitionBounds(data.faceDefinition);
+    if (definitionEchoChanged || definitionBoundsChanged) syncDefinitionUI();
+    const rows = Array.isArray(data.items) ? data.items : [];
+    state.total = Number(data.total) || 0;
+    state.nextCursor = data.nextCursor || null;
+    // Album names for this page only. Kept in a map keyed by identifier rather
+    // than on the rows so the rows stay exactly what the cache holds, and so an
+    // absent map entry reads as "no name known" rather than "not in an album".
+    absorbAlbumTitles(data.filter && data.filter.albums);
+    if (replace) state.items.length = 0;
+    const offset = state.items.length;
+    state.items.push(...rows);
+    renderTiles(rows, offset);
+    updateCounts();
+    updateLoadMore();
+    renderEmptyState();
+    return rows;
   }
 
   function loadNextPage() {
@@ -1548,6 +1573,113 @@
   }
 
   /**
+ * Re-reads the grid for the favorites filter **without** putting the preview away or
+ * starting the grid again from nothing.
+ *
+ * ## Why this is not `resetGrid`
+ *
+ * `resetGrid` is the right answer for a filter that changes what the *grid* is: it
+ * drops every loaded row, closes a live preview whose queue was those rows, and
+ * starts from page one. For this dimension both of those are wrong, because the
+ * reader is usually mid-review when they reach for the tag: pressing it while a
+ * photograph is on the stage closed the stage, emptied the contact sheet and threw
+ * away the scroll position, to change which photos are in a set the reader was
+ * already looking at. The filter has one bit of state and no new control to learn —
+ * it should cost nothing but the rows themselves changing.
+ *
+ * So this keeps three things that `resetGrid` spends:
+ *
+ * - **The preview.** A live preview's queue *is* `state.items` by reference, which is
+ *   why the rows are emptied in place (`absorbPage`'s `replace`) rather than into a
+ *   new array: the array the preview walks has to be the array the grid fills.
+ * - **The tiles on screen.** Nothing is cleared until the answer is in hand, so
+ *   moving the tag does not flash an empty sheet at a reader who only moved a
+ *   filter.
+ * - **The scroll position**, restored afterwards — not the same rows at the same
+ *   offsets, which the filter makes impossible, but the same distance down the page.
+ *
+ * ## Where the preview lands
+ *
+ * If the photograph on the stage is still in the new set — the ordinary case, since
+ * most photographs are not favorites — the preview is re-pointed at its new position
+ * and repainted, which is a no-op for the image, the zoom and the clip: same row, so
+ * nothing is re-fetched and nothing restarts.
+ *
+ * If it is *not* in the new set, the photograph on the stage has just left the filter
+ * (it was favourited while the tag read `no`, or it was a favorite and the tag just
+ * went to `no`). The preview stays open and moves to the photograph that took its
+ * place rather than closing: the photo is out of the set being reviewed, and the
+ * empty grid behind would be a worse place to end up than the next one. Only a grid
+ * with nothing left in it closes the preview, because then there is nothing to move
+ * to.
+ *
+ * A preview opened from All Photos or from Similar Groups is left entirely alone:
+ * neither window is filtered by this dimension, so nothing it is showing has become
+ * wrong.
+ *
+ * @return `'ok'`, `'failed'` (nothing changed, so the caller puts the tag back) or
+ *         `'superseded'` (a newer reload owns the grid now — *not* a failure, and the
+ *         caller must not undo a newer press because this one lost the race).
+ */
+async function reloadGridKeepingPreview() {
+  const openId = currentLightboxRow()?.id ?? null;
+  const scrollY = window.scrollY;
+  // Bumped for the same reason `resetGrid` bumps it: a page still in flight for the
+  // previous filter must be discarded rather than appended to the new grid.
+  const generation = (state.generation += 1);
+  state.nextCursor = null;
+  state.anchorIndex = -1;
+  state.inflightGeneration = -1;
+  state.loading = false;
+  state.lastGridRefresh = Date.now();
+  let data;
+  try {
+    data = await api.get('/api/photos?' + pageQuery(null).toString());
+  } catch (error) {
+    if (generation !== state.generation) return 'superseded';
+    toast('Could not load photos — ' + error.message, 'error');
+    return 'failed';
+  }
+  if (generation !== state.generation) return 'superseded';
+  // The menu's tile belongs to the grid that is about to go, so it goes first.
+  closeTileMenu();
+  $('grid').replaceChildren();
+  absorbPage(data, null, { replace: true });
+  window.scrollTo(0, scrollY);
+  // The sentinel request that follows a page has no equivalent here on purpose: this
+  // is one deliberate move of one control, and pulling a second page to fill a hole
+  // is the grid's own job once the reader scrolls.
+  reanchorPreviewAfterReload(openId);
+  return 'ok';
+  }
+
+  /**
+   * Puts an open preview back where it belongs after the favorites filter changed
+   * which rows the grid holds.
+   *
+   * Only the *live* preview — the one opened from the grid, whose queue is
+   * `state.items`. An All Photos or Similar Groups preview has its own queue that this
+   * dimension never filtered, so it is left exactly as it is.
+   */
+  function reanchorPreviewAfterReload(openId) {
+    const lightbox = state.lightbox;
+    if (!lightbox.open || lightbox.queue !== state.items) return;
+    const moved = openId ? state.items.findIndex((row) => row.id === openId) : -1;
+    if (moved >= 0) {
+      // Same photograph, new position: `renderLightbox` is a repaint here, not a move,
+      // so the image, the zoom and any playing clip are all left alone.
+      lightbox.index = moved;
+      renderLightbox();
+      return;
+    }
+    if (state.items.length === 0) { closeLightbox(); return; }
+    // The photograph on the stage has left the filter. Stay open and take the one that
+    // replaced it, clamped into the window that is now loaded.
+    lightbox.index = Math.min(Math.max(lightbox.index, 0), state.items.length - 1);
+    renderLightbox();
+  }
+
+  /**
    * Shows every photo, or every photo that is *not* a favorite.
    *
    * Takes the state to move to rather than reading a click and inverting it, so the
@@ -1555,12 +1687,18 @@
    * thing that decides which one a press means. That matters for the echo path, which
    * writes `state.favorites` and repaints from it without ever going near here.
    *
-   * The three things `selectMedia` does, minus the second: the grid resets, because
-   * the keyset cursor names a position inside one result set and this changes which
-   * set that is; a "matching" selection goes stale, handled by `sameFilter` reading
-   * `favorites` rather than by clearing anything, so the deletion is refused until
-   * the reader re-snapshots with ⌘A or gives the selection up with Esc; and an
-   * explicit id selection is untouched by a filter change by design.
+   * The three things `selectMedia` does, minus two: the loaded window restarts at
+   * page one, because the keyset cursor names a position inside one result set and
+   * this changes which set that is; a "matching" selection goes stale, handled by
+   * `sameFilter` reading `favorites` rather than by clearing anything, so the
+   * deletion is refused until the reader re-snapshots with ⌘A or gives the selection
+   * up with Esc; and an explicit id selection is untouched by a filter change by
+   * design.
+   *
+   * The *how* of that restart is `reloadGridKeepingPreview` and not `resetGrid`,
+   * because this is the one filter a reader reaches for in the middle of a review:
+   * pressing it with a photograph on the stage used to close the stage and empty the
+   * contact sheet. See that function for what it keeps and why.
    *
    * The Similar Groups window is *not* reset, unlike the media filter's path, and
    * the reason is that the dimension does not reach it: `/api/groups` and
@@ -1574,10 +1712,22 @@
    */
   function selectFavorites(value) {
     const next = FAVORITE_CHOICES.includes(value) ? value : 'include';
-    if (state.favorites === next) return;
+    if (state.favorites === next) return Promise.resolve();
+    const previous = state.favorites;
     state.favorites = next;
     renderFavoritesToggle();
-    scheduleReload(0);
+    return reloadGridKeepingPreview().then((outcome) => {
+      // A *failure* puts the tag back, because a tag reading "no" over a grid the
+      // server never filtered is the one state in which the panel is describing a
+      // filter that is not in force. A superseded reload is not a failure: it lost a
+      // race to a newer press, and undoing that press because the older one lost
+      // would leave the control disagreeing with the grid it is over.
+      if (outcome === 'failed') {
+        state.favorites = previous;
+        renderFavoritesToggle();
+      }
+      return outcome;
+    });
   }
 
   /** One press, the other state. The only place a click becomes a state. */
@@ -2768,16 +2918,15 @@
    * something else, and a hand-picked selection would name a photo the filter no
    * longer admits.
    *
-   * ## Why the whole grid reloads rather than the tile being patched out
+   * ## Why the whole grid re-reads rather than the tile being patched out
    *
    * Removing one row means renumbering every tile after it and every index the open
-   * lightbox walks by — and the live lightbox's queue *is* `state.items` by
-   * reference, so splicing the row the preview is showing out from under it would
-   * leave the next repaint showing a different photograph on the stage. The
-   * deletion path has the same shape of problem and the same answer: `resetGrid`
-   * closes the live preview and reloads from page one, which costs a scroll
-   * position on a press that, in a grid deliberately showing only the photos you
-   * have not decided about yet, is rare.
+   * preview walks by. The reload here is `reloadGridKeepingPreview` and not
+   * `resetGrid`, and that choice is the whole point of this case: the photograph
+   * being favourited is very often the one on the stage — that is where the heart is
+   * most convenient to press — so the reload keeps the preview open and moves it to
+   * the photograph that took the departed one's place. `resetGrid` would have closed
+   * the stage on the press that made the photo leave.
    *
    * ## The other direction needs nothing
    *
@@ -2796,7 +2945,7 @@
     if (state.all.active || state.groups.active) return false;
     const crossed = ids.some((id) => state.items.some((row) => row.id === id));
     if (!crossed) return false;
-    await resetGrid();
+    await reloadGridKeepingPreview();
     return true;
   }
 

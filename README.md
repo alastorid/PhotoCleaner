@@ -422,6 +422,22 @@ Two more things that are decisions rather than omissions:
   needs nothing: it can only make a photo eligible that was never loaded, and the
   next page brings it in.
 
+**Neither switch disturbs a review.** This is the one filter a reader reaches for
+*while* looking at photographs, so pressing the tag does not close an open preview
+and does not start the grid again from nothing: the photograph on the stage stays on
+the stage, on the same `src` and the same zoom, at its new position in the list, and
+the tiles are swapped only once the server has answered, so the contact sheet never
+flashes empty. The one thing that moves is the photograph that has genuinely left
+the set — favourite the one you are looking at and the preview moves to the
+photograph that took its place, rather than closing. The scroll position is restored,
+and the grid restarts at one page like any other first page: the rest arrives as you
+scroll. A *failed* request puts the tag back, because a tag reading *no* over a grid
+the server never filtered is the one state in which the panel is lying.
+
+The other filters still take the full reset and still close an open preview — they
+change what the grid *is* rather than one bit of membership, and the preview's queue
+is the grid's rows, so there is nothing there worth preserving.
+
 The filter is a **grid** filter. All Photos ignores it by design, like `lo` and
 `hi`, and the Similar Groups browser shows favorites whatever the tag says —
 visibly so, since a favorite in a group strip carries the same heart. A selection
