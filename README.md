@@ -296,11 +296,11 @@ accidental and duplicated-looking shots surface immediately at the low end.
 
 The control panel reads in the order you use it: **Aesthetics** (the score
 range), then **Face definition** (detail in a face's own pixels), then
-**Album**, then **Media** (All / Photos / Videos) and **Favourites** (All / Not
-favourites) — all five of which *narrow* 53,000 assets to something you would
-actually look at — and then **Sort** last, pushed to the far right, because it is
-the one control that changes no membership. It only reorders what is already on
-screen, so it is the final decision about how to walk the result.
+**Album**, then **Media** (All / Photos / Videos) and the **favorites** tag
+(All / Not favorite) — all five of which *narrow* 53,000 assets to something you
+would actually look at — and then **Sort** last, pushed to the far right, because
+it is the one control that changes no membership. It only reorders what is
+already on screen, so it is the final decision about how to walk the result.
 
 ### The grid
 
@@ -397,31 +397,33 @@ server-side** from every bulk selection and deletion. There is no switch: the
 server refuses a request that sets it off, and a `settings.json` written by an
 earlier build that stored `false` is read with protection on anyway.
 
-### Hiding the favourites
+### Hiding the favorites
 
-The control panel carries a **Favourites** filter beside Media, with two chips:
-**All** and **Not favourites**. *Not favourites* narrows the grid to the photos you
-have not marked, which is the half of the library the cleanup is actually about —
-the marked ones are already decided.
+The control panel carries one **favorites** tag between Media and Sort. It reads
+**All** while your marked photos are on screen and **Not favorite** while they are
+hidden — the label states the state, so one button holds both and a press is never
+ambiguous about what it did. *Not favorite* narrows the grid to the photos you have
+not marked, which is the half of the library the cleanup is actually about: the
+marked ones are already decided.
 
 Two things that are decisions rather than omissions:
 
-- **There is no "Favourites only" chip.** The API has always accepted
-  `favorites=only` and still does; a cleaner is not a favourites browser, and the
+- **There is no "Favorites only" state.** The API has always accepted
+  `favorites=only` and still does; a cleaner is not a favorites browser, and the
   heart on each tile already says which photos those are. The dimension is here to
-  put your own decisions out of the way, not to browse them.
-- **Marking a photo on this grid takes it off the grid.** With *Not favourites* in
+  put your own decisions out of the way, not to browse them. The tag's tooltip is
+  where the count of what it is hiding lives.
+- **Marking a photo on this grid takes it off the grid.** With *Not favorite* in
   force, pressing a heart is a membership change and not just a flag change, so the
   grid is re-read rather than left showing a row the filter excludes. Un-marking
   needs nothing: it can only make a photo eligible that was never loaded, and the
   next page brings it in.
 
 The filter is a **grid** filter. All Photos ignores it by design, like `lo` and
-`hi`, and the Similar Groups browser shows favourites whatever the chip says —
-visibly so, since a favourite in a group strip carries the same heart. A selection
-taken with *Not favourites* in force pins the dimension (`⌘A` sends it), so it
-cannot later be destroyed as a set that includes the photos the grid was not
-showing.
+`hi`, and the Similar Groups browser shows favorites whatever the tag says —
+visibly so, since a favorite in a group strip carries the same heart. A selection
+taken with *Not favorite* in force pins the dimension (`⌘A` sends it), so it cannot
+later be destroyed as a set that includes the photos the grid was not showing.
 
 ## Deletion
 
@@ -626,10 +628,10 @@ POST /api/library/rescan          re-read the library and reconcile
 
 `sort` ∈ `score_asc` (default) `| score_desc | date_desc | date_asc`;
 `favorites` ∈ `include | exclude | only`, default `include`, and part of the
-pagination fingerprint. The grid's UI offers **All** and **Not favourites** only —
-`only` is accepted here and deliberately not offered (see **Favourite protection**
-above); a client that received an `only` echo is expected to ignore it rather than
-adopt a bucket it has no chip for.
+pagination fingerprint. The grid's UI has two states for it, on one tag that reads
+**All** or **Not favorite** — `only` is accepted here and deliberately not offered
+(see **Hiding the favorites** above); a client that received an `only` echo is
+expected to ignore it rather than adopt a state it has no label for.
 `media` is `all` (default) `| images | videos`, and it means the same thing on
 `/api/photos`, `/api/groups` and `/api/group` — see **Videos** below for what it
 does to a group. Anything else is a **400 naming the three valid values**, never a

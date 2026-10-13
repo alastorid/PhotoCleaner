@@ -49,10 +49,6 @@ const app = await openApp({
   },
 });
 
-/** The favourites chip for one of the server's two offered values. */
-const favoriteChip = (app, value) =>
-  app.window.document.querySelector(`#favoriteChips [data-favorites="${value}"]`);
-
 async function until(predicate) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
@@ -85,38 +81,42 @@ try {
   assert.equal(app.$('emptyState').hidden, false);
   console.log('PASS an empty filtered page clears the previous count');
 
-  // The favourites filter, on the grid the two buckets belong to. Two chips only:
-  // "include" and "exclude" — the server's third bucket is not offered, because a
-  // cleaner is not a favourites browser.
+  // The favourites filter, on the grid it belongs to. One tag, two states, and the
+  // label states the state rather than the action — so it reads "All" while the
+  // favorites are on screen and "Not favorite" while they are not. The server's third
+  // state (`only`) has no label here at all: a cleaner is not a favorites browser.
   app.click('#mediaChips [data-media="images"]');
   await until(() => app.tileIds().length === 3);
-  assert.deepEqual(
-    [...app.$('favoriteChips').querySelectorAll('[data-favorites]')].map((chip) => chip.dataset.favorites),
-    ['include', 'exclude'],
-    'the favourites filter offers a bucket the cleanup does not need',
-  );
-  assert.equal(favoriteChip(app, 'include').getAttribute('aria-pressed'), 'true');
-  console.log('PASS the favourites filter starts unfiltered, with two buckets');
+  const tag = app.$('favoriteToggle');
+  assert.equal(tag.textContent, 'All', 'the tag does not start reading the state it is in');
+  assert.equal(tag.getAttribute('aria-pressed'), 'false');
+  assert.equal(app.window.document.querySelectorAll('#favoriteToggle').length, 1,
+    'there is more than one favourites control on the panel');
+  console.log('PASS the favourites filter is one tag, reading All');
 
-  app.click('#favoriteChips [data-favorites="exclude"]');
+  app.click('#favoriteToggle');
   await until(() => requests[requests.length - 1].searchParams.get('favorites') === 'exclude');
   assert.equal(requests[requests.length - 1].searchParams.get('favorites'), 'exclude',
     'the filter was not sent on the wire, so the grid is the whole library');
   assert.deepEqual(app.tileIds(), ['first', 'second'], 'the favourites filter did not reach the page');
   assert.equal(app.$('matchCount').textContent, '2', 'the count did not follow the filter');
-  assert.equal(favoriteChip(app, 'exclude').getAttribute('aria-pressed'), 'true');
-  assert.equal(favoriteChip(app, 'include').getAttribute('aria-pressed'), 'false');
-  // The tooltip is the only place the hidden count appears, and it is the server's
-  // count rather than a tally of what this client happens to have loaded.
-  assert.match(favoriteChip(app, 'exclude').title, /1 favourite/);
-  console.log('PASS hiding the favourites filters the grid, the count and the pressed state');
+  assert.equal(tag.textContent, 'Not favorite', 'the tag did not repaint itself for the new state');
+  assert.equal(tag.getAttribute('aria-pressed'), 'true');
+  // The hidden count is in the tooltip and the accessible name, and nowhere else: the
+  // header reports the library's assets and its clips, not what this filter withholds.
+  assert.match(tag.title, /1 favorite/);
+  assert.match(tag.getAttribute('aria-label'), /^Not favorite/,
+    'the accessible name no longer leads with the label on the button');
+  console.log('PASS one press hides the favorites: label, aria-pressed, grid and count');
 
-  app.click('#favoriteChips [data-favorites="include"]');
+  app.click('#favoriteToggle');
   await until(() => app.tileIds().length === 3);
+  assert.equal(tag.textContent, 'All', 'the tag did not come back to its other label');
+  assert.equal(tag.getAttribute('aria-pressed'), 'false');
   assert.equal(requests[requests.length - 1].searchParams.get('favorites'), 'include',
     'the default is omitted rather than sent, and a cursor minted under "exclude" '
     + 'would then be replayed against a different result set');
-  console.log('PASS “All” brings the favourites back, and is sent as a value rather than an absence');
+  console.log('PASS a second press brings the favorites back, sent as a value not an absence');
 } finally {
   app.close();
 }

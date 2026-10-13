@@ -128,9 +128,9 @@
        #albumIndexState's tooltip — the count a reader hovers when an album they
        can see in Photos is missing — rather than offered as filters; see the note
        on the server's /api/albums. Favorites is the one of them with a filter of
-       its own, and that filter is the Favourites group below rather than a chip
-       here: the flag is per-asset and belongs to no album, so a chip among the
-       album buckets would nest it in a membership it does not have. Clicking a chip
+       its own, and that filter is the tag below rather than a chip here: the flag
+       is per-asset and belongs to no album, so a chip among the album buckets
+       would nest it in a membership it does not have. Clicking a chip
        filters the grid; clicking it again clears. #albumNote is left for the one
        case that must not wait for a hover: PhotoCleaner failing to read the albums
        at all. -->
@@ -187,29 +187,30 @@
       <button class="chip" data-media="videos">Videos</button>
     </div>
 
-    <!-- Favourites, between Media and Sort, for the same reason Media is: both are
-         filters on the same grid, and Sort stays last because it is the one control
-         that changes no membership. Two buckets, and `.chip` like the two groups
-         beside it, so the pressed state, the hover and the focus ring are the ones
-         the reader already knows from Media rather than a third ramp.
+    <!-- Favorites: one tag, between Media and Sort, for the same reason Media is —
+         both filter the same grid, and Sort stays last because it changes no
+         membership. It is a single `.chip` and nothing else, with no label of its own,
+         because it has only two states to hold: it reads **All**, or it reads **Not
+         favorite**, and a label plus two chips spent a fifth of the panel's width on a
+         control whose third chip was never wanted.
 
-         Two buckets, not three. The server has always accepted
-         `favorites=include | exclude | only`, so "Favourites only" would be one
-         click away — and it is deliberately not offered. This is a cleaner, not a
-         favourites browser: the work in front of the reader is deciding what to
-         throw away, and a photo they have already marked is not work. The dimension
-         exists to get the favourites out of the way of that decision, so the chip
-         that made your own favourites the subject would be the wrong affordance in
-         the middle of a cleanup.
+         The label states the state, not the action, so the tag never reads as a promise
+         about what pressing it will do. `aria-pressed` carries the same two states for a
+         screen reader, and the tooltip — the sentence that says what the word means in
+         this library, including how many favorites are being hidden — carries the rest.
 
-         "All" is a bucket rather than the absence of a filter, exactly as it is for
-         Media, so there is no fourth state to fall back to and clicking the pressed
-         chip is simply a click on the chip it already names. -->
-    <div class="favorites-group" id="favoriteChips" role="group" aria-label="Filter by favourite">
-      <span class="control-label">Favourites</span>
-      <button class="chip" data-favorites="include">All</button>
-      <button class="chip" data-favorites="exclude">Not favourites</button>
-    </div>
+         There is no "Favorites only" state. The server has always accepted
+         `favorites=include | exclude | only` and still does, so the API can do it in
+         one request, and this control will not: a cleaner is not a favorites browser.
+         The work in front of the reader is deciding what to throw away, and a photo
+         they have already marked is not work, so the dimension is here to put their
+         decisions out of the way rather than to browse them.
+
+         And no heart: the heart on a tile means "this photo is protected from deletion",
+         so a heart on the control that hides those very photos would be saying the
+         opposite of what it does. -->
+    <button class="chip" id="favoriteToggle" aria-pressed="false"
+            title="Every photo is shown, favorites included">All</button>
 
     <div class="sort-group">
       <span class="control-label">Sort</span>

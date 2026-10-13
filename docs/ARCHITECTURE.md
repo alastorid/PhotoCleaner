@@ -93,13 +93,13 @@ than an omission. `/api/groups` and `/api/group` take `album` and `media` and ha
 never taken `favorites`; `groupMemberClause` builds the member predicate and
 `rankingInputs` reads `favorite` off each row for the Best Shot ranker, but nothing
 constrains on it. Adding it would mean filtering members *inside* a group, which is
-a different question from filtering groups: a burst whose best shot is a favourite
+a different question from filtering groups: a burst whose best shot is a favorite
 would become a two-photo strip, and the card would then be about a group the reader
 can no longer compare. So `selectFavorites` resets the grid and does not call
-`resetGroupsWindow()`, and the group browser shows favourites whatever the chip
-says. That contradiction is visible rather than hidden — a favourite in a strip
-carries the same heart the grid gives them — which is the same standard §1 applies
-to a list narrowed by a filter the reader cannot see.
+`resetGroupsWindow()`, and the group browser shows favorites whatever the tag says.
+That contradiction is visible rather than hidden — a favorite in a strip carries the
+same heart the grid gives them — which is the same standard §1 applies to a list
+narrowed by a filter the reader cannot see.
 
 Two decisions, deliberately different:
 
@@ -317,13 +317,22 @@ GET  /api/timeline/page
   the entire time, so the server was always ready and the client was the only thing
   not asking. The client now sends `state.favorites` on every request, in the
   selection snapshot and on every page, for the reason the fingerprint exists: a
-  token minted while favourites were hidden describes a position inside the
-  *unfavourited* rows, and replaying it without the dimension would splice back a
+  token minted while favorites were hidden describes a position inside the
+  *unfavorited* rows, and replaying it without the dimension would splice back a
   row the filter exists to hide. `FAVORITE_CHOICES` in the client is
   `include | exclude` — **`only` is accepted by the server and deliberately not
-  offered**, because a cleaner is not a favourites browser. A server that echoed
+  offered**, because a cleaner is not a favorites browser. A server that echoed
   `only` to this client would find the echo *ignored* rather than adopted, since the
-  control has no chip to represent it.
+  tag has no label for that state.
+- **The favorites control is one tag, not a group of buckets, and its label states
+  the state.** A third chip was never wanted, and a label + two chips spent a fifth
+  of the panel's width on the one dimension with two states. The label is therefore
+  the state (`All` / `Not favorite`) rather than the action, which is what lets a
+  single button carry both without a group: an action label inverts with the state,
+  so it would need a third value to stay honest. `aria-pressed` carries the same two
+  states, and the tooltip — which leads with the label, so the accessible name still
+  contains the visible text — carries the count of what is hidden, which is the only
+  place that number appears.
 - **`/api/photo/{id}/video` is the one route that answers 409.** A clip that exists
   but is iCloud-only is not a 404 — that would read as "this video is gone" and send
   the user looking for a file that is sitting in iCloud. It says which preference

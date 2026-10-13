@@ -2061,45 +2061,45 @@ await check('⌘A pins the face-definition range it snapshotted', async (app) =>
     'the snapshot did not pin the face-definition dimension');
 });
 
-console.log('favourites: two buckets, and the server owns the third');
+console.log('favorites: one tag, two states, and the server owns a third');
 
 /**
- * Puts the favourites filter on "Not favourites" and waits for a page that answers it.
+ * Presses the favorites tag and waits for a page that answers the state it moved to.
  *
  * Polled, like `showVideos`, for the same reason: how long the filtered grid takes
  * depends on the library, and a fixed wait is a flake on a slow machine.
  *
- * @return the tiles of that page — none of them favourites, because the server
+ * @return the tiles of that page — none of them favorites, because the server
  *         filtered them, which is also how this check knows the predicate reached
  *         the query without inspecting the SQL.
  */
-async function showUnfavourited(app) {
-  app.click('#favoriteChips [data-favorites="exclude"]');
+async function showUnfavorited(app) {
+  app.click('#favoriteToggle');
   for (let attempt = 0; attempt < 40; attempt += 1) {
     await app.settle(250);
-    if (app.$('favoriteChips').querySelector('[data-favorites="exclude"]').getAttribute('aria-pressed') === 'true'
+    if (app.$('favoriteToggle').getAttribute('aria-pressed') === 'true'
         && app.window.document.querySelector('#grid .tile')) {
       return [...app.window.document.querySelectorAll('#grid .tile')];
     }
   }
-  throw new Error('the grid never showed a page with the favourites filtered out');
+  throw new Error('the grid never showed a page with the favorites filtered out');
 }
 
-await check('the filter is All and Not favourites, and never favourites alone', async (app) => {
-  // The server has always accepted `only` as well, and this asserts it stays out of
-  // the control: a cleaner is not a favourites browser. Asserted on the chips rather
-  // than on the absence of a request, so a bucket that cannot be pressed at all is
-  // caught whichever way it arrived.
-  const chips = [...app.$('favoriteChips').querySelectorAll('[data-favorites]')];
-  assertEqual(chips.map((chip) => chip.dataset.favorites), ['include', 'exclude'],
-    'the favourites filter is not the two buckets the cleanup needs');
-  assertEqual(app.$('favoriteChips').querySelector('[data-favorites="include"]').getAttribute('aria-pressed'), 'true',
-    'the grid does not start unfiltered');
-  assertEqual(app.$('favoriteChips').querySelector('[data-favorites="exclude"]').getAttribute('aria-pressed'), 'false',
-    'the grid starts with the favourites hidden');
+await check('the filter is one tag reading its own state', async (app) => {
+  // Asserted on the shape, because both halves of it are decisions: one control
+  // rather than a group of buckets, and a label that states the state rather than
+  // the action. The server has always accepted `only` as well, and this pins that it
+  // has no label here — a cleaner is not a favorites browser.
+  assertEqual(app.$('favoriteToggle').textContent, 'All',
+    'the tag does not start reading the state it is in');
+  assertEqual(app.$('favoriteToggle').getAttribute('aria-pressed'), 'false',
+    'the grid starts with the favorites on screen');
+  assertEqual(app.$('favoriteChips'), null, 'the tag is a group of buckets again');
+  assertEqual(app.$('favoriteToggle').querySelectorAll('*').length, 0,
+    'the tag grew a label or a glyph inside it');
 });
 
-await check('“Not favourites” asks the server for the unfavourited photos', async (app) => {
+await check('“Not favorite” asks the server for the unfavorited photos', async (app) => {
   const asked = [];
   const real = app.window.fetch;
   app.window.fetch = async (input, init) => {
@@ -2109,24 +2109,26 @@ await check('“Not favourites” asks the server for the unfavourited photos', 
     }
     return real(input, init);
   };
-  const tiles = await showUnfavourited(app);
+  const tiles = await showUnfavorited(app);
   assert(asked.length > 0, 'no page was requested');
   // Sent always, `include` included — "absent" and "unfiltered" are different
   // queries, and the dimension is folded into the pagination fingerprint.
   assert(asked.every((value) => value === 'exclude'),
-    `a page was fetched without the favourites filter in force: ${JSON.stringify(asked)}`);
-  assert(tiles.length > 0, 'the unfavourited page is empty');
+    `a page was fetched without the favorites filter in force: ${JSON.stringify(asked)}`);
+  assert(tiles.length > 0, 'the unfavorited page is empty');
+  assertEqual(app.$('favoriteToggle').textContent, 'Not favorite',
+    'the tag did not repaint itself for the state the server answered');
   for (const tile of tiles) {
     assert(!/, favorite/.test(tile.getAttribute('aria-label') || ''),
-      `a tile on a page that hides favourites is announced as one: ${tile.getAttribute('aria-label')}`);
+      `a tile on a page that hides favorites is announced as one: ${tile.getAttribute('aria-label')}`);
   }
 });
 
-await check('the favourites chips follow the server\'s echo, not the click that asked', async (app) => {
+await check('the tag follows the server\'s echo, not the click that asked', async (app) => {
   // The echo is why `filter.favorites` is on the wire, and the lie it prevents is
-  // sharper here than for media: a control claiming to hide favourites over a grid
-  // full of them is a grid whose next selection resolves to a different set of
-  // photos than the one on screen.
+  // sharper here than for media: a tag claiming to hide favorites over a grid full of
+  // them is a grid whose next selection resolves to a different set of photos than
+  // the one on screen.
   //
   // The skew is injected rather than waited for, because a real server answering a
   // real `?favorites=exclude` echoes `exclude` and the guarantee would hold
@@ -2145,21 +2147,21 @@ await check('the favourites chips follow the server\'s echo, not the click that 
       async json() { return { ...payload, filter: { ...payload.filter, favorites: 'include' } }; },
     };
   };
-  app.click('#favoriteChips [data-favorites="exclude"]');
+  app.click('#favoriteToggle');
   for (let attempt = 0; attempt < 40 && rewrote === 0; attempt += 1) await app.settle(100);
   assert(rewrote > 0, 'the filtered page carrying the echo was never fetched');
-  assertEqual(app.$('favoriteChips').querySelector('[data-favorites="include"]').getAttribute('aria-pressed'), 'true',
-    'the chips still show the click rather than the filter the server applied');
-  assertEqual(app.$('favoriteChips').querySelector('[data-favorites="exclude"]').getAttribute('aria-pressed'), 'false',
-    '“Not favourites” is still marked as the filter in force');
+  assertEqual(app.$('favoriteToggle').textContent, 'All',
+    'the tag still shows the click rather than the filter the server applied');
+  assertEqual(app.$('favoriteToggle').getAttribute('aria-pressed'), 'false',
+    '“Not favorite” is still marked as the state in force');
 });
 
-await check('⌘A pins the favourite filter it snapshotted', async (app) => {
+await check('⌘A pins the favorite filter it snapshotted', async (app) => {
   // The load-bearing safety property, on the wire. A snapshot that hardcoded
   // `include` — which is what this client did for as long as there was no control to
-  // change it — resolves against every photo in the score range, favourites
-  // included, so the count on Delete is a count of a set nobody is looking at.
-  await showUnfavourited(app);
+  // change it — resolves against every photo in the score range, favorites included,
+  // so the count on Delete is a count of a set nobody is looking at.
+  await showUnfavorited(app);
   const sent = [];
   const real = app.window.fetch;
   app.window.fetch = async (input, init) => {
@@ -2173,33 +2175,33 @@ await check('⌘A pins the favourite filter it snapshotted', async (app) => {
   assertEqual(sent.length, 1, `the selection was not resolved (${sent.length} requests)`);
   assertEqual(sent[0].mode, 'matching', 'the snapshot is not a filter');
   assertEqual(sent[0].filter.favorites, 'exclude',
-    'the snapshot did not pin the favourites dimension, so it would resolve to the whole library');
+    'the snapshot did not pin the favorites dimension, so it would resolve to the whole library');
 });
 
-await check('a snapshot taken with favourites hidden cannot be deleted once they are back', async (app) => {
-  // The failure this exists to prevent: a ⌘A on the "Not favourites" grid, then the
-  // reader widens the filter to All, and a press still destroys a set that includes
-  // the favourites the grid was deliberately not showing.
+await check('a snapshot taken with favorites hidden cannot be deleted once they are back', async (app) => {
+  // The failure this exists to prevent: a ⌘A on the "Not favorite" grid, then the
+  // reader presses the tag back to All, and a press still destroys a set that includes
+  // the favorites the grid was deliberately not showing.
   const sent = interceptDeletes(app);
-  await showUnfavourited(app);
+  await showUnfavorited(app);
   app.key('a', { metaKey: true });
   await app.settle(700);
 
-  app.click('#favoriteChips [data-favorites="include"]');
+  app.click('#favoriteToggle');
   await app.settle(700);
   app.key('Backspace');
   await app.settle(600);
-  assertEqual(sent.length, 0, 'a selection was destroyed under a different favourites filter');
+  assertEqual(sent.length, 0, 'a selection was destroyed under a different favorites filter');
 });
 
-await check('marking a photo a favourite takes it off a grid that hides them', async (app) => {
+await check('marking a photo a favorite takes it off a grid that hides them', async (app) => {
   // The heart is still the way the flag is set, and with the filter in force a press
   // is a *membership* change: the photo has left the set the grid claims to be
-  // showing. A tile left behind would be a row the server would never return, over
-  // a grid whose next ⌘A resolves to something narrower than the one on screen.
+  // showing. A tile left behind would be a row the server would never return, over a
+  // grid whose next ⌘A resolves to something narrower than the one on screen.
   //
   // Writes to the library, so it restores the flag afterwards.
-  const tiles = await showUnfavourited(app);
+  const tiles = await showUnfavorited(app);
   const target = tiles[0].dataset.id;
   const tile = app.window.document.querySelector(`#grid .tile[data-id="${app.window.CSS.escape(target)}"]`);
   assert(tile, `the page has no tile for ${target}`);
@@ -2213,7 +2215,7 @@ await check('marking a photo a favourite takes it off a grid that hides them', a
     }
     assertEqual(app.window.document.querySelector(
       `#grid .tile[data-id="${app.window.CSS.escape(target)}"]`), null,
-      'a favourite is still on a grid that filters them out');
+      'a favorite is still on a grid that filters them out');
   } finally {
     await fetch(`${base}/api/favorites`, {
       method: 'POST',
