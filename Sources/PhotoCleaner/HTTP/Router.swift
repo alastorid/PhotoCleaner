@@ -398,10 +398,13 @@ struct Router: Sendable {
         // range readout above it does not describe — the same lie
         // a refused album prevents.
         let faceDefinition: PhotosResponse.FaceDefinitionBounds?
-        switch (request.queryFloat("faceDefLo"), request.queryFloat("faceDefHi")) {
+        switch (request.queryValue("faceDefLo"), request.queryValue("faceDefHi")) {
         case (nil, nil):
             faceDefinition = nil
-        case let (lo?, hi?):
+        case let (rawLo?, rawHi?):
+            guard let lo = Float(rawLo), let hi = Float(rawHi) else {
+                return .response(.error("face definition bounds must be numbers", status: 400))
+            }
             guard lo.isFinite, hi.isFinite, lo <= hi else {
                 return .response(.error("invalid face definition range \(lo)…\(hi); faceDefLo must not exceed faceDefHi",
                                        status: 400))

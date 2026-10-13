@@ -48,6 +48,46 @@ private func flatImage(width: Int, height: Int, gray: Double) -> CGImage {
 
 func registerFaceDefinitionTests() {
     let suite = "Face definition"
+    Registry.shared.add(suite: suite, TestCase(name: "malformed definition bounds are refused rather than treated as absent", knownBug: nil) {
+        let fixture = try await Fixture.make("definition-invalid-range")
+        try await fixture.seed([.init(id: "a", score: 0.5, date: 1)])
+        let invalid: [[String: String]] = [
+            ["faceDefLo": "abc", "faceDefHi": "xyz"],
+            ["faceDefLo": "abc"], ["faceDefHi": "xyz"],
+            ["faceDefLo": "", "faceDefHi": ""],
+            ["faceDefLo": "abc", "faceDefHi": "0.8"],
+            ["faceDefLo": "0.2", "faceDefHi": "xyz"],
+            ["faceDefLo": "0.2"], ["faceDefHi": "0.8"],
+            ["faceDefLo": "nan", "faceDefHi": "0.8"],
+            ["faceDefLo": "0.2", "faceDefHi": "inf"],
+            ["faceDefLo": "0.8", "faceDefHi": "0.2"],
+        ]
+        for query in invalid {
+            let response = await fixture.router.reply(Req.get("/api/photos", query: query))
+            checkEqual(response.status, 400, "invalid range \(query) must not widen the grid")
+        }
+    })
+    Registry.shared.add(suite: suite, TestCase(name: "valid definition ranges filter inclusively and absent bounds leave the filter off", knownBug: nil) {
+        let fixture = try await Fixture.make("definition-valid-range")
+        try await fixture.seed([
+            .init(id: "low", score: 0.5, date: 1),
+            .init(id: "high", score: 0.5, date: 2),
+            .init(id: "no-face", score: 0.5, date: 3),
+        ])
+        try await fixture.cache.record(score: 0.5, faceDefinition: 0.2, for: "low")
+        try await fixture.cache.record(score: 0.5, faceDefinition: 0.8, for: "high")
+        let off = await fixture.router.reply(Req.get("/api/photos"))
+        checkEqual(off.status, 200, "absent bounds are accepted")
+        checkEqual(off.int("total"), 3, "filter off includes unmeasured faces")
+        for (lo, hi, expected) in [("0.2", "0.8", ["high", "low"]), ("0.8", "0.8", ["high"])] {
+            let response = await fixture.router.reply(Req.get("/api/photos", query: ["faceDefLo": lo, "faceDefHi": hi]))
+            checkEqual(response.status, 200, "valid range is accepted")
+            checkEqual(response.rows().map(\.id), expected, "bounds are inclusive and exclude missing definitions")
+            let echoed = response.side("filter").side("faceDefinition").json
+            checkEqual((echoed["lower"] as? NSNumber)?.floatValue, Float(lo), "lower bound is echoed")
+            checkEqual((echoed["upper"] as? NSNumber)?.floatValue, Float(hi), "upper bound is echoed")
+        }
+    })
     Registry.shared.add(suite: suite, TestCase(name: "small sharp edge face beats large blurred centre face", knownBug: nil) {
         let small = CGRect(x: 0, y: 100, width: 40, height: 48)
         let large = CGRect(x: 120, y: 50, width: 120, height: 144)

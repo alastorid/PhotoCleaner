@@ -1066,6 +1066,8 @@
         adoptObservedDefinitionBounds(data.faceDefinition);
       if (definitionEchoChanged || definitionBoundsChanged) syncDefinitionUI();
       const rows = Array.isArray(data.items) ? data.items : [];
+      state.total = Number(data.total) || 0;
+      state.nextCursor = data.nextCursor || null;
       // Album names for this page only. Kept in a map keyed by identifier rather
       // than on the rows so the rows stay exactly what the cache holds, and so an
       // absent map entry reads as "no name known" rather than "not in an album".

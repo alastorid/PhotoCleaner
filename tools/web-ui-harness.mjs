@@ -64,7 +64,7 @@ export async function openApp(options = {}) {
         url = parsed.href;
       }
     }
-    const response = await fetch(url, init);
+    const response = await (options.fetch || fetch)(url, init);
     return {
       ok: response.ok,
       status: response.status,
